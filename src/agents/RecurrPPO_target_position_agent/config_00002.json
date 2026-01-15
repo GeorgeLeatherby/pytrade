@@ -1,0 +1,113 @@
+{
+    "environment": {
+        "execution_mode": "single_asset_target_position",
+        "initial_portfolio_value": 100000,
+        "episode_length_days": 200,
+        "lookback_window": 0,
+        "early_stopping_threshold": 0.3,
+        "cash_return_rate": 0.0,
+        "seed": 42,
+        "maybe_provide_sequence": false,
+        "block_buffer_multiplier": 1,
+
+        "test_val_split_ratio": 0.2,
+        "sortino_eta": 0.0125,
+        "percentage_of_cash_only_starts": 0.10,
+
+        "execution_min_share_threshold": 1,
+        "execution_min_trade_value_threshold": 500.0,
+        "execution_min_days_between_trades": 0,
+        "execution_weight_change_threshold": 0.01,
+        "allow_short": false,
+        "price_source": "current_close",
+        "quantity_type": "shares",
+
+        "fixed_fee_per_order": 0.0,
+        "commission_bps": 0.000002,
+        "half_spread_bps": 0.000004,
+        "impact_coeff": 0.15,
+        "adv_window": 21
+    },
+
+    "features": {
+        "dow_sin": true,
+        "dow_cos": true,
+        "dom_sin": true,
+        "dom_cos": true,
+        "moy_sin": true,
+        "moy_cos": true,
+        "return_1d": true,
+        "return_5d": true,
+        "return_20d": true,
+        "return_40d": true,
+        "volume_change_1d": true,
+        "volume_change_5d": true,
+        "volume_change_20d": true,
+        "volume_change_40d": true,
+        "volume_percentile_20d": true,
+        "volume_percentile_40d": true,
+        "daily_range_pct": true,
+        "rsi_14": true,
+        "macd": true,
+        "bb_position": true,
+        "bb_width": true,
+        "volatility_5d": true,
+        "volatility_20d": true,
+        "market_beta": true,
+        "avg_correlation": true,
+        "composite_risk_score": true,
+        "return_kurtosis": true,
+        "trend_strength_20d": true,
+        "drawdown_adjusted_return_30d": true
+    },
+
+    "agent":{
+        "policy": "MlpLstmPolicy",
+        "policy_kwargs": {
+            "net_arch": { "pi": [128, 64], "vf": [128, 64] },
+            "n_lstm_layers": 2,
+            "lstm_hidden_size": 128
+        },
+
+        "device": "auto",
+        "verbose": 1,
+        "n_epochs": 7,
+        "n_steps": 1000,
+        "batch_size": 200,
+        "gamma": 0.99,
+        "gae_lambda": 0.97,
+        "vf_coef": 0.5,
+        "max_grad_norm": 0.5,
+        "target_kl": 0.05,
+        "normalize_advantage": true,        
+
+        "learning_rate_start":  3.5e-4,
+        "learning_rate_end": 1e-4,
+        "lr_schedule_type": "linear",
+        "lr_schedule_warmup_pct": 0.25,
+        "lr_schedule_ramping_pct": 0.6,
+
+        "ent_coef_start": 0.0005,
+        "ent_coef_end": 0.000001,
+        "ent_coef_schedule_type": "linear",
+        "ent_coef_schedule_warmup_pct": 0.3,
+        "ent_coef_schedule_ramping_pct": 0.6,
+
+        "action_limiting_factor_start": 0.05,
+        "action_limiting_factor_end": 0.08,
+        "action_limiting_factor_schedule_type": "linear",
+        "action_limiting_factor_schedule_warmup_pct": 0.3,
+        "action_limiting_factor_schedule_ramping_pct": 0.6
+
+    },
+
+    "training": {
+        "seed": 42,
+        "total_timesteps": 3000000,
+        "eval_freq": 100000,
+        "n_eval_episodes": 16,
+        "eval_deterministic": false,
+        "progress_bar": true
+    }
+
+}

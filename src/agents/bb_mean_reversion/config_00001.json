@@ -1,0 +1,10 @@
+{
+    "agent": {},
+    "environment": {
+        "lookback_window": 0,
+        "episode_length_days": 40,
+        "test_val_split_ratio": 0.2,
+        "initial_cash": 100000
+    },
+    "features": {}
+}
