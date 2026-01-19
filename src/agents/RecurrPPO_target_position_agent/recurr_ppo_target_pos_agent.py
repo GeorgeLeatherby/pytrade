@@ -171,6 +171,45 @@ class EpisodePortfolioSB3LoggerCallback(BaseCallback):
                 self.model.logger.record(f"{self.tag_prefix}/episode_sharpe", sharpe, exclude=("stdout",))
             if dd is not None:
                 self.model.logger.record(f"{self.tag_prefix}/episode_max_drawdown", dd, exclude=("stdout",))
+            # Turnover and costs
+            if "total_turnover" in info:
+                self.model.logger.record(f"{self.tag_prefix}/episode_turnover", float(info["total_turnover"]), exclude=("stdout",))
+                self.model.logger.record(f"{self.tag_prefix}/avg_turnover", float(info["avg_turnover"]), exclude=("stdout",))
+            if "total_transaction_cost" in info:
+                self.model.logger.record(f"{self.tag_prefix}/cost_total", float(info["total_transaction_cost"]), exclude=("stdout",))
+                self.model.logger.record(f"{self.tag_prefix}/cost_commission", float(info["episode_cost_commission"]), exclude=("stdout",))
+                self.model.logger.record(f"{self.tag_prefix}/cost_spread", float(info["episode_cost_spread"]), exclude=("stdout",))
+                self.model.logger.record(f"{self.tag_prefix}/cost_impact", float(info["episode_cost_impact"]), exclude=("stdout",))
+            # Exposure
+            if "exposure_avg" in info:
+                self.model.logger.record(f"{self.tag_prefix}/exposure_start", float(info["exposure_start"]), exclude=("stdout",))
+                self.model.logger.record(f"{self.tag_prefix}/exposure_avg", float(info["exposure_avg"]), exclude=("stdout",))
+                self.model.logger.record(f"{self.tag_prefix}/exposure_end", float(info["exposure_end"]), exclude=("stdout",))
+            # Gross vs net
+            if "shadow_return" in info:
+                self.model.logger.record(f"{self.tag_prefix}/gross_return", float(info["shadow_return"]), exclude=("stdout",))
+            # Buy/Sell totals and trade sizes
+            if "total_buy_notional" in info:
+                self.model.logger.record(f"{self.tag_prefix}/total_buy_notional", float(info["total_buy_notional"]), exclude=("stdout",))
+                self.model.logger.record(f"{self.tag_prefix}/total_sell_notional", float(info["total_sell_notional"]), exclude=("stdout",))
+            if "trade_size_mean" in info:
+                self.model.logger.record(f"{self.tag_prefix}/trade_size_mean", float(info["trade_size_mean"]), exclude=("stdout",))
+                self.model.logger.record(f"{self.tag_prefix}/trade_size_median", float(info["trade_size_median"]), exclude=("stdout",))
+            # Action stats
+            if "action_mean" in info:
+                self.model.logger.record(f"{self.tag_prefix}/action_mean", float(info["action_mean"]), exclude=("stdout",))
+                self.model.logger.record(f"{self.tag_prefix}/action_median", float(info["action_median"]), exclude=("stdout",))
+                self.model.logger.record(f"{self.tag_prefix}/action_p05", float(info["action_p05"]), exclude=("stdout",))
+                self.model.logger.record(f"{self.tag_prefix}/action_p25", float(info["action_p25"]), exclude=("stdout",))
+                self.model.logger.record(f"{self.tag_prefix}/action_p75", float(info["action_p75"]), exclude=("stdout",))
+                self.model.logger.record(f"{self.tag_prefix}/action_p95", float(info["action_p95"]), exclude=("stdout",))
+            # Sortino components
+            if "sortino_mean_ema" in info:
+                self.model.logger.record(f"{self.tag_prefix}/sortino_mean_ema", float(info["sortino_mean_ema"]), exclude=("stdout",))
+                self.model.logger.record(f"{self.tag_prefix}/sortino_downside_ema", float(info["sortino_downside_ema"]), exclude=("stdout",))
+                self.model.logger.record(f"{self.tag_prefix}/sortino_reward_raw_mean", float(info["sortino_reward_raw_mean"]), exclude=("stdout",))
+                self.model.logger.record(f"{self.tag_prefix}/sortino_reward_raw_p25", float(info["sortino_reward_raw_p25"]), exclude=("stdout",))
+                self.model.logger.record(f"{self.tag_prefix}/sortino_reward_raw_p75", float(info["sortino_reward_raw_p75"]), exclude=("stdout",))
         return True
 
 

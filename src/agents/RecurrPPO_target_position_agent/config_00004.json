@@ -64,7 +64,7 @@
     "agent":{
         "policy": "MlpLstmPolicy",
         "policy_kwargs": {
-            "net_arch": { "pi": [128, 64], "vf": [128, 64] },
+            "net_arch": { "pi": [128, 128, 64], "vf": [128, 128, 64] },
             "n_lstm_layers": 2,
             "lstm_hidden_size": 128
         },
@@ -81,10 +81,10 @@
         "target_kl": 0.05,
         "normalize_advantage": true,        
 
-        "learning_rate_start":  2.0e-4,
-        "learning_rate_end": 1.0e-4,
+        "learning_rate_start":  1.5e-4,
+        "learning_rate_end": 5.0e-5,
         "lr_schedule_type": "linear",
-        "lr_schedule_warmup_pct": 0.25,
+        "lr_schedule_warmup_pct": 0.3,
         "lr_schedule_ramping_pct": 0.6,
 
         "ent_coef_start": 0.0005,
@@ -93,8 +93,8 @@
         "ent_coef_schedule_warmup_pct": 0.35,
         "ent_coef_schedule_ramping_pct": 0.6,
 
-        "action_limiting_factor_start": 0.05,
-        "action_limiting_factor_end": 0.08,
+        "action_limiting_factor_start": 0.06,
+        "action_limiting_factor_end": 0.09,
         "action_limiting_factor_schedule_type": "linear",
         "action_limiting_factor_schedule_warmup_pct": 0.3,
         "action_limiting_factor_schedule_ramping_pct": 0.6

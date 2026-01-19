@@ -1491,6 +1491,27 @@ class TradingEnv(gym.Env):
         initial_cash = self.initial_portfolio_value  # Default to all cash
         total_init_tc = 0.0  # Track initialization costs
 
+        # Episode accumulators for diagnostics
+        self._ep_turnover_notional = 0.0
+        self._ep_cost_commission = 0.0
+        self._ep_cost_spread = 0.0
+        self._ep_cost_impact = 0.0
+        self._ep_cost_fixed = 0.0
+        self._ep_buy_notional = 0.0
+        self._ep_sell_notional = 0.0
+        self._ep_trade_sizes = []  # absolute traded notional per leg
+        self._ep_action_outputs = []  # raw single-asset action outputs
+        self._ep_exposure_sum = 0.0
+        self._ep_exposure_steps = 0
+        # Shadow (frictionless) portfolio mirrors live trades without costs
+        self.shadow_portfolio_state = PortfolioState(
+            cash=self.initial_portfolio_value,
+            positions=np.zeros(num_assets, dtype=np.float32),
+            prices=initial_prices.copy(),
+            step=self.current_step,
+            terminated=False,
+        )
+
         # Single-asset target position mode: cash-only or random allocation between cash and selected asset
         if self.execution_mode == SINGLE_ASSET_TARGET_POS:
             # Single asset tradable only! Other assets may not be initialised and traded
@@ -1925,6 +1946,36 @@ class TradingEnv(gym.Env):
 
 
         # ---------------- FROM HERE ALL MODES SHARE THE SAME PROCESSING ------------
+        # ---- Episode metric accumulation ----
+        traded_notional = float(execution_result.traded_dollar_value)
+        if traded_notional > 0:
+            self._ep_turnover_notional += traded_notional
+            self._ep_trade_sizes.append(traded_notional)
+        # Split buy/sell notional from execution_result.trades_executed
+        buys = execution_result.traded_notional_per_asset[execution_result.trades_executed > 0].sum()
+        sells = execution_result.traded_notional_per_asset[execution_result.trades_executed < 0].sum()
+        self._ep_buy_notional += float(buys)
+        self._ep_sell_notional += float(abs(sells))
+        # Cost breakdown captured in _calculate_transaction_costs
+        if hasattr(self, "_last_cost_breakdown"):
+            c_comm, c_spread, c_imp, c_fix = self._last_cost_breakdown
+            self._ep_cost_commission += c_comm
+            self._ep_cost_spread += c_spread
+            self._ep_cost_impact += c_imp
+            self._ep_cost_fixed += c_fix
+        # Exposure tracking
+        invested_fraction = 1.0 - self.portfolio_state.get_weights()[0]
+        self._ep_exposure_sum += invested_fraction
+        self._ep_exposure_steps += 1
+        # Record raw action output (single-asset mode)
+        if self.execution_mode == SINGLE_ASSET_TARGET_POS:
+            self._ep_action_outputs.append(float(action))
+        # Shadow (frictionless) portfolio: apply same position changes without costs
+        if execution_result.success:
+            shadow_pos = self.shadow_portfolio_state.positions.copy()
+            shadow_pos += execution_result.trades_executed
+            self.shadow_portfolio_state.positions = shadow_pos
+            self.shadow_portfolio_state.cash -= execution_result.traded_dollar_value  # no costs
 
         # ADVANCE TIME -----------------------------------------------------
         self.current_step += 1
@@ -1938,6 +1989,10 @@ class TradingEnv(gym.Env):
         # Portfolio positions remain the same, but prices change
         self.portfolio_state.prices[:] = new_prices # in-place update
         self.portfolio_state.step = self.current_step
+
+        # Update shadow portfolio prices (frictionless)
+        self.shadow_portfolio_state.prices[:] = new_prices
+        self.shadow_portfolio_state.step = self.current_step
 
         # Update comparison portfolio state
         self.comparison_portfolio_state.prices[:] = new_prices # in-place update
@@ -2082,6 +2137,14 @@ class TradingEnv(gym.Env):
             bench_ret = (final_benchmark_value / self.initial_portfolio_value) - 1.0
             alpha_ret = port_ret - bench_ret
 
+            ep_turnover = self._ep_turnover_notional / max(1e-8, self.initial_portfolio_value)
+            avg_exposure = (self._ep_exposure_sum / max(1, self._ep_exposure_steps)) if self._ep_exposure_steps else 0.0
+            start_exposure = 1.0 - self.initial_portfolio_value / max(1e-8, self.initial_portfolio_value)  # 0 if start in cash
+            end_exposure = 1.0 - self.portfolio_state.get_weights()[0]
+            shadow_value = self.shadow_portfolio_state.get_total_value()
+            live_value = self.portfolio_state.get_total_value()
+            comparison_value = self.comparison_portfolio_state.get_total_value()
+
             # Safe slices
             if internal_end >= internal_start:
                 returns_slice = self.episode_buffer.returns[internal_start:internal_end + 1]
@@ -2214,12 +2277,24 @@ class TradingEnv(gym.Env):
                 "episode_max_drawdown": episode_max_dd,
                 "episode_sharpe": episode_sharpe,
                 "episode_volatility": episode_volatility,
+                # Gross vs net
+                "shadow_final_value": float(shadow_value),
+                "shadow_return": float(shadow_value / self.initial_portfolio_value - 1.0),
+                # Costs
                 "total_transaction_costs": total_transaction_costs,
+                "episode_cost_commission": float(self._ep_cost_commission),
+                "episode_cost_spread": float(self._ep_cost_spread),
+                "episode_cost_impact": float(self._ep_cost_impact),
+                "episode_cost_fixed": float(self._ep_cost_fixed),
                 "num_trade_days": num_trade_days,
                 "avg_turnover": avg_turnover,
                 "total_turnover": total_turnover,
                 "episode_traded_notional": episode_traded_notional,
                 "episode_traded_shares": episode_traded_shares,
+                # Exposure
+                "exposure_start": float(start_exposure),
+                "exposure_avg": float(avg_exposure),
+                "exposure_end": float(end_exposure),
                 "weights_mean": weights_mean,
                 "weights_max": weights_max,
                 "weights_min": weights_min,
@@ -2239,7 +2314,27 @@ class TradingEnv(gym.Env):
                 "reward_components/cost_sum": comp_cost_sum,
                 "reward_components/turnover_sum": comp_turn_sum,
                 "reward_components/concentration_sum": comp_conc_sum,
-                "reward_components/survival_sum": comp_surv_sum
+                "reward_components/survival_sum": comp_surv_sum,
+                # Buy/Sell totals
+                "total_buy_notional": float(self._ep_buy_notional),
+                "total_sell_notional": float(self._ep_sell_notional),
+                # Trade sizes
+                "trade_size_mean": float(np.mean(self._ep_trade_sizes)) if self._ep_trade_sizes else 0.0,
+                "trade_size_median": float(np.median(self._ep_trade_sizes)) if self._ep_trade_sizes else 0.0,
+                # Action magnitude stats (single-asset mode)
+                "action_mean": float(np.mean(self._ep_action_outputs)) if self._ep_action_outputs else 0.0,
+                "action_median": float(np.median(self._ep_action_outputs)) if self._ep_action_outputs else 0.0,
+                "action_p05": float(np.percentile(self._ep_action_outputs, 5)) if self._ep_action_outputs else 0.0,
+                "action_p25": float(np.percentile(self._ep_action_outputs, 25)) if self._ep_action_outputs else 0.0,
+                "action_p75": float(np.percentile(self._ep_action_outputs, 75)) if self._ep_action_outputs else 0.0,
+                "action_p95": float(np.percentile(self._ep_action_outputs, 95)) if self._ep_action_outputs else 0.0,
+                # Sortino internals (episode aggregates)
+                "sortino_mean_ema": float(np.mean(self._sortino_mean_hist)) if hasattr(self, "_sortino_mean_hist") else 0.0,
+                "sortino_downside_ema": float(np.mean(self._sortino_down_hist)) if hasattr(self, "_sortino_down_hist") else 0.0,
+                "sortino_reward_raw_mean": float(np.mean(self._sortino_raw_hist)) if hasattr(self, "_sortino_raw_hist") else 0.0,
+                "sortino_reward_raw_p25": float(np.percentile(self._sortino_raw_hist, 25)) if hasattr(self, "_sortino_raw_hist") else 0.0,
+                "sortino_reward_raw_p75": float(np.percentile(self._sortino_raw_hist, 75)) if hasattr(self, "_sortino_raw_hist") else 0.0,
+ 
             })
 
         else:
@@ -2324,6 +2419,13 @@ class TradingEnv(gym.Env):
         # 4. Clip reward
         gain = float(3.5)
         reward = float(np.tanh(gain * reward))
+
+        # Track Sortino internals for episode-level stats
+        if not hasattr(self, "_sortino_mean_hist"):
+            self._sortino_mean_hist, self._sortino_down_hist, self._sortino_raw_hist = [], [], []
+        self._sortino_mean_hist.append(float(self.running_mean_ema))
+        self._sortino_down_hist.append(float(self.running_downside_variance_ema))
+        self._sortino_raw_hist.append(float(reward))
 
         # START OF OLD REWARD CALCULATION LOGIC
         # ============================================
@@ -2894,25 +2996,25 @@ class TradingEnv(gym.Env):
             if executed_qty > 0:
                 notional = executed_qty * execution_price
                 # Estimate transaction cost for buy
-                tc = self._calculate_transaction_costs(
+                total_transaction_cost = self._calculate_transaction_costs(
                     shares_traded=np.eye(1, self.market_data_cache.num_assets, sym_idx, dtype=np.float32)[0] * executed_qty,
                     prices=self.market_data_cache.close_prices[price_idx],  # costs scale with notional; price choice consistent
                     abs_step=price_idx
                 )
-                cash_needed = notional + tc
+                cash_needed = notional + total_transaction_cost
                 if cash_needed > self.portfolio_state.cash:
                     # Cap shares by cash
-                    cap_shares = max(0.0, (self.portfolio_state.cash - tc) / execution_price)
+                    cap_shares = max(0.0, (self.portfolio_state.cash - total_transaction_cost) / execution_price)
                     cap_shares = float(np.floor(cap_shares)) if cap_shares > 0 else 0.0
                     if cap_shares <= 0:
                         executed_qty = 0.0
                         notional = 0.0
-                        tc = 0.0
+                        total_transaction_cost = 0.0
                         reason_final = "insufficient_cash"
                     else:
                         executed_qty = cap_shares
                         notional = executed_qty * execution_price
-                        tc = self._calculate_transaction_costs(
+                        total_transaction_cost = self._calculate_transaction_costs(
                             shares_traded=np.eye(1, self.market_data_cache.num_assets, sym_idx, dtype=np.float32)[0] * executed_qty,
                             prices=self.market_data_cache.close_prices[price_idx],
                             abs_step=price_idx
@@ -2922,17 +3024,17 @@ class TradingEnv(gym.Env):
                 # Apply buy
                 if executed_qty > 0:
                     self.portfolio_state.positions[sym_idx] += executed_qty
-                    self.portfolio_state.cash -= (notional + tc)
+                    self.portfolio_state.cash -= (notional + total_transaction_cost)
                     trades_executed[sym_idx] += executed_qty
                     traded_notional_per_asset[sym_idx] += notional
-                    total_transaction_costs += tc
+                    total_transaction_costs += total_transaction_cost
                     trade_results.append({
                         "success": True, "symbol": instr.symbol, "action": instr.action,
                         "requested_qty": float(instr.quantity) if instr.quantity is not None else None,
                         "requested_notional": float(instr.notional) if instr.notional is not None else None,
                         "executed_qty": executed_qty,
                         "execution_price": execution_price, "notional": notional,
-                        "transaction_cost": tc, "reason": reason_final
+                        "transaction_cost": total_transaction_cost, "reason": reason_final
                     })
                 else:
                     trade_results.append({
@@ -2951,7 +3053,7 @@ class TradingEnv(gym.Env):
                 sell_shares = -executed_qty
                 # Cap sells if not allow_short and not enough shares (already handled)
                 notional = sell_shares * execution_price
-                tc = self._calculate_transaction_costs(
+                total_transaction_cost = self._calculate_transaction_costs(
                     shares_traded=-np.eye(1, self.market_data_cache.num_assets, sym_idx, dtype=np.float32)[0] * sell_shares,
                     prices=self.market_data_cache.close_prices[price_idx],
                     abs_step=price_idx
@@ -2961,17 +3063,17 @@ class TradingEnv(gym.Env):
                 if not self.allow_short:
                     # enforce non-negative floor
                     self.portfolio_state.positions[sym_idx] = max(0.0, self.portfolio_state.positions[sym_idx])
-                self.portfolio_state.cash += (notional - tc)
+                self.portfolio_state.cash += (notional - total_transaction_cost)
                 trades_executed[sym_idx] -= sell_shares
                 traded_notional_per_asset[sym_idx] += notional
-                total_transaction_costs += tc
+                total_transaction_costs += total_transaction_cost
                 trade_results.append({
                     "success": True, "symbol": instr.symbol, "action": instr.action,
                     "requested_qty": float(instr.quantity) if instr.quantity is not None else None,
                     "requested_notional": float(instr.notional) if instr.notional is not None else None,
                     "executed_qty": sell_shares,
                     "execution_price": execution_price, "notional": notional,
-                    "transaction_cost": tc, "reason": reason_final
+                    "transaction_cost": total_transaction_cost, "reason": reason_final
                 })
             else:
                 # No-op
@@ -3064,7 +3166,15 @@ class TradingEnv(gym.Env):
         num_orders = int(np.sum(traded_notional > 0))
         fixed_cost = fixed_fee * num_orders
 
-        return float(commission_cost + spread_cost + impact_cost + fixed_cost)
+        total_cost = float(commission_cost + spread_cost + impact_cost + fixed_cost)
+        # Record components for episode metrics
+        self._last_cost_breakdown = (
+            float(commission_cost),
+            float(spread_cost),
+            float(impact_cost),
+            float(fixed_cost),
+        )
+        return total_cost
     
     def _initialize_portfolio_with_costs(
         self, 
