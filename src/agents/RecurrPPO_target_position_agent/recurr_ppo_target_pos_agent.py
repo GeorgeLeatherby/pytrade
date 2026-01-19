@@ -47,6 +47,7 @@ import os
 import time
 import numpy as np
 from typing import Callable, Dict, Any, Optional
+from datetime import datetime
 
 
 #import torch
@@ -55,7 +56,8 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 from sb3_contrib import RecurrentPPO
 from sb3_contrib.ppo_recurrent import MlpLstmPolicy
-from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
+from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
 from stable_baselines3.common.utils import configure_logger
 
@@ -65,6 +67,7 @@ import gymnasium as gym
 # The `cache` object passed by main.py comes from src.environment.trading_env.MarketDataCache;
 # runtime type checks are duck-typed—if attributes match, it works.
 from src.environment.single_asset_target_pos_drl_trading_env import TradingEnv as SingleAssetEnv
+import json
 
 
 # ================================
@@ -130,13 +133,23 @@ class EntropyScheduleCallback(BaseCallback):
 # Custom Logger Callback (portfolio metrics into tb logs)
 # ================================
 class EpisodePortfolioSB3LoggerCallback(BaseCallback):
-    def __init__(self, tag_prefix: str = "train", verbose: int = 0):
+    def __init__(self, tag_prefix: str = "train", log_freq: int = 100, verbose: int = 0):
         super().__init__(verbose)
+
         self.tag_prefix = tag_prefix
+        self.log_freq = log_freq
+        self.episode_count = 0 # Track completed episodes
 
     def _on_step(self) -> bool:
         info = self.locals.get("infos", [{}])[0]
         if info.get("episode_final", False):
+            self.episode_count += 1
+
+            # Only log every log_freq episodes
+            if self.episode_count % self.log_freq != 0:
+                return True # Skip logging but continue training
+            
+            # Extract portfolio metrics from info dict
             pv = info.get("portfolio_final_value", None)
             comp_pv = info.get("comparison_final_value", None)
             bench = info.get("benchmark_final_value", None)
@@ -159,6 +172,224 @@ class EpisodePortfolioSB3LoggerCallback(BaseCallback):
             if dd is not None:
                 self.model.logger.record(f"{self.tag_prefix}/episode_max_drawdown", dd, exclude=("stdout",))
         return True
+
+
+class ValidationMetricsCallback(BaseCallback):
+    """
+    Captures metrics from EvalCallback's evaluation episodes.
+    Must be passed TO the EvalCallback as a callback parameter.
+    """
+    def __init__(self, tag_prefix: str = "validation", verbose: int = 0):
+        super().__init__(verbose)
+        self.tag_prefix = tag_prefix
+        self.eval_episode_count = 0
+
+        # Buffers to accumulate per-episode metrics
+        self.pv_buffer = []
+        self.comp_pv_buffer = []
+        self.bench_buffer = []
+        self.ret_buffer = []
+        self.sharpe_buffer = []
+        self.dd_buffer = []
+        self.alpha_ret_buffer = []
+        self.cum_reward_buffer = []
+
+    def _on_step(self) -> bool:
+        """Called during evaluation episodes (by EvalCallback)."""
+        info = self.locals.get("infos", [{}])[0]
+        if info.get("episode_final", False):
+            self.eval_episode_count += 1
+            
+            # Extract metrics
+            pv = info.get("portfolio_final_value", None)
+            comp_pv = info.get("comparison_final_value", None)
+            bench = info.get("benchmark_final_value", None)
+            ret = info.get("portfolio_return", None)
+            sharpe = info.get("episode_sharpe", None)
+            dd = info.get("episode_max_drawdown", None)
+            alpha_ret = info.get("alpha_return", None)
+            cum_reward = info.get("cumulative_reward", None)
+            
+            # Accumulate all eval episode metricsin buffers
+            if pv is not None:
+                self.pv_buffer.append(pv)
+            if comp_pv is not None:
+                self.comp_pv_buffer.append(comp_pv)
+            if bench is not None:
+                self.bench_buffer.append(bench)
+            if ret is not None:
+                self.ret_buffer.append(ret)
+            if sharpe is not None:
+                self.sharpe_buffer.append(sharpe)
+            if dd is not None:
+                self.dd_buffer.append(dd)
+            if alpha_ret is not None:
+                self.alpha_ret_buffer.append(alpha_ret)
+            if cum_reward is not None:
+                self.cum_reward_buffer.append(cum_reward)
+                
+        return True
+    
+    def flush_metrics(self, n_eval_episodes: int) -> None:
+        """
+        Called after all eval episodes complete to log aggregated metrics.
+        
+        Args:
+            n_eval_episodes: expected number of episodes (used to verify buffer is full)
+        """
+        # Only log if we have accumulated the expected number of episodes
+        if self.eval_episode_count < n_eval_episodes:
+            return
+        
+        # Compute and log means
+        if self.pv_buffer:
+            mean_pv = float(np.mean(self.pv_buffer))
+            self.model.logger.record(f"{self.tag_prefix}/portfolio_final_value_mean", mean_pv, exclude=("stdout",))
+            std_pv = float(np.std(self.pv_buffer))
+            self.model.logger.record(f"{self.tag_prefix}/portfolio_final_value_std", std_pv, exclude=("stdout",))
+        
+        if self.comp_pv_buffer:
+            mean_comp = float(np.mean(self.comp_pv_buffer))
+            self.model.logger.record(f"{self.tag_prefix}/comparison_final_value_mean", mean_comp, exclude=("stdout",))
+        
+        if self.pv_buffer and self.comp_pv_buffer:
+            return_diffs = [pv - comp for pv, comp in zip(self.pv_buffer, self.comp_pv_buffer)]
+            mean_return_diff = float(np.mean(return_diffs))
+            self.model.logger.record(f"{self.tag_prefix}/return_diff_vs_init_mean", mean_return_diff, exclude=("stdout",))
+        
+        if self.bench_buffer:
+            mean_bench = float(np.mean(self.bench_buffer))
+            self.model.logger.record(f"{self.tag_prefix}/benchmark_final_value_mean", mean_bench, exclude=("stdout",))
+        
+        if self.ret_buffer:
+            mean_ret = float(np.mean(self.ret_buffer))
+            self.model.logger.record(f"{self.tag_prefix}/portfolio_return_mean", mean_ret, exclude=("stdout",))
+            std_ret = float(np.std(self.ret_buffer))
+            self.model.logger.record(f"{self.tag_prefix}/portfolio_return_std", std_ret, exclude=("stdout",))
+        
+        if self.sharpe_buffer:
+            mean_sharpe = float(np.mean(self.sharpe_buffer))
+            self.model.logger.record(f"{self.tag_prefix}/episode_sharpe_mean", mean_sharpe, exclude=("stdout",))
+            std_sharpe = float(np.std(self.sharpe_buffer))
+            self.model.logger.record(f"{self.tag_prefix}/episode_sharpe_std", std_sharpe, exclude=("stdout",))
+        
+        if self.dd_buffer:
+            mean_dd = float(np.mean(self.dd_buffer))
+            self.model.logger.record(f"{self.tag_prefix}/episode_max_drawdown_mean", mean_dd, exclude=("stdout",))
+        
+        if self.alpha_ret_buffer:
+            mean_alpha = float(np.mean(self.alpha_ret_buffer))
+            self.model.logger.record(f"{self.tag_prefix}/alpha_return_mean", mean_alpha, exclude=("stdout",))
+        
+        if self.cum_reward_buffer:
+            mean_cum_reward = float(np.mean(self.cum_reward_buffer))
+            self.model.logger.record(f"{self.tag_prefix}/cumulative_reward_mean", mean_cum_reward, exclude=("stdout",))
+        
+        # Reset buffers for next eval run
+        self._reset_buffers()
+    
+    def _reset_buffers(self) -> None:
+        """Reset all accumulation buffers."""
+        self.pv_buffer = []
+        self.comp_pv_buffer = []
+        self.bench_buffer = []
+        self.ret_buffer = []
+        self.sharpe_buffer = []
+        self.dd_buffer = []
+        self.alpha_ret_buffer = []
+        self.cum_reward_buffer = []
+        self.eval_episode_count = 0
+    
+
+class EvalCallbackWithMetrics(BaseCallback):
+    """
+    Eval callback that forwards each eval step to a per-episode metrics callback
+    (e.g., ValidationMetricsCallback) while preserving SB3 eval logging.
+    """
+    def __init__(
+        self,
+        eval_env,
+        best_model_save_path,
+        log_path,
+        eval_freq: int,
+        n_eval_episodes: int,
+        deterministic: bool,
+        render: bool,
+        callback_on_new_best=None,
+        callback_after_eval=None,
+        eval_step_callback: Optional[BaseCallback] = None,
+        warn: bool = True,
+        verbose: int = 0,
+    ):
+        super().__init__(verbose)
+        self.eval_env = eval_env
+        self.best_model_save_path = best_model_save_path
+        self.log_path = log_path
+        self.eval_freq = eval_freq
+        self.n_eval_episodes = n_eval_episodes
+        self.deterministic = deterministic
+        self.render = render
+        self.callback_on_new_best = callback_on_new_best
+        self.callback_after_eval = callback_after_eval
+        self.eval_step_callback = eval_step_callback
+        self.warn = warn
+        self.best_mean_reward = -np.inf
+        self.n_eval_calls = 0
+
+    def _init_callback(self) -> None:
+        if self.best_model_save_path is not None:
+            os.makedirs(self.best_model_save_path, exist_ok=True)
+        if self.eval_step_callback is not None:
+            self.eval_step_callback.init_callback(self.model)
+
+    def _on_step(self) -> bool:
+        if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
+            def _step_cb(locals_, globals_):
+                if self.eval_step_callback is None:
+                    return True
+                self.eval_step_callback.locals = locals_
+                self.eval_step_callback.globals = globals_
+                return bool(self.eval_step_callback.on_step())
+
+            episode_rewards, episode_lengths = evaluate_policy(
+                self.model,
+                self.eval_env,
+                n_eval_episodes=self.n_eval_episodes,
+                deterministic=self.deterministic,
+                render=self.render,
+                return_episode_rewards=True,
+                warn=self.warn,
+                callback=_step_cb,
+            )
+            self.n_eval_calls += 1
+
+            # Flush aggregated validation metrics after all eval episodes complete
+            if self.eval_step_callback is not None:
+                self.eval_step_callback.flush_metrics(self.n_eval_episodes)
+                
+            # Log standard SB3 eval metrics
+            mean_reward, std_reward = np.mean(episode_rewards), np.std(episode_rewards)
+            mean_ep_length = np.mean(episode_lengths)
+            self.model.logger.record("eval/mean_reward", float(mean_reward))
+            self.model.logger.record("eval/std_reward", float(std_reward))
+            self.model.logger.record("eval/mean_ep_length", float(mean_ep_length))
+            if self.log_path is not None:
+                np.savez(
+                    os.path.join(self.log_path, "evaluations.npz"),
+                    timesteps=np.array([self.num_timesteps]),
+                    results=np.array([episode_rewards]),
+                    ep_lengths=np.array([episode_lengths]),
+                )
+            if mean_reward > self.best_mean_reward:
+                self.best_mean_reward = mean_reward
+                if self.best_model_save_path is not None:
+                    self.model.save(os.path.join(self.best_model_save_path, "best_model"))
+                if self.callback_on_new_best is not None:
+                    self.callback_on_new_best.on_step()
+            if self.callback_after_eval is not None:
+                self.callback_after_eval.on_step()
+        return True
+
 
 class ProgressSyncCallback(BaseCallback):
     def __init__(self, verbose: int = 0):
@@ -397,7 +628,7 @@ def build_model(env: gym.Env, config: Dict[str, Any]) -> RecurrentPPO:
     return model
 
 
-def build_eval_callback(eval_env: gym.Env, config: Dict[str, Any], log_dir: str) -> EvalCallback:
+def build_eval_callback(eval_env: gym.Env, config: Dict[str, Any], log_dir: str) -> BaseCallback:
     """
     Build an evaluation callback to periodically assess policy on validation blocks.
 
@@ -414,14 +645,19 @@ def build_eval_callback(eval_env: gym.Env, config: Dict[str, Any], log_dir: str)
     n_eval_episodes = int(train_cfg.get("n_eval_episodes", 10))
     deterministic = bool(train_cfg.get("eval_deterministic", False))
 
-    callback = EvalCallback(
+    val_metrics_cb = ValidationMetricsCallback(tag_prefix='validation')
+
+    callback = EvalCallbackWithMetrics(
         eval_env=eval_env,
         best_model_save_path=log_dir,
         log_path=log_dir,
         eval_freq=eval_freq,
         n_eval_episodes=n_eval_episodes,
         deterministic=deterministic,
-        render=False
+        render=False,
+        callback_on_new_best=None,
+        callback_after_eval=None,
+        eval_step_callback=val_metrics_cb
     )
     return callback
 
@@ -505,14 +741,45 @@ def run(cache, config: Dict[str, Any]) -> Dict[str, Any]:
     # Build model
     model = build_model(vec_train, config)
 
-    # Logging and checkpoints
     agent_dir = os.path.join(os.path.dirname(__file__))
-    log_dir = os.path.join(agent_dir, "logs")
-    os.makedirs(log_dir, exist_ok=True)
-    model_path = os.path.join(agent_dir, "recurrent_ppo_target_pos_model.zip")
+
+    # Generate custom TensorBoard log name: XXXXX_config_ZZZZZ_YY_MM_DD
+    # Extract run_id from json file and increment it
+    # run_id = str(config.get("training", {}).get("run_id", "00001")).zfill(5)
+    # Load run_id from JSON file
+    run_id_file = r"C:\Users\HansenSimonO\Documents\Coding\PyTradeTwo\pytrade-two\src\data\run_id.json"
+    with open(run_id_file, 'r') as f:
+        run_id_data = json.load(f)
+
+    current_run_id = int(run_id_data.get("run_id", 0))
+    next_run_id = current_run_id + 1
+
+    # Save incremented run_id back to JSON
+    with open(run_id_file, 'w') as f:
+        json.dump({"run_id": next_run_id}, f)
+
+    run_id = str(current_run_id).zfill(5)
+    config_id = str(config.get("training", {}).get("config_id", "00000")).zfill(5)
+    
+    # Get current date in YY_MM_DD format
+    date_str = datetime.now().strftime("%y_%m_%d")
+    
+    # Format: XXXXX_config_ZZZZZ_YY_MM_DD
+    tb_log_name = f"{run_id}_config_{config_id}_{date_str}"
+
+    # Create saved_models directory for model checkpoints
+    saved_models_dir = os.path.join(agent_dir, "saved_models")
+    os.makedirs(saved_models_dir, exist_ok=True)
+    
+    # Model path with same name as TB log
+    model_path = os.path.join(saved_models_dir, f"{tb_log_name}.zip")
+    
+    # EvalCallback best model path (also in saved_models, subfolder with run name)
+    best_model_dir = os.path.join(saved_models_dir, tb_log_name)
+    os.makedirs(best_model_dir, exist_ok=True)
 
     # Evaluation callback
-    eval_cb = build_eval_callback(vec_eval, config, log_dir)
+    eval_cb = build_eval_callback(vec_eval, config, best_model_dir)
 
     # Entropy schedule callback (only if schedule keys are present)
     acfg = config.get("agent", {})
@@ -523,17 +790,25 @@ def run(cache, config: Dict[str, Any]) -> Dict[str, Any]:
             warmup_pct=float(acfg["ent_coef_schedule_warmup_pct"]),
             ramping_pct=float(acfg["ent_coef_schedule_ramping_pct"]),
         )
+    else:
+        ent_cb = None # No entropy schedule handling
 
-
-    # Custom logger callback for training/validation portfolio metrics
-    train_tb_cb = EpisodePortfolioSB3LoggerCallback(tag_prefix="train")
-    val_tb_cb = EpisodePortfolioSB3LoggerCallback(tag_prefix="validation")
+    # Training metrics callback with throttling
+    train_cfg = config.get("training", {})
+    train_log_freq = int(train_cfg.get("train_log_freq", 50))  # NEW CONFIG KEY
+    train_tb_cb = EpisodePortfolioSB3LoggerCallback(
+        tag_prefix="train", 
+        log_freq=train_log_freq  # Log every 50 episodes by default
+    )
 
     # Progress sync callback to propagate progress_remaining to envs
     progress_sync_cb = ProgressSyncCallback()
 
-    # Build callback list with all available callbacks
-    callback = [eval_cb, ent_cb, progress_sync_cb, train_tb_cb, val_tb_cb] 
+    # Build callback list (validation callback is now inside eval_cb)
+    if ent_cb is not None:
+        callback = [eval_cb, ent_cb, progress_sync_cb, train_tb_cb]
+    else:
+        callback = [eval_cb, progress_sync_cb, train_tb_cb]
 
     # ----------- Train -----------------
     total_timesteps = int(config.get("training", {}).get("total_timesteps", 300_000))
@@ -544,7 +819,8 @@ def run(cache, config: Dict[str, Any]) -> Dict[str, Any]:
     model.learn(
         total_timesteps=total_timesteps, 
         callback=callback, 
-        progress_bar=True
+        progress_bar=True,
+        tb_log_name=tb_log_name
     )
     # Endtime
     t1 = time.time()
@@ -560,6 +836,9 @@ def run(cache, config: Dict[str, Any]) -> Dict[str, Any]:
         "total_timesteps": total_timesteps,
         "elapsed_sec": round(t1 - t0, 2),
         "model_path": model_path,
+        "tb_log_name": tb_log_name,
+        "run_id": run_id,
+        "config_id": config_id,
         "n_steps": int(agent_cfg.get("n_steps", 128)),
         "batch_size": int(agent_cfg.get("batch_size", 256)),
         "gamma": float(agent_cfg.get("gamma", 0.99)),

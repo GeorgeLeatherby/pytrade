@@ -328,7 +328,7 @@ class EpisodeBuffer:
 
     def get_returns_window(self, window: int) -> np.ndarray:
         """Get last N returns for risk calculations (no wrap-around, no ring buffer)"""
-        end_idx = self.current_step + 1
+        end_idx = self.current_step
         start_idx = max(0, end_idx - window)
         return self.returns[start_idx:end_idx]
     
@@ -356,7 +356,7 @@ class EpisodeBuffer:
         Returns 0.0 until a positive portfolio value is observed.
         Completely avoids NaNs/Infs from 0/0 situations in warm-up.
         """
-        end_idx = self.current_step + 1
+        end_idx = self.current_step
         if end_idx <= 0:
             return 0.0
         start_idx = max(0, end_idx - window)
@@ -1487,26 +1487,40 @@ class TradingEnv(gym.Env):
         initial_prices = self._get_current_prices(self.current_absolute_step)
         
         num_assets = self.market_data_cache.num_assets
-        initial_positions = np.zeros(num_assets, dtype=np.float32) # Does not contain cash
-        
+        initial_positions = np.zeros(num_assets, dtype=np.float32)
+        initial_cash = self.initial_portfolio_value  # Default to all cash
+        total_init_tc = 0.0  # Track initialization costs
+
         # Single-asset target position mode: cash-only or random allocation between cash and selected asset
         if self.execution_mode == SINGLE_ASSET_TARGET_POS:
             # Single asset tradable only! Other assets may not be initialised and traded
             # Uses perc_of_cash_only_starts (range: 0-1) to determine cash-only or random allocation start
             if np.random.random() < self.perc_of_cash_only_starts:
-                # Cash-only start
+                # Cash-only start (no transaction costs)
                 initial_cash = self.initial_portfolio_value
                 initial_positions[self.selected_asset_index] = 0.0
             else:
                 # Random allocation between cash and selected asset only
                 rand_weight = np.random.random()  # between 0 and 1
-                initial_cash = self.initial_portfolio_value * (1.0 - rand_weight)
-                asset_allocation = self.initial_portfolio_value * rand_weight
                 
+                # Calculate target position
+                asset_allocation = self.initial_portfolio_value * rand_weight
                 if initial_prices[self.selected_asset_index] > 0:
-                    initial_positions[self.selected_asset_index] = asset_allocation / initial_prices[self.selected_asset_index]
+                    target_shares = asset_allocation / initial_prices[self.selected_asset_index]
                 else:
                     raise ValueError(f"Initial price for selected asset index {self.selected_asset_index} is zero or negative.")
+                
+                # Build target positions vector (only selected asset, others zero)
+                target_positions = np.zeros(num_assets, dtype=np.float32)
+                target_positions[self.selected_asset_index] = target_shares
+                
+                # Apply transaction costs
+                initial_cash, initial_positions, total_init_tc = self._initialize_portfolio_with_costs(
+                    target_positions=target_positions,
+                    initial_prices=initial_prices,
+                    initial_value=self.initial_portfolio_value,
+                    allow_cash_residual=False
+                )
 
         # Portfolio mode: random weights across all assets + cash, ensuring minimum cash allocation
         else:
@@ -1524,7 +1538,7 @@ class TradingEnv(gym.Env):
                 asset_weights_sum = asset_weights.sum()
                 
                 if asset_weights_sum > 0:
-                # Rescale asset weights to fit remaining allocation
+                    # Rescale asset weights to fit remaining allocation
                     remaining_allocation = 1.0 - cash_weight
                     asset_weights = asset_weights * (remaining_allocation / asset_weights_sum)
                 else:
@@ -1535,16 +1549,30 @@ class TradingEnv(gym.Env):
                 # Update the weights array
                 random_weights = np.concatenate(([cash_weight], asset_weights))
             
-            # Calculate initial cash and positions from weights
-            initial_cash = self.initial_portfolio_value * random_weights[0]
+            # Calculate target positions from weights
             asset_weights = random_weights[1:]
+            target_positions = np.zeros(num_assets, dtype=np.float32)
             
-            # Calculate initial positions (shares to buy)
-            initial_positions = np.zeros(num_assets, dtype=np.float32)
             for i in range(num_assets):
                 asset_allocation = self.initial_portfolio_value * asset_weights[i]
                 if asset_allocation > 0 and initial_prices[i] > 0:
-                    initial_positions[i] = asset_allocation / initial_prices[i]
+                    target_positions[i] = asset_allocation / initial_prices[i]
+            
+            # Apply transaction costs (reserves intended cash weight from portfolio value)
+            intended_cash = self.initial_portfolio_value * random_weights[0]
+            available_for_assets = self.initial_portfolio_value - intended_cash
+            
+            initial_cash, initial_positions, total_init_tc = self._initialize_portfolio_with_costs(
+                target_positions=target_positions,
+                initial_prices=initial_prices,
+                initial_value=available_for_assets,
+                allow_cash_residual=True,
+                max_iterations=10
+            )
+            # Add back the intended cash reserve
+            initial_cash += intended_cash
+
+        # from here same logic for all modes ----------------------------------
 
         # Update portfolio state instance
         self.portfolio_state.portfolio_reset(
@@ -1557,22 +1585,17 @@ class TradingEnv(gym.Env):
 
         # update comparison portfolio in the same way to be able to verify if trades are giving alpha vs initialisation
         init_cash_comparison = initial_cash
-        init_positions = initial_positions
+        init_positions_comparison = initial_positions.copy()
 
         self.comparison_portfolio_state.portfolio_reset(
             cash=init_cash_comparison,
-            positions=init_positions,
+            positions=init_positions_comparison,
             prices=initial_prices,
             step=self.current_step,
             terminated=False
         )
 
-        # Validate initial portfolio value matches configuration
-        actual_initial_value = self.portfolio_state.get_total_value()
-        if abs(actual_initial_value - self.initial_portfolio_value) > 1: # dollar - level accuracy
-            raise ValueError(f"Portfolio initialization error: {actual_initial_value} != {self.initial_portfolio_value}")
-
-        # Update Benchmark Portfolio (custom allocation, no cash)
+        # Update Benchmark Portfolio (custom allocation, no cash - fully invested)
         benchmark_target_weights = {
             "SPY": 0.45,
             "Gold": 0.20,
@@ -1603,25 +1626,51 @@ class TradingEnv(gym.Env):
         if abs(present_weight_sum - 1.0) > 1e-6:
             bench_weights /= present_weight_sum  # scale remaining to sum 1
 
-        # Convert weights (no cash) into positions
-        benchmark_position_values = self.initial_portfolio_value * bench_weights
-        benchmark_positions = np.where(initial_prices > 0,
-                                       benchmark_position_values / initial_prices,
-                                       0.0).astype(np.float32)
-        
+        # Convert weights to target positions (gross, before costs)
+        benchmark_target_positions = np.zeros(num_assets, dtype=np.float32)
+        for i in range(num_assets):
+            if bench_weights[i] > 0 and initial_prices[i] > 0:
+                allocation = self.initial_portfolio_value * bench_weights[i]
+                benchmark_target_positions[i] = allocation / initial_prices[i]
+
+        # Apply transaction costs with full investment constraint (allow small cash residual)
+        benchmark_cash, benchmark_positions, benchmark_tc = self._initialize_portfolio_with_costs(
+            target_positions=benchmark_target_positions,
+            initial_prices=initial_prices,
+            initial_value=self.initial_portfolio_value,
+            allow_cash_residual=True,  # Key difference: allows small residual
+            max_iterations=10
+        )
+
         self.benchmark_portfolio_state.portfolio_reset(
-            cash=0.0,
+            cash=benchmark_cash,  # Will be small (< $1) or zero
             positions=benchmark_positions,
             prices=initial_prices,
             step=self.current_step,
             terminated=False
         )
 
+        # Validate initial portfolio value matches configuration (allowing for small rounding)
+        actual_initial_value = self.portfolio_state.get_total_value()
+        if abs(actual_initial_value - self.initial_portfolio_value) > 100:  # $100 tolerance for TC rounding
+            print(f"\nPortfolio initialization error: {actual_initial_value} != {self.initial_portfolio_value}")
+
+        # Validate comparison portfolio value matches configuration (allowing for small rounding)
+        actual_initial_value = self.comparison_portfolio_state.get_total_value()
+        if abs(actual_initial_value - self.initial_portfolio_value) > 100:  # $100 tolerance for TC rounding
+            print(f"\nComparison portfolio initialization error: {actual_initial_value} != {self.initial_portfolio_value}")
+
+        # Validate benchmark portfolio value matches configuration (allowing for small rounding)
+        actual_initial_value = self.benchmark_portfolio_state.get_total_value()
+        if abs(actual_initial_value - self.initial_portfolio_value) > 100:  # $100 tolerance for TC rounding
+            print(f"Benchmark portfolio initialization error: {actual_initial_value} != {self.initial_portfolio_value}")
+
         # Seed a pre-step entry in the EpisodeBuffer so the first observation contains real weights
         initial_weights = self.portfolio_state.get_weights().astype(np.float32)
         zero_action = np.zeros(self.market_data_cache.num_assets + 1, dtype=np.float32)
+
         self.episode_buffer.record_step(
-            external_step=0,  # BEFORE: mapped to internal index lookback_window - 1, or -1 directly
+            external_step=0, 
             portfolio_value=actual_initial_value,
             weights=initial_weights,
             portfolio_positions=self.portfolio_state.positions.copy(),
@@ -1756,7 +1805,6 @@ class TradingEnv(gym.Env):
 
         trade_results: List[Dict[str, Any]] = []
 
-
         # Default entropy initialization; override in specific modes when computed
         diagnostic_entropy = 0.0
         raw_logits_mean = 0.0
@@ -1781,7 +1829,9 @@ class TradingEnv(gym.Env):
             if len(action) != 1:
                 raise ValueError("Action length must be 1 for SINGLE_ASSET_TARGET_POS mode.")
             
+            # Get desired target position change
             target_position_change = float(action[0])  # scalar target position change for selected asset in [-1.0, 1.0]
+            # Validate target position change
             if np.isnan(target_position_change) or np.isinf(target_position_change):
                 raise ValueError("Action contains NaN or Inf values.")
             
@@ -1835,9 +1885,8 @@ class TradingEnv(gym.Env):
                 portfolio_state=self.portfolio_state
             )
 
+        # ------- Simple/Tranche instruction path -------
         else:
-
-            # ------- Simple/Tranche instruction path -------
             # Action must be a list of TradeInstruction or dicts
             if not isinstance(action, (list, tuple)):
                 raise ValueError("In simple/tranche modes, action must be a list of TradeInstruction or dicts.")
@@ -1877,7 +1926,6 @@ class TradingEnv(gym.Env):
 
         # ---------------- FROM HERE ALL MODES SHARE THE SAME PROCESSING ------------
 
-
         # ADVANCE TIME -----------------------------------------------------
         self.current_step += 1
         self.current_absolute_step = int(self.current_episode_start_step + self.current_step)
@@ -1916,6 +1964,57 @@ class TradingEnv(gym.Env):
             action=(action if self.execution_mode == EXECUTION_PORTFOLIO else None)
         )
 
+        # Construct action vector for episode buffer:
+            # Single Asset target position mode: store [net_cash_delta, per-asset traded $] computed from execution_result.
+            # Portfolio mode: store weights action (as before).
+            # Simple/Tranche: store [net_cash_delta, per-asset traded $] computed from execution_result.
+
+        if self.execution_mode == SINGLE_ASSET_TARGET_POS:
+            net_asset_dollars = execution_result.traded_notional_per_asset.copy()
+            net_asset_dollars[np.isnan(net_asset_dollars)] = 0.0
+            net_cash_delta = -float(np.sum(net_asset_dollars))  # costs handled separately in transaction_cost
+            action_vec = np.concatenate([[net_cash_delta], net_asset_dollars]).astype(np.float32)
+
+        elif self.execution_mode == EXECUTION_PORTFOLIO:
+            action_vec = action_weights.astype(np.float32)
+
+        else:
+            net_asset_dollars = execution_result.traded_notional_per_asset.copy()
+            net_asset_dollars[np.isnan(net_asset_dollars)] = 0.0
+            net_cash_delta = -float(np.sum(net_asset_dollars))  # costs handled separately in transaction_cost
+            action_vec = np.concatenate([[net_cash_delta], net_asset_dollars]).astype(np.float32)
+
+        # Record step data ---------------------------------------
+        current_weights_after_execution = self.portfolio_state.get_weights()
+        daily_return = (portfolio_value_after / portfolio_value_before - 1.0 if portfolio_value_before > 0 else 0.0)
+        
+        # FIX: Set external step to current step (already incremented)
+        external_step = self.current_step  # zero-based index for buffer, is called first time at reset!
+
+        # Record step in episode buffer
+        self.episode_buffer.record_step(
+            external_step=external_step,
+            portfolio_value=float(portfolio_value_after),
+            portfolio_positions=self.portfolio_state.positions.copy(),
+            weights=current_weights_after_execution.copy(),
+            daily_return=float(daily_return),
+            reward=float(allocator_reward),
+            action=action_vec.copy(),
+            transaction_cost=float(execution_result.transaction_cost),
+            prices=new_prices.copy(),
+            sharpe_ratio=reward_parts.get("sharpe_ratio", 0.0),
+            drawdown=reward_parts.get("max_drawdown", 0.0),
+            volatility=reward_parts.get("volatility", 0.0),
+            turnover=reward_parts.get("turnover_component", 0.0),
+            alpha=reward_parts.get("raw_alpha", 0.0),
+            traded_dollar_volume=float(execution_result.traded_dollar_value),
+            traded_shares_total=float(execution_result.traded_shares_total),
+            action_entropy=float(diagnostic_entropy),
+            reward_parts={k: float(v) for k, v in reward_parts.items()},
+            benchmark_portfolio_value=float(benchmark_portfolio_value_after),
+            comparison_portfolio_value=float(comparison_portfolio_value_after)
+        )
+
         # Check termination conditions -----------------------------------
         low_value_cond = portfolio_value_after <= self.threshold_val
         zero_value_cond = portfolio_value_after < 0.0
@@ -1937,54 +2036,8 @@ class TradingEnv(gym.Env):
             # Print all triggered reasons together
             print(f"Episode {self.current_episode} terminated early due to: " + "; ".join(reasons))
         
-        truncated = self.current_step >= self.episode_length_days # step limit reached in days
+        truncated = self.current_step >= self.episode_length_days -1  # step limit reached in days
         self.portfolio_state.terminated = terminated or truncated
- 
-        # Record step data
-        current_weights_after_execution = self.portfolio_state.get_weights()
-        daily_return = (portfolio_value_after / portfolio_value_before - 1.0 if portfolio_value_before > 0 else 0.0)
-        
-        # FIX: off-by-one error in episode buffer recording
-        external_step = self.current_step - 1  # zero-based index for buffer
-
-        # Construct action vector for buffer:
-            # Single Asset target position mode: store [net_cash_delta, per-asset traded $] computed from execution_result.
-            # Portfolio mode: store weights action (as before).
-            # Simple/Tranche: store [net_cash_delta, per-asset traded $] computed from execution_result.
-
-        if self.execution_mode == SINGLE_ASSET_TARGET_POS:
-            net_asset_dollars = execution_result.traded_notional_per_asset.copy()
-            net_asset_dollars[np.isnan(net_asset_dollars)] = 0.0
-            net_cash_delta = -float(np.sum(net_asset_dollars))  # costs handled separately in transaction_cost
-            action_vec = np.concatenate([[net_cash_delta], net_asset_dollars]).astype(np.float32)
-
-        elif self.execution_mode == EXECUTION_PORTFOLIO:
-            action_vec = action_weights.astype(np.float32)
-
-        else:
-            net_asset_dollars = execution_result.traded_notional_per_asset.copy()
-            net_asset_dollars[np.isnan(net_asset_dollars)] = 0.0
-            net_cash_delta = -float(np.sum(net_asset_dollars))  # costs handled separately in transaction_cost
-            action_vec = np.concatenate([[net_cash_delta], net_asset_dollars]).astype(np.float32)
-
-        # Record step in episode buffer
-        self.episode_buffer.record_step(
-            external_step=external_step,
-            portfolio_value=portfolio_value_after,
-            portfolio_positions=self.portfolio_state.positions,
-            weights=current_weights_after_execution,
-            daily_return=daily_return,
-            reward=allocator_reward,
-            action=action_vec,
-            transaction_cost=execution_result.transaction_cost,
-            prices=new_prices,
-            traded_dollar_volume=execution_result.traded_dollar_value,
-            traded_shares_total=execution_result.traded_shares_total,
-            action_entropy=diagnostic_entropy,
-            reward_parts=reward_parts,
-            benchmark_portfolio_value=benchmark_portfolio_value_after,
-            comparison_portfolio_value=comparison_portfolio_value_after
-        )
         
         # Prepare info
         info = self._get_info()
@@ -2255,8 +2308,9 @@ class TradingEnv(gym.Env):
         delta = portfolio_return_absolut - self.running_mean_ema
         self.running_mean_ema += self.sortino_eta * delta
 
-        downside_sq_ema = portfolio_return_absolut**2 if portfolio_return_absolut < 0 else 1e-9
-        delta_downside = downside_sq_ema - self.running_downside_variance_ema
+        downside_sq_ema = portfolio_return_absolut**2 if portfolio_return_absolut < 0 else 0
+        downside = max(downside_sq_ema, 1e-8)  # avoid zero downside
+        delta_downside = downside - self.running_downside_variance_ema
         self.running_downside_variance_ema += self.sortino_eta * delta_downside
 
         # 2. Calc real-time Sortino
@@ -2268,7 +2322,7 @@ class TradingEnv(gym.Env):
         self.previous_sortino = current_sortino
 
         # 4. Clip reward
-        gain = float(3.0)
+        gain = float(3.5)
         reward = float(np.tanh(gain * reward))
 
         # START OF OLD REWARD CALCULATION LOGIC
@@ -2328,12 +2382,10 @@ class TradingEnv(gym.Env):
         if self.current_step > 0:
             if self.maybe_provide_sequence:
                 prev_w = self.episode_buffer.portfolio_weights[
-                    self.episode_buffer.lookback_window + (self.current_step - 1)
-                ]
+                    self.episode_buffer.lookback_window + self.current_step -1]
             else:
                 prev_w = self.episode_buffer.portfolio_weights[
-                    (self.current_step - 1)
-                ]
+                    self.current_step -1]
             turnover = float(np.sum(np.abs(current_weights[1:] - prev_w[1:])))
         else:
             turnover = 0.0
@@ -3014,6 +3066,90 @@ class TradingEnv(gym.Env):
 
         return float(commission_cost + spread_cost + impact_cost + fixed_cost)
     
+    def _initialize_portfolio_with_costs(
+        self, 
+        target_positions: np.ndarray, 
+        initial_prices: np.ndarray,
+        initial_value: float,
+        allow_cash_residual: bool = True,
+        max_iterations: int = 6
+    ) -> Tuple[float, np.ndarray, float]:
+        """
+        Calculate initial portfolio positions accounting for transaction costs.
+        
+        For portfolios that must be fully invested (benchmark), iteratively reduces
+        position sizes to ensure costs can be paid while leaving minimal cash.
+        
+        Args:
+            target_positions: Desired positions in shares [num_assets]
+            initial_prices: Asset prices at initialization [num_assets]
+            initial_value: Total portfolio value to allocate
+            allow_cash_residual: If True, allows small cash remainder (for benchmark)
+            max_iterations: Max adjustment iterations (3 is sufficient for convergence)
+        
+        Returns:
+            Tuple of (final_cash, final_positions, transaction_costs)
+        """
+        num_assets = len(target_positions)
+        
+        # Calculate transaction costs for target positions
+        tc = self._calculate_transaction_costs(
+            shares_traded=target_positions,
+            prices=initial_prices,
+            abs_step=self.current_absolute_step,
+            asset_mask=None
+        )
+        
+        # Calculate gross cost (positions + transaction costs)
+        position_notional = np.sum(target_positions * initial_prices)
+        total_cost = position_notional + tc
+        
+        # Case 1: Standard portfolio (with intended cash allocation)
+        if not allow_cash_residual:
+            # Simple: reduce available cash by transaction costs
+            final_cash = initial_value - total_cost
+            return float(final_cash), target_positions.copy(), float(tc)
+        
+        # Case 2: Fully-invested portfolio (benchmark)
+        # Must iteratively adjust to ensure: positions + costs <= initial_value
+        # and leave minimal cash (< $1)
+        
+        if total_cost <= initial_value:
+            # Lucky case: already fits with small residual
+            final_cash = initial_value - total_cost
+            return float(final_cash), target_positions.copy(), float(tc)
+        
+        # Need to scale down positions iteratively
+        scale_factor = 1.0
+        final_positions = target_positions.copy()
+        
+        for iteration in range(max_iterations):
+            # Reduce scale factor to fit budget
+            scale_factor *= (initial_value / total_cost) * 0.99  # 1% buffer for convergence
+            final_positions = target_positions * scale_factor
+            
+            # Recalculate costs with scaled positions
+            tc = self._calculate_transaction_costs(
+                shares_traded=final_positions,
+                prices=initial_prices,
+                abs_step=self.current_absolute_step,
+                asset_mask=None
+            )
+            
+            position_notional = np.sum(final_positions * initial_prices)
+            total_cost = position_notional + tc
+            
+            # Check if we're within budget
+            if total_cost <= initial_value:
+                final_cash = initial_value - total_cost
+                # Accept if cash residual is small (< $20) or we've hit max iterations
+                if final_cash < 20.0 or iteration == max_iterations - 1:
+                    return float(final_cash), final_positions.astype(np.float32), float(tc)
+        
+        # Fallback: return best effort (should rarely reach here)
+        final_cash = max(0.0, initial_value - total_cost)
+        return float(final_cash), final_positions.astype(np.float32), float(tc)
+
     def _check_execution_thresholds(self, target_weights: np.ndarray, portfolio_state: PortfolioState) -> Tuple[bool, np.ndarray]:
         """
         Determine if execution should occur based on multiple thresholds.
@@ -3126,8 +3262,8 @@ class TradingEnv(gym.Env):
         """
 
         # Use the last recorded external step from EpisodeBuffer for portfolio features
-        # We recorded with external_step = self.current_step - 1
-        external_step_for_obs = max(self.current_step - 1, 0) # Clamp to valid range
+        # We recorded with external_step = self.current_step
+        external_step_for_obs = self.current_step
         if self.maybe_provide_sequence:
             internal_step = external_step_for_obs + self.lookback_window
         else:

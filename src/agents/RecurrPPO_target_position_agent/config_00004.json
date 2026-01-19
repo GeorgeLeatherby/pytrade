@@ -4,14 +4,14 @@
         "initial_portfolio_value": 10000,
         "episode_length_days": 252,
         "lookback_window": 0,
-        "early_stopping_threshold": 0.3,
+        "early_stopping_threshold": 0.2,
         "cash_return_rate": 0.0,
         "seed": 42,
         "maybe_provide_sequence": false,
-        "block_buffer_multiplier": 1,
+        "block_buffer_multiplier": 1.5,
 
-        "test_val_split_ratio": 0.2,
-        "sortino_eta": 0.0125,
+        "test_val_split_ratio": 0.1,
+        "sortino_eta": 0.018,
         "percentage_of_cash_only_starts": 0.15,
 
         "execution_min_share_threshold": 1,
@@ -71,9 +71,9 @@
 
         "device": "auto",
         "verbose": 1,
-        "n_epochs": 7,
-        "n_steps": 1000,
-        "batch_size": 200,
+        "n_epochs": 5,
+        "n_steps": 1008,
+        "batch_size": 252,
         "gamma": 0.99,
         "gae_lambda": 0.97,
         "vf_coef": 0.5,
@@ -81,8 +81,8 @@
         "target_kl": 0.05,
         "normalize_advantage": true,        
 
-        "learning_rate_start":  3.5e-4,
-        "learning_rate_end": 1e-4,
+        "learning_rate_start":  2.0e-4,
+        "learning_rate_end": 1.0e-4,
         "lr_schedule_type": "linear",
         "lr_schedule_warmup_pct": 0.25,
         "lr_schedule_ramping_pct": 0.6,
@@ -90,7 +90,7 @@
         "ent_coef_start": 0.0005,
         "ent_coef_end": 0.000001,
         "ent_coef_schedule_type": "linear",
-        "ent_coef_schedule_warmup_pct": 0.3,
+        "ent_coef_schedule_warmup_pct": 0.35,
         "ent_coef_schedule_ramping_pct": 0.6,
 
         "action_limiting_factor_start": 0.05,
@@ -109,7 +109,7 @@
         "n_eval_episodes": 33,
         "eval_deterministic": false,
         "progress_bar": true,
-        "config_id": 3
+        "config_id": 4
     }
 
 }
