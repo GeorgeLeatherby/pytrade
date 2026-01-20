@@ -1242,7 +1242,7 @@ class TradingEnv(gym.Env):
         self.lookback_window = config["environment"]["lookback_window"]
         self.initial_portfolio_value = config["environment"]["initial_portfolio_value"]
         self.early_stopping_threshold = config["environment"]["early_stopping_threshold"]
-        self.cash_return_rate = config["environment"]["cash_return_rate"]
+        self.cash_drag_rate_pa = config["environment"]["cash_drag_rate_pa"]
         
         self.seed = config["environment"]["seed"]
         # Execution parameters
@@ -2001,6 +2001,16 @@ class TradingEnv(gym.Env):
         # Update benchmark portfolio state
         self.benchmark_portfolio_state.prices[:] = new_prices # in-place update
         self.benchmark_portfolio_state.step = self.current_step
+
+        # Apply daily cash decay (inflation/opportunity cost)
+        # cash_drag_rate is annual; convert to daily: (1 + rate)^(1/252) - 1
+        if self.cash_drag_rate_pa > 0:
+            daily_decay_factor = (1.0 + self.cash_drag_rate_pa) ** (1.0 / 252.0) - 1.0
+            # Reduce cash by decay (daily carrying cost)
+            self.portfolio_state.cash *= (1.0 - daily_decay_factor)
+            self.comparison_portfolio_state.cash *= (1.0 - daily_decay_factor)
+            self.benchmark_portfolio_state.cash *= (1.0 - daily_decay_factor)
+            self.shadow_portfolio_state.cash *= (1.0 - daily_decay_factor)
         
         # Calculate new portfolio value after price changes
         portfolio_value_after = self.portfolio_state.get_total_value()
@@ -2403,20 +2413,32 @@ class TradingEnv(gym.Env):
         delta = portfolio_return_absolut - self.running_mean_ema
         self.running_mean_ema += self.sortino_eta * delta
 
-        downside_sq_ema = portfolio_return_absolut**2 if portfolio_return_absolut < 0 else 0
-        downside = max(downside_sq_ema, 1e-8)  # avoid zero downside
-        delta_downside = downside - self.running_downside_variance_ema
-        self.running_downside_variance_ema += self.sortino_eta * delta_downside
+        # downside_sq_ema = portfolio_return_absolut**2 if portfolio_return_absolut < 0 else 0
+        # downside = max(downside_sq_ema, 1e-8)  # avoid zero downside
+        # delta_downside = downside - self.running_downside_variance_ema
+        # self.running_downside_variance_ema += self.sortino_eta * delta_downside
 
-        # 2. Calc real-time Sortino
-        epsilon = 1e-8  # small constant to avoid division by zero
-        current_sortino = self.running_mean_ema / np.sqrt(self.running_downside_variance_ema + epsilon)
+        # # 2. Calc real-time Sortino
+        # epsilon = 1e-8  # small constant to avoid division by zero
+        # current_sortino = self.running_mean_ema / np.sqrt(self.running_downside_variance_ema + epsilon)
+
+        # Alternative: use squared downside returns
+        downside_sq = (min(portfolio_return_absolut, 0.0))**2
+        self.running_downside_variance_ema += self.sortino_eta * (downside_sq - self.running_downside_variance_ema)
+        downside_var_floor = 1e-6
+        downside_var = max(self.running_downside_variance_ema, downside_var_floor)
+        current_sortino = self.running_mean_ema / np.sqrt(downside_var)
 
         # 3. Calc Differential Sortino for reward
-        reward = current_sortino - self.previous_sortino
+        sortino_reward = current_sortino - self.previous_sortino
         self.previous_sortino = current_sortino
 
-        # 4. Clip reward
+        # 4. Mix in raw return
+        sortino_net_reward_mix = 0.5
+        reward = (sortino_net_reward_mix * sortino_reward + 
+                  (1 - sortino_net_reward_mix) * portfolio_return_absolut)
+
+        # 5. Clip and amplify reward
         gain = float(3.5)
         reward = float(np.tanh(gain * reward))
 

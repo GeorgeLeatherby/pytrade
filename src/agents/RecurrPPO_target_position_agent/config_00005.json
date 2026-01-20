@@ -1,27 +1,32 @@
 {
     "environment": {
         "execution_mode": "single_asset_target_position",
-        "initial_portfolio_value": 100000,
-        "episode_length_days": 200,
+        "initial_portfolio_value": 10000,
+        "episode_length_days": 252,
         "lookback_window": 0,
-        "early_stopping_threshold": 0.3,
-        "cash_return_rate": 0.0,
-        "cash_drag_rate_pa": 0.0,
+        "early_stopping_threshold": 0.2,
+        "cash_drag_rate_pa": 0.02,
         "seed": 42,
         "maybe_provide_sequence": false,
-        "block_buffer_multiplier": 1,
+        "block_buffer_multiplier": 1.5,
 
-        "test_val_split_ratio": 0.25,
-        "sortino_eta": 0.0125,
+        "test_val_split_ratio": 0.1,
+        "sortino_eta": 0.018,
         "percentage_of_cash_only_starts": 0.10,
 
         "execution_min_share_threshold": 1,
-        "execution_min_trade_value_threshold": 500.0,
-        "execution_min_days_between_trades": 0,
+        "execution_min_trade_value_threshold": 200.0,
+        "execution_min_days_between_trades": 2,
         "execution_weight_change_threshold": 0.01,
         "allow_short": false,
         "price_source": "current_close",
-        "quantity_type": "shares"
+        "quantity_type": "shares",
+
+        "fixed_fee_per_order": 0.0,
+        "commission_bps": 0.0002,
+        "half_spread_bps": 0.0015,
+        "impact_coeff": 0.125,
+        "adv_window": 21
     },
 
     "features": {
@@ -58,18 +63,17 @@
 
     "agent":{
         "policy": "MlpLstmPolicy",
-
         "policy_kwargs": {
-            "net_arch": { "pi": [128, 64], "vf": [128, 64] },
+            "net_arch": { "pi": [128, 128, 64], "vf": [128, 128, 64] },
             "n_lstm_layers": 2,
             "lstm_hidden_size": 128
         },
 
         "device": "auto",
         "verbose": 1,
-        "n_epochs": 7,
-        "n_steps": 1000,
-        "batch_size": 200,
+        "n_epochs": 3,
+        "n_steps": 1008,
+        "batch_size": 252,
         "gamma": 0.99,
         "gae_lambda": 0.97,
         "vf_coef": 0.5,
@@ -77,8 +81,8 @@
         "target_kl": 0.05,
         "normalize_advantage": true,        
 
-        "learning_rate_start":  3e-4,
-        "learning_rate_end": 1e-4,
+        "learning_rate_start":  1.5e-4,
+        "learning_rate_end": 5.0e-5,
         "lr_schedule_type": "linear",
         "lr_schedule_warmup_pct": 0.3,
         "lr_schedule_ramping_pct": 0.6,
@@ -86,11 +90,11 @@
         "ent_coef_start": 0.0005,
         "ent_coef_end": 0.000001,
         "ent_coef_schedule_type": "linear",
-        "ent_coef_schedule_warmup_pct": 0.3,
+        "ent_coef_schedule_warmup_pct": 0.35,
         "ent_coef_schedule_ramping_pct": 0.6,
 
-        "action_limiting_factor_start": 0.05,
-        "action_limiting_factor_end": 0.075,
+        "action_limiting_factor_start": 0.06,
+        "action_limiting_factor_end": 0.09,
         "action_limiting_factor_schedule_type": "linear",
         "action_limiting_factor_schedule_warmup_pct": 0.3,
         "action_limiting_factor_schedule_ramping_pct": 0.6
@@ -99,11 +103,13 @@
 
     "training": {
         "seed": 42,
-        "total_timesteps": 3000000,
-        "eval_freq": 100000,
-        "n_eval_episodes": 16,
+        "total_timesteps": 5000000,
+        "train_log_freq": 10,
+        "eval_freq": 20000,
+        "n_eval_episodes": 33,
         "eval_deterministic": false,
-        "progress_bar": true
+        "progress_bar": true,
+        "config_id": 5
     }
 
 }

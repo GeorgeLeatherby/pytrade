@@ -5,6 +5,7 @@
         "episode_length_days": 252,
         "lookback_window": 0,
         "early_stopping_threshold": 0.2,
+        "cash_drag_rate_pa": 0.0,
         "cash_return_rate": 0.0,
         "seed": 42,
         "maybe_provide_sequence": false,
