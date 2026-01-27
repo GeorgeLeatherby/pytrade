@@ -1250,6 +1250,10 @@ class TradingEnv(gym.Env):
         self.execution_min_trade_value_threshold = config["environment"]["execution_min_trade_value_threshold"]
         self.execution_min_days_between_trades = config["environment"]["execution_min_days_between_trades"]              # e.g., 0.0005
         self.maybe_provide_sequence = config['environment']['maybe_provide_sequence']  # Whether to provide sequence data in observations
+        self.sortino_net_reward_mix = config["environment"]["sortino_net_reward_mix"]
+        self.lambda_drawdown = config["environment"]["lambda_drawdown"]
+
+        self.previous_max_drawdown = None
 
         # Store references
         self.market_data_cache = market_data_cache
@@ -1490,6 +1494,8 @@ class TradingEnv(gym.Env):
         initial_positions = np.zeros(num_assets, dtype=np.float32)
         initial_cash = self.initial_portfolio_value  # Default to all cash
         total_init_tc = 0.0  # Track initialization costs
+
+        self.previous_max_drawdown = float(0.0)
 
         # Episode accumulators for diagnostics
         self._ep_turnover_notional = 0.0
@@ -2433,10 +2439,26 @@ class TradingEnv(gym.Env):
         sortino_reward = current_sortino - self.previous_sortino
         self.previous_sortino = current_sortino
 
-        # 4. Mix in raw return
-        sortino_net_reward_mix = 0.5
-        reward = (sortino_net_reward_mix * sortino_reward + 
-                  (1 - sortino_net_reward_mix) * portfolio_return_absolut)
+        # Mix Sortino with other metrics to get risk-aware non-deterministic policy
+        """Calculate dynamic risk window. Use self.reward_risk_window and the current step to produce
+        behaviour which starts at 2 raises with the steps up to maximum risk_reward_window"""
+        if self.current_step <= 2:
+            risk_metric_window = 2
+        else:
+            risk_metric_window = min(self.current_step, self.max_reward_risk_window)
+
+        max_drawdown = self.episode_buffer.calculate_max_drawdown(
+            window=risk_metric_window
+        )
+
+        max_drawdown_delta = max(0.0, max_drawdown - self.previous_max_drawdown)
+        self.previous_max_drawdown = max_drawdown
+        max_drawdown_penalty = float(self.lambda_drawdown * max_drawdown_delta)
+
+        # 4. Mix in raw return & windowed drawdown penalty
+
+        reward = (self.sortino_net_reward_mix * sortino_reward + 
+                  (1 - self.sortino_net_reward_mix) * portfolio_return_absolut) - max_drawdown_penalty
 
         # 5. Clip and amplify reward
         gain = float(3.5)
@@ -2462,19 +2484,8 @@ class TradingEnv(gym.Env):
         # ============================================
         risk_adjustment = 0.0
 
-        # Calculate dynamic risk window. Use self.reward_risk_window and the current step to produce
-        # behaviour which starts at 2 raises with the steps up to maximum risk_reward_window
-        if self.current_step <= 2:
-            risk_metric_window = 2
-        else:
-            risk_metric_window = min(self.current_step, self.max_reward_risk_window)
-
         # Use episode buffer's efficient methods
         sharpe_ratio = self.episode_buffer.calculate_sharpe_ratio(
-            window=risk_metric_window
-        )
-        
-        max_drawdown = self.episode_buffer.calculate_max_drawdown(
             window=risk_metric_window
         )
         
