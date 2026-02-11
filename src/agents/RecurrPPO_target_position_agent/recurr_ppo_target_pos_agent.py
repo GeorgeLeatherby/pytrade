@@ -232,6 +232,12 @@ class ValidationMetricsCallback(BaseCallback):
         self.dd_buffer = []
         self.alpha_ret_buffer = []
         self.cum_reward_buffer = []
+        self.saa_subpf_buffer = []
+        self.saa_return_after_rdn_portf_init_buffer = []
+
+        # Store last computed return_diff_vs_init_mean for best-model selection
+        self.last_return_diff_total_mean = None
+        self.last_return_diff_target_mean = None
 
     def _on_step(self) -> bool:
         """Called during evaluation episodes (by EvalCallback)."""
@@ -248,6 +254,8 @@ class ValidationMetricsCallback(BaseCallback):
             dd = info.get("episode_max_drawdown", None)
             alpha_ret = info.get("alpha_return", None)
             cum_reward = info.get("cumulative_reward", None)
+            saa_subpf = info.get("saa_final_subportfolio_value", None)
+            saa_return_after_rdn_portf_init = info.get("saa_return_final", None)
             
             # Accumulate all eval episode metricsin buffers
             if pv is not None:
@@ -266,6 +274,10 @@ class ValidationMetricsCallback(BaseCallback):
                 self.alpha_ret_buffer.append(alpha_ret)
             if cum_reward is not None:
                 self.cum_reward_buffer.append(cum_reward)
+            if saa_subpf is not None:
+                self.saa_subpf_buffer.append(saa_subpf)
+            if saa_return_after_rdn_portf_init is not None:
+                self.saa_return_after_rdn_portf_init_buffer.append(saa_return_after_rdn_portf_init)
                 
         return True
     
@@ -293,8 +305,14 @@ class ValidationMetricsCallback(BaseCallback):
         
         if self.pv_buffer and self.comp_pv_buffer:
             return_diffs = [pv - comp for pv, comp in zip(self.pv_buffer, self.comp_pv_buffer)]
-            mean_return_diff = float(np.mean(return_diffs))
-            self.model.logger.record(f"{self.tag_prefix}/return_diff_vs_init_mean", mean_return_diff, exclude=("stdout",))
+            mean_return_diff_total = float(np.mean(return_diffs))
+            self.model.logger.record(f"{self.tag_prefix}/return_diff_vs_init_total_mean", mean_return_diff_total, exclude=("stdout",))
+            self.last_return_diff_total_mean = mean_return_diff_total
+
+        if self.saa_return_after_rdn_portf_init_buffer:
+            mean_return_diff_target = float(np.mean(self.saa_return_after_rdn_portf_init_buffer))
+            self.model.logger.record(f"{self.tag_prefix}/return_diff_vs_init_target_mean", mean_return_diff_target, exclude=("stdout",))
+            self.last_return_diff_target_mean = mean_return_diff_target
         
         if self.bench_buffer:
             mean_bench = float(np.mean(self.bench_buffer))
@@ -326,9 +344,18 @@ class ValidationMetricsCallback(BaseCallback):
         
         # Reset buffers for next eval run
         self._reset_buffers()
+
+    def get_best_return_diff(self) -> Optional[float]:
+        """
+        Return the last computed return_diff_vs_init_mean.
+        Used by EvalCallbackWithMetrics for best-model selection.
+        """
+        if self.last_return_diff_total_mean is not None:
+            return self.last_return_diff_total_mean
+        return None
     
     def _reset_buffers(self) -> None:
-        """Reset all accumulation buffers."""
+        """Reset all accumulation buffers at the end of an evaluation run."""
         self.pv_buffer = []
         self.comp_pv_buffer = []
         self.bench_buffer = []
@@ -338,12 +365,17 @@ class ValidationMetricsCallback(BaseCallback):
         self.alpha_ret_buffer = []
         self.cum_reward_buffer = []
         self.eval_episode_count = 0
+        self.saa_subpf_buffer = []
+        self.saa_return_after_rdn_portf_init_buffer = []
     
 
 class EvalCallbackWithMetrics(BaseCallback):
     """
     Eval callback that forwards each eval step to a per-episode metrics callback
     (e.g., ValidationMetricsCallback) while preserving SB3 eval logging.
+
+    Saves best model based on last_return_diff_target_mean (value creation metric)
+    rather than raw cumulative reward.
     """
     def __init__(
         self,
@@ -373,6 +405,7 @@ class EvalCallbackWithMetrics(BaseCallback):
         self.eval_step_callback = eval_step_callback
         self.warn = warn
         self.best_mean_reward = -np.inf
+        self.best_return_diff = -np.inf # Track best last_return_diff_target_mean
         self.n_eval_calls = 0
 
     def _init_callback(self) -> None:
@@ -419,12 +452,26 @@ class EvalCallbackWithMetrics(BaseCallback):
                     results=np.array([episode_rewards]),
                     ep_lengths=np.array([episode_lengths]),
                 )
-            if mean_reward > self.best_mean_reward:
-                self.best_mean_reward = mean_reward
+
+            # Check if this is a new best model based on last_return_diff_target_mean
+            current_return_diff = None
+            if isinstance(self.eval_step_callback, ValidationMetricsCallback):
+                current_return_diff = self.eval_step_callback.get_best_return_diff()
+            
+            if current_return_diff is not None and current_return_diff > self.best_return_diff:
+                self.best_return_diff = current_return_diff
                 if self.best_model_save_path is not None:
                     self.model.save(os.path.join(self.best_model_save_path, "best_model"))
+                    # Save VecNormalize stats at the exact same checkpoint time
+                    vec_env = self.model.get_env()
+                    if isinstance(vec_env, VecNormalize):
+                        vec_env.save(os.path.join(self.best_model_save_path, "best_model_vecnormalize.pkl"))
+                        print(f"New best model saved! last_return_diff_target_mean: {current_return_diff:.4f}")
+                    else:
+                        raise RuntimeError(f"New best model saved! last_return_diff_target_mean: {current_return_diff:.4f} (VecNormalize not found!)")
                 if self.callback_on_new_best is not None:
                     self.callback_on_new_best.on_step()
+            
             if self.callback_after_eval is not None:
                 self.callback_after_eval.on_step()
         return True

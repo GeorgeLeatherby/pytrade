@@ -9,18 +9,18 @@
         "seed": 42,
         "maybe_provide_sequence": false,
         "block_buffer_multiplier": 1.2,
-        "test_val_split_ratio": 0.1,
+        "test_val_split_ratio": 0.15,
 
         "sortino_eta": 0.018,
         "lambda_drawdown": 0.005,
-        "sortino_net_reward_mix": 0.5,
+        "sortino_net_reward_mix": 0.4,
 
         "percentage_of_cash_only_starts": 0.10,
 
         "execution_min_share_threshold": 1,
-        "execution_min_trade_value_threshold": 200.0,
+        "execution_min_trade_value_threshold": 50.0,
         "execution_min_days_between_trades": 2,
-        "execution_weight_change_threshold": 0.01,
+        "execution_weight_change_threshold": 0.005,
         "allow_short": false,
         "price_source": "current_close",
         "quantity_type": "shares",
@@ -73,29 +73,29 @@
         "device": "auto",
         "verbose": 1,
         "n_epochs": 3,
-        "n_steps": 2016,
-        "batch_size": 504,
-        "gamma": 0.993,
+        "n_steps": 4032,
+        "batch_size": 1008,
+        "gamma": 0.998,
         "gae_lambda": 0.98,
         "vf_coef": 0.5,
         "max_grad_norm": 0.5,
         "target_kl": 0.05,
         "normalize_advantage": true,        
 
-        "learning_rate_start":  1.5e-4,
-        "learning_rate_end": 5.0e-5,
+        "learning_rate_start":  2.0e-5,
+        "learning_rate_end": 5.0e-6,
         "lr_schedule_type": "linear",
         "lr_schedule_warmup_pct": 0.3,
         "lr_schedule_ramping_pct": 0.6,
 
-        "ent_coef_start": 0.005,
-        "ent_coef_end": 0.0001,
+        "ent_coef_start": 0.01,
+        "ent_coef_end": 0.00001,
         "ent_coef_schedule_type": "linear",
         "ent_coef_schedule_warmup_pct": 0.35,
         "ent_coef_schedule_ramping_pct": 0.6,
 
-        "action_limiting_factor_start": 0.06,
-        "action_limiting_factor_end": 0.09,
+        "action_limiting_factor_start": 0.025,
+        "action_limiting_factor_end": 0.05,
         "action_limiting_factor_schedule_type": "linear",
         "action_limiting_factor_schedule_warmup_pct": 0.3,
         "action_limiting_factor_schedule_ramping_pct": 0.6
@@ -104,13 +104,13 @@
 
     "training": {
         "seed": 42,
-        "total_timesteps": 2000000,
+        "total_timesteps": 20000000,
         "train_log_freq": 10,
-        "eval_freq": 20000,
-        "n_eval_episodes": 33,
+        "eval_freq": 100000,
+        "n_eval_episodes": 100,
         "eval_deterministic": false,
         "progress_bar": true,
-        "config_id": 6
+        "config_id": 9
     }
 
 }

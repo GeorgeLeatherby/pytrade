@@ -18,7 +18,7 @@
         "percentage_of_cash_only_starts": 0.10,
 
         "execution_min_share_threshold": 1,
-        "execution_min_trade_value_threshold": 200.0,
+        "execution_min_trade_value_threshold": 50.0,
         "execution_min_days_between_trades": 2,
         "execution_weight_change_threshold": 0.01,
         "allow_short": false,
@@ -73,8 +73,8 @@
         "device": "auto",
         "verbose": 1,
         "n_epochs": 3,
-        "n_steps": 2016,
-        "batch_size": 504,
+        "n_steps": 4032,
+        "batch_size": 1008,
         "gamma": 0.993,
         "gae_lambda": 0.98,
         "vf_coef": 0.5,
@@ -82,7 +82,7 @@
         "target_kl": 0.05,
         "normalize_advantage": true,        
 
-        "learning_rate_start":  1.5e-4,
+        "learning_rate_start":  1.2e-4,
         "learning_rate_end": 5.0e-5,
         "lr_schedule_type": "linear",
         "lr_schedule_warmup_pct": 0.3,
@@ -104,13 +104,13 @@
 
     "training": {
         "seed": 42,
-        "total_timesteps": 2000000,
+        "total_timesteps": 12000000,
         "train_log_freq": 10,
         "eval_freq": 20000,
         "n_eval_episodes": 33,
         "eval_deterministic": false,
         "progress_bar": true,
-        "config_id": 6
+        "config_id": 7
     }
 
 }
