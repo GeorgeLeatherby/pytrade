@@ -2157,11 +2157,21 @@ class TradingEnv(gym.Env):
         benchmark_portfolio_value_after = self.benchmark_portfolio_state.get_total_value()
         comparison_portfolio_value_after = self.comparison_portfolio_state.get_total_value()
 
-        # SAA return: change in cash + target asset return
-        selected_asset_notional_after = self.portfolio_state.positions[selected_asset_index] * self.portfolio_state.prices[selected_asset_index]
-        delta_selected_asset_notional = selected_asset_notional_after - selected_asset_notional_before
-        delta_cash = live_portfolio_cash_before - self.portfolio_state.cash
-        saa_return = delta_selected_asset_notional + delta_cash
+        # SAA return: change in cash + target asset return 
+        "NOTE: only meaningful in single-asset mode"
+        selected_asset_notional_after = 0.0
+        delta_selected_asset_notional = 0.0
+        delta_cash = 0.0
+        saa_return = 0.0
+
+        if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
+            selected_asset_notional_after = (
+                self.portfolio_state.positions[selected_asset_index]
+                * self.portfolio_state.prices[selected_asset_index]
+            )
+            delta_selected_asset_notional = selected_asset_notional_after - selected_asset_notional_before
+            delta_cash = live_portfolio_cash_before - self.portfolio_state.cash
+            saa_return = delta_selected_asset_notional + delta_cash
 
 
         # Allocate rewards based on mode. Init all with None to check proper implementation

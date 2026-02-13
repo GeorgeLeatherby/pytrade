@@ -1,8 +1,8 @@
 {
     "saa_config":{
-        "saa_run_id": "00017",
+        "saa_run_id": "00041",
         "saa_base_dir":"src/agents/RecurrPPO_target_position_agent/saved_models",
-        "saa_config_id": "00006",
+        "saa_config_id": "00009",
         "device": "cpu"
     },
 
@@ -55,7 +55,7 @@
 
     "environment": {
         "assets": ["SPY", "EWG", "EWH", "EWJ", "EWQ", "EWS", "EWT", "EWU", "EWY", "Crude", "Gold"],
-        "execution_mode": "portfolio",
+        "execution_mode": "portfolio_weights",
         "initial_portfolio_value": 10000,
         "episode_length_days": 252,
         "lookback_window": 0,

@@ -45,6 +45,56 @@ from src.environment.single_asset_target_pos_drl_trading_env import MarketDataCa
 
 
 # ================================
+# VecNormalize Utilities for Observation Normalization
+# ================================
+class _ObsNormDummyEnv(gym.Env):
+    """
+    Minimal env needed so VecNormalize.load(...) can reattach to an env and expose obs_rms.
+    We never step it for real; we only use the loaded running stats to normalize observations.
+    """
+    metadata = {}
+
+    def __init__(self, observation_space: gym.Space):
+        super().__init__()
+        self.observation_space = observation_space
+        # Not used, but required by gym.Env API:
+        self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
+
+    def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
+        super().reset(seed=seed)
+        obs = np.zeros(self.observation_space.shape, dtype=np.float32)
+        return obs, {}
+
+    def step(self, action):
+        obs = np.zeros(self.observation_space.shape, dtype=np.float32)
+        reward = 0.0
+        terminated = True
+        truncated = False
+        info = {}
+        return obs, reward, terminated, truncated, info
+
+
+def _normalize_obs_with_vecnormalize(obs: np.ndarray, vecnorm: VecNormalize) -> np.ndarray:
+    """
+    Standalone equivalent of VecNormalize.normalize_obs(obs) using saved obs_rms.
+    Works for 1D obs vectors (the SAA case here).
+    """
+    if vecnorm is None or getattr(vecnorm, "obs_rms", None) is None:
+        return obs
+
+    obs = np.asarray(obs, dtype=np.float32)
+    mean = vecnorm.obs_rms.mean
+    var = vecnorm.obs_rms.var
+
+    epsilon = float(getattr(vecnorm, "epsilon", getattr(vecnorm, "eps", 1e-8)))
+    clip_obs = float(getattr(vecnorm, "clip_obs", 10.0))
+
+    obs_norm = (obs - mean) / np.sqrt(var + epsilon)
+    obs_norm = np.clip(obs_norm, -clip_obs, clip_obs)
+    return obs_norm.astype(np.float32, copy=False)
+
+
+# ================================
 # SAA Ensemble (Frozen single-asset agents)
 # ================================
 
@@ -67,7 +117,10 @@ class FrozenSAAEnsemble:
     - This allows easy switching via config parameter: "saa_run_id"
     """
 
-    def __init__(self, asset_to_model_path: Dict[str, str], device: str = "cpu"):
+    def __init__(
+            self, asset_to_model_path: Dict[str, str], 
+            vecnormalize_path: Optional[str] = None,device: str = "cpu"
+        ):
         """
         Initialize ensemble with paths to trained SAA models.
         
@@ -84,6 +137,7 @@ class FrozenSAAEnsemble:
         self.assets = list(asset_to_model_path.keys())
         self.models = {}
         self.lstm_states = {}  # Per-asset LSTM hidden states (cell_state, hidden_state)
+        self.vecnormalize = None # Loaded VecNormalize (obs stats) for inference-time normalization
         
         # Load all SAA models from disk
         print(f"[FrozenSAAEnsemble] Loading {len(self.assets)} SAA models...")
@@ -111,6 +165,22 @@ class FrozenSAAEnsemble:
             self.lstm_states[asset_symbol] = None
         
         print(f"[FrozenSAAEnsemble] Successfully loaded {len(self.models)} SAA models on device: {device}")
+
+        # Load VecNormalize observation stats (if provided) so frozen inference matches SAA training
+        if vecnormalize_path is not None:
+            if not os.path.exists(vecnormalize_path):
+                print(f"[FrozenSAAEnsemble] WARNING: VecNormalize file not found: {vecnormalize_path}. Proceeding without obs normalization.")
+            else:
+                try:
+                    any_model = next(iter(self.models.values()))
+                    obs_space = any_model.observation_space
+                    dummy_env = DummyVecEnv([lambda: _ObsNormDummyEnv(obs_space)])
+                    self.vecnormalize = VecNormalize.load(vecnormalize_path, dummy_env)
+                    self.vecnormalize.training = False
+                    self.vecnormalize.norm_reward = False
+                    print(f"[FrozenSAAEnsemble] Loaded VecNormalize stats from: {os.path.basename(vecnormalize_path)}")
+                except Exception as e:
+                    raise RuntimeError(f"Failed to load VecNormalize from {vecnormalize_path}: {str(e)}")
 
     def reset_episode(self) -> None:
         """
@@ -161,7 +231,7 @@ class FrozenSAAEnsemble:
         with torch.no_grad():
             for asset in self.assets:
                 # Get observation for this asset
-                obs = obs_per_asset[asset]
+                obs = _normalize_obs_with_vecnormalize(obs_per_asset[asset], self.vecnormalize)
                 
                 # Get episode start flag
                 episode_start = np.array([episode_starts.get(asset, False)])
@@ -228,7 +298,7 @@ class FrozenSAAEnsemble:
         
         with torch.no_grad():
             for asset in self.assets:
-                obs = obs_per_asset[asset]
+                obs = _normalize_obs_with_vecnormalize(obs_per_asset[asset], self.vecnormalize)
                 episode_start = np.array([episode_starts.get(asset, False)])
                 
                 # Get value estimate from SAA's value function
@@ -239,11 +309,11 @@ class FrozenSAAEnsemble:
                 # We need to extract the value through the policy network
                 try:
                     # Access policy's value function directly
-                    with self.models[asset].policy.set_training_mode(False):
-                        _, value, _ = self.models[asset].policy(
-                            obs_tensor,
-                            state=self.lstm_states[asset],
-                            episode_start=episode_start
+                    self.models[asset].policy.set_training_mode(False)
+                    _, value, _ = self.models[asset].policy(
+                        obs_tensor,
+                        state=self.lstm_states[asset],
+                        episode_start=episode_start
                         )
                     saa_values[asset] = float(value[0, 0])
                 except Exception as e:
@@ -284,7 +354,7 @@ class FrozenSAAEnsemble:
         
         with torch.no_grad():
             for asset in self.assets:
-                obs = obs_per_asset[asset]
+                obs = _normalize_obs_with_vecnormalize(obs_per_asset[asset], self.vecnormalize)
                 episode_start = np.array([episode_starts.get(asset, False)])
                 
                 # Run prediction but extract hidden state from returned state tuple
@@ -1053,7 +1123,7 @@ class AllocatorEnvironmentWrapper(gym.Wrapper):
 
         # Validation: verify weights sum to 1.0 (allow small numerical tolerance)
         action_sum = np.sum(action)
-        if not (0.99 <= action_sum <= 1.01):
+        if not (1-1e-4 <= action_sum <= 1+1e-4):
             # This should NEVER happen with proper softmax in policy
             # But clamp for safety to ensure sum = 1.0
             action = action / np.maximum(action_sum, 1e-8)
@@ -2480,6 +2550,11 @@ def load_saa_models(config: Dict[str, Any], device: str = "cpu") -> FrozenSAAEns
     # Construct path to best_model.zip
     model_dir = os.path.join(saa_base_dir, selected_dir)
     model_path = os.path.join(model_dir, "best_model.zip")
+
+    vecnormalize_path = os.path.join(model_dir, "best_model_vecnormalize.pkl")
+    if not os.path.exists(vecnormalize_path):
+        print(f"[load_saa_models] WARNING: VecNormalize stats not found at {vecnormalize_path}. Proceeding without obs normalization.")
+        vecnormalize_path = None
     
     # Verify model file exists
     if not os.path.exists(model_path):
@@ -2532,9 +2607,11 @@ def load_saa_models(config: Dict[str, Any], device: str = "cpu") -> FrozenSAAEns
     try:
         saa_ensemble = FrozenSAAEnsemble(
             asset_to_model_path=asset_to_model_path,
+            vecnormalize_path=vecnormalize_path,
             device=saa_device
         )
         return saa_ensemble
+    
     except Exception as e:
         raise RuntimeError(
             f"Failed to create FrozenSAAEnsemble: {str(e)}\n"
@@ -3217,6 +3294,10 @@ def run(cache: MarketDataCache, config: Dict[str, Any]) -> Dict[str, Any]:
         clip_reward=np.inf,
         gamma=gamma_cfg
     )
+
+    vec_eval.obs_rms = vec_train.obs_rms  # Share observation normalization stats
+    if vec_eval.norm_reward==True:
+        vec_eval.ret_rms = vec_train.ret_rms
     
     print("[run] Evaluation environment created and vectorized")
     
