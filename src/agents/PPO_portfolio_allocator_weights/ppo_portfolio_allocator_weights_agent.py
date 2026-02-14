@@ -1681,12 +1681,12 @@ class AllocatorPortfolioLoggerCallback(BaseCallback):
     - Reward components (if available)
     """
 
-    def __init__(self, tag_prefix: str = "allocator/train", log_freq: int = 10, verbose: int = 0):
+    def __init__(self, tag_prefix: str = "train", log_freq: int = 10, verbose: int = 0):
         """
         Initialize callback.
         
         Args:
-            tag_prefix: TensorBoard metric prefix (e.g., "allocator/train")
+            tag_prefix: TensorBoard metric prefix (e.g., "train")
             log_freq: Log every N completed episodes (throttling to reduce TB overhead)
             verbose: Verbosity level (0=silent, 1=info, 2=debug)
         """
@@ -1940,12 +1940,12 @@ class AllocatorValidationCallback(BaseCallback):
     episodes before logging, providing more stable validation metrics.
     """
 
-    def __init__(self, tag_prefix: str = "allocator/validation", verbose: int = 0):
+    def __init__(self, tag_prefix: str = "validation", verbose: int = 0):
         """
         Initialize validation callback.
         
         Args:
-            tag_prefix: TensorBoard metric prefix (e.g., "allocator/validation")
+            tag_prefix: TensorBoard metric prefix (e.g., "validation")
             verbose: Verbosity level
         """
         super().__init__(verbose)
@@ -3051,7 +3051,7 @@ def build_allocator_model(
     training_cfg = config.get("training", {})
     tb_log_dir = training_cfg.get(
         "tensorboard_log",
-        "src/agents/PPO_portfolio_allocator/tb_logs"
+        "src/agents/PPO_portfolio_allocator_weights/tb_logs"
     )
     # Ensure directory exists, create if not
     os.makedirs(tb_log_dir, exist_ok=True)

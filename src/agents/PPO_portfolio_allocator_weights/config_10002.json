@@ -88,15 +88,12 @@
   },
 
     "portfolio_allocator_agent":{
-        "policy_kwargs": {
-        },
-
         "device": "auto",
         "verbose": 1,
         "n_epochs": 3,
-        "n_steps": 2016,
-        "batch_size": 504,
-        "gamma": 0.993,
+        "n_steps": 4032,
+        "batch_size": 1008,
+        "gamma": 0.998,
         "gae_lambda": 0.98,
         "vf_coef": 0.5,
         "max_grad_norm": 0.5,
@@ -131,7 +128,8 @@
         "n_eval_episodes": 100,
         "eval_deterministic": false,
         "progress_bar": true,
-        "config_id": 1
+        "config_id": 1,
+        "tensorboard_log": "src/agents/PPO_portfolio_allocator_weights/tb_logs"
     }
 
 }
