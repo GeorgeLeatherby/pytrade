@@ -99,5 +99,5 @@ def main():
     for cfg in configs:
         run_agent(agent, cfg)
 
-if __name__ == "__main__":
+if __name__ == "__main__": 
     main()

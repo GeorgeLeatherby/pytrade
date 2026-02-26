@@ -131,7 +131,7 @@
         "n_eval_episodes": 100,
         "eval_deterministic": false,
         "progress_bar": true,
-        "config_id": 1
+        "config_id": 10001
     }
 
 }

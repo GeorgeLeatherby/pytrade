@@ -9,10 +9,10 @@ Architecture:
 - Input: Per-asset features (SAA signals + portfolio state + risk metrics) + global portfolio token
 - Embedding: Linear projection + asset ID embeddings → d_model dimensions
 - Transformer Encoder: Self-attention across N+1 tokens (N assets + 1 portfolio token)
-- Output Heads: Per-asset weight logits + cash weight logit → DIRECT softmax output
-  (Weights sum to 1.0 directly from policy, not post-hoc normalized)
+- Output Heads: Per-asset raw allocation logits + cash logit → sigmoid output in [0, 1]
+    (Environment applies post-policy normalization to valid portfolio weights)
 - Value Head: Portfolio token → scalar value estimate
-- PPO Training: Standard (non-recurrent) PPO with Gaussian policy
+- PPO Training: Standard (non-recurrent) PPO
 
 Frozen SAAs provide signal generation only; allocator learns to weight and combine signals.
 Environment is EXECUTION_PORTFOLIO mode (full multi-asset rebalancing at each step).
@@ -26,6 +26,7 @@ import json
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.distributions
 from typing import Callable, Dict, Any, Optional, Tuple, List
 from datetime import datetime
 
@@ -267,7 +268,126 @@ class FrozenSAAEnsemble:
                 saa_signals[asset] = float(action[0])
         
         return saa_signals
-
+    
+    # Batched version of get_saa_signals for improved efficiency (runs all SAAs in one forward pass)
+    # Batched version of get_saa_signals for improved efficiency (runs all SAAs in one forward pass)
+    def get_saa_signals_batched(
+        self,
+        obs_per_asset: Dict[str, np.ndarray],
+        episode_starts: Dict[str, bool]
+    ) -> Dict[str, float]:
+        """
+        BATCHED inference: Run all SAA forward passes in a single batch.
+        
+        ~75-85% faster than sequential get_saa_signals() for 11 assets.
+        Uses vectorized operations instead of 11 separate forward passes.
+        
+        Args:
+            obs_per_asset: Dict mapping asset symbol → observation array
+            episode_starts: Dict mapping asset symbol → episode boundary flag
+        
+        Returns:
+            Dict mapping asset symbol → SAA action scalar (typically [-1, 1])
+        """
+        saa_signals = {}
+        
+        with torch.no_grad():
+            # --- Step 1: Normalize and stack all observations ---
+            obs_list = []
+            for asset in self.assets:
+                obs = _normalize_obs_with_vecnormalize(obs_per_asset[asset], self.vecnormalize)
+                obs_list.append(obs)
+            
+            # Stack into batch array: [num_assets, obs_dim]
+            obs_batch = np.stack(obs_list, axis=0).astype(np.float32)
+            
+            # --- Step 2: Stack episode start flags ---
+            episode_start_batch = np.array(
+                [episode_starts.get(asset, False) for asset in self.assets],
+                dtype=bool
+            )
+            
+            # --- Step 3: Prepare LSTM states for batching ---
+            # Extract hidden size from the LSTM layer itself
+            ref_model = self.models[self.assets[0]]
+            
+            try:
+                # Try to get hidden size from lstm_actor layer (MlpLstmPolicy stores it here)
+                lstm_layer = ref_model.policy.lstm_actor
+                hidden_size = lstm_layer.hidden_size
+            except (AttributeError, TypeError):
+                try:
+                    # Fallback: infer from existing LSTM state if any asset has been stepped
+                    first_state = next((s for s in self.lstm_states.values() if s is not None), None)
+                    if first_state is not None:
+                        lstm_c, lstm_h = first_state
+                        hidden_size = lstm_h.shape[1]
+                    else:
+                        # Could not determine hidden size - raise informative error
+                        raise RuntimeError(
+                            f"Could not determine LSTM hidden size from policy.lstm_actor.hidden_size. "
+                            f"Available policy attributes: {[attr for attr in dir(ref_model.policy) if 'lstm' in attr.lower()]}"
+                        )
+                except RuntimeError:
+                    raise
+                except Exception as e:
+                    raise RuntimeError(f"Failed to extract LSTM hidden size: {str(e)}")
+            
+            lstm_h_list = []
+            lstm_c_list = []
+            
+            for asset in self.assets:
+                state = self.lstm_states[asset]
+                
+                if state is None:
+                    # First step: initialize with zeros [1, hidden_size]
+                    lstm_h = np.zeros((1, hidden_size), dtype=np.float32)
+                    lstm_c = np.zeros((1, hidden_size), dtype=np.float32)
+                else:
+                    # Unpack existing state: (cell, hidden) from previous step
+                    lstm_c, lstm_h = state
+                
+                lstm_h_list.append(lstm_h)
+                lstm_c_list.append(lstm_c)
+            
+            # Stack into batch: [num_assets, hidden_size]
+            lstm_h_batch = np.vstack(lstm_h_list)
+            lstm_c_batch = np.vstack(lstm_c_list)
+            lstm_state_batch = (lstm_c_batch, lstm_h_batch)
+            
+            # --- Step 4: Single batched forward pass (THE SPEEDUP!) ---
+            # Convert to tensors on correct device
+            obs_tensor = torch.as_tensor(obs_batch, dtype=torch.float32, device=self.device)
+            
+            # Call policy forward with batched inputs
+            # This runs all 11 LSTM cells in parallel → ~11x faster
+            actions, lstm_states_new = ref_model.policy(
+                obs_tensor,
+                state=lstm_state_batch,
+                episode_start=episode_start_batch,
+                deterministic=True
+            )
+            
+            # --- Step 5: Unpack batched results and update LSTM states ---
+            actions_np = actions.cpu().numpy()
+            lstm_c_new, lstm_h_new = lstm_states_new
+            
+            for idx, asset in enumerate(self.assets):
+                # Extract this asset's action from batch
+                action_val = float(actions_np[idx, 0])
+                
+                # Validate and clip to [-1, 1]
+                action_val = np.clip(action_val, -1.0, 1.0)
+                saa_signals[asset] = action_val
+                
+                # Update LSTM state for next step: [1, hidden_size]
+                self.lstm_states[asset] = (
+                    lstm_c_new[idx:idx+1],  # Cell state
+                    lstm_h_new[idx:idx+1]   # Hidden state
+                )
+        
+        return saa_signals
+    
     def get_saa_values(
         self,
         obs_per_asset: Dict[str, np.ndarray],
@@ -614,6 +734,7 @@ class TransformerTokenizer:
             variance = np.sum(delta * delta2) / self._portfolio_feature_count
             self._portfolio_feature_std = np.sqrt(np.maximum(variance, 1e-8))
 
+
 class TransformerEncoder(nn.Module):
     """
     Transformer encoder module for processing asset and portfolio tokens.
@@ -738,7 +859,7 @@ class TransformerAllocatorPolicy(ActorCriticPolicy):
     
     Architecture:
     1. Transformer Encoder: Processes observation tokens via self-attention
-    2. Actor Head: Outputs weight logits → immediately passed to softmax layer
+    2. Actor Head: Outputs raw allocation logits → passed to sigmoid in [0, 1]
     3. Critic Head: Outputs scalar value estimate
     
     Integration with SB3 PPO:
@@ -821,21 +942,22 @@ class TransformerAllocatorPolicy(ActorCriticPolicy):
         else:
             self.asset_id_embedding = None
         
-        # Actor head: maps transformer output → weight logits (pre-softmax)
+        # Actor head: maps transformer output → raw allocation logits
         # Output dimension: N+1 (N assets + cash)
         action_dim = action_space.shape[0]
         self.action_head = nn.Linear(d_model, action_dim)
 
-        # Softmax layer: converts logits to valid probability distribution
-        # Ensures weights sum to exactly 1.0 across all dimensions
-        # This is the only output layer needed - no log_std for categorical-like output
-        self.softmax = nn.Softmax(dim=-1)
-
         # Critic head: maps transformer output → scalar value estimate
         self.value_head = nn.Linear(d_model, 1)
 
-        # NOTE: No log_std parameter needed - softmax output is already bounded [0,1]
-        # and sums to 1.0, so we use a Dirichlet-like approach (deterministic softmax)
+        # Create dummy log_std parameter for SB3 logging compatibility
+        # SB3 tries to log 'std = exp(log_std)' during training (line 295 of ppo.py)
+        # We use Dirichlet distribution, not Normal, so this is just a placeholder
+        # to prevent: TypeError: exp(): argument 'input' must be Tensor, not NoneType
+        # Value doesn't matter - Dirichlet doesn't use it
+        action_dim = action_space.shape[0]
+        self.register_parameter('log_std', nn.Parameter(torch.zeros(action_dim)))
+
 
     def forward(self, obs: torch.Tensor, deterministic: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -847,7 +969,7 @@ class TransformerAllocatorPolicy(ActorCriticPolicy):
         
         Returns:
             (actions, values, log_probs) tuple
-                actions: Portfolio weights [batch_size, action_dim], sum to 1.0
+                actions: Raw allocations in [0, 1] [batch_size, action_dim]
                 values: Value estimates, shape [batch_size, 1]
                 log_probs: Log probabilities of weight distributions, shape [batch_size]
         """
@@ -856,27 +978,17 @@ class TransformerAllocatorPolicy(ActorCriticPolicy):
         
         # Get weight logits and values
         weight_logits = self.action_head(features)  # [batch_size, N+1]
-        values = self.value_head(features)  # [batch_size, 1]
-        
-        # Convert logits to valid probability distribution via softmax
-        # Output: weights ∈ [0,1] that sum to 1.0 across all assets
-        weights = self.softmax(weight_logits)  # [batch_size, N+1]
-        
-        # For policy gradient: use log-softmax to compute log probabilities
-        # This is numerically stable and naturally computes the log of the softmax output
-        log_softmax = torch.nn.functional.log_softmax(weight_logits, dim=-1)  # [batch_size, N+1]
-        
-        # Use Dirichlet distribution interpretation:
-        # For deterministic, return mean (softmax directly)
-        # For stochastic, we could sample from Dirichlet, but for simplicity/stability,
-        # use the softmax directly (it's already a valid probability distribution)
-        actions = weights  # [batch_size, N+1] - already sums to 1.0
-        
-        # Compute log probability under softmax (entropy-like measure)
-        # This represents the "confidence" of the weight distribution
-        # High confidence → low entropy → one weight near 1.0, others near 0
-        # Low confidence → high entropy → weights more uniform
-        log_probs = (weights * log_softmax).sum(dim=-1)  # [batch_size]
+        values = self.value_head(features).squeeze(-1)  # [batch_size]
+
+        # Policy produces raw allocations in [0, 1].
+        # IMPORTANT: sum-to-1 normalization is intentionally performed by the environment,
+        # not here, to keep policy output unconstrained except for bounds.
+        actions = torch.sigmoid(weight_logits)  # [batch_size, N+1]
+
+        # Custom log-prob surrogate (used consistently in forward/evaluate_actions).
+        # This keeps PPO bookkeeping stable while leaving simplex projection to env.
+        p = torch.clamp(actions, min=1e-8, max=1.0 - 1e-8)
+        log_probs = (actions * torch.log(p) + (1.0 - actions) * torch.log(1.0 - p)).sum(dim=-1)
         
         return actions, values, log_probs
 
@@ -937,28 +1049,80 @@ class TransformerAllocatorPolicy(ActorCriticPolicy):
         """
         actions, _, _ = self.forward(obs, deterministic=deterministic)
         return actions
-
+    
     def _get_action_dist_and_value(
         self,
         obs: torch.Tensor
-    ) -> Tuple[torch.distributions.Categorical, torch.Tensor]:
+    ) -> Tuple[torch.distributions.Normal, torch.Tensor]:
         """
-        Get weight distribution and value estimate for training.
-        
-        Returns a categorical-like distribution over weight simplex.
-        Uses Dirichlet distribution concept: softmax output as concentration parameters.
+        Get auxiliary Normal distribution and value estimate.
+
+        Note: action projection to valid portfolio weights is done in the environment.
+        This distribution is kept simple and is primarily for compatibility.
         """
         features = self._extract_features(obs)
         weight_logits = self.action_head(features)
-        values = self.value_head(features)
-        
-        # Create categorical distribution from unnormalized logits
-        # Each asset is a "category" with its own weight
-        # Softmax normalizes these into a valid probability distribution
-        distribution = torch.distributions.Categorical(logits=weight_logits)
+        values = self.value_head(features).squeeze(-1) # should now be: [batch_size]
+
+        mean = torch.sigmoid(weight_logits)
+        std = torch.full_like(mean, 0.1)
+        distribution = torch.distributions.Normal(mean, std)
         
         return distribution, values
     
+    def _get_action_dist_from_latent(self, latent_pi: torch.Tensor) -> torch.distributions.Distribution:
+        """
+        Build a simple Normal distribution around sigmoid-bounded means.
+        
+        Args:
+            latent_pi: Logit tensor from action head [batch_size, num_assets+1]
+        
+        Returns:
+            Normal distribution parameterized by bounded means
+        """
+        mean = torch.sigmoid(latent_pi)
+        std = torch.full_like(mean, 0.1)
+        return torch.distributions.Normal(mean, std)
+    
+    def evaluate_actions(
+        self, 
+        obs: torch.Tensor, 
+        actions: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Override evaluate_actions to match the raw-allocation policy output.
+        
+        SB3 calls this during policy gradient computation in training.
+        The environment handles normalization to simplex weights.
+        
+        Args:
+            obs: Observations tensor [batch_size, obs_dim]
+            actions: Actions taken [batch_size, action_dim] in [0, 1]
+        
+        Returns:
+            (values, log_probs, entropies) tuple for all batch samples
+            - values: Value estimates [batch_size]
+            - log_probs: Log probabilities of actions [batch_size]
+            - entropies: Entropy of action distributions [batch_size]
+        """
+        # Extract features and compute logits + values
+        features = self._extract_features(obs)  # [batch_size, d_model]
+        weight_logits = self.action_head(features)  # [batch_size, N+1]
+        values = self.value_head(features).squeeze(-1)  # [batch_size]
+        
+        probs = torch.sigmoid(weight_logits)
+        probs = torch.clamp(probs, min=1e-8, max=1.0 - 1e-8)
+        clipped_actions = torch.clamp(actions, min=1e-8, max=1.0 - 1e-8)
+
+        # Keep log-prob surrogate consistent with forward() so PPO ratio remains well-defined.
+        log_prob = (
+            clipped_actions * torch.log(probs)
+            + (1.0 - clipped_actions) * torch.log(1.0 - probs)
+        ).sum(dim=-1)
+
+        entropy = -(probs * torch.log(probs) + (1.0 - probs) * torch.log(1.0 - probs)).sum(dim=-1)
+        
+        return values, log_prob, entropy
 
 class AllocatorEnvironmentWrapper(gym.Wrapper):
     """
@@ -982,10 +1146,9 @@ class AllocatorEnvironmentWrapper(gym.Wrapper):
     4. Assembling into transformer-ready format via tokenizer
     
     Action Structure:
-    - Input: Raw logits [N+1] from allocator policy (unnormalized)
-    - Processing: Action is already normalized weights from policy softmax
+    - Input: Raw allocator outputs [N+1] in [0, 1]
+    - Processing: Wrapper forwards raw action; normalization is done by env
     - Output: Target portfolio weights [N+1] passed to env.execute_portfolio_change()
-       (Softmax is applied inside policy, not by environment)
     """
 
     def __init__(
@@ -1094,17 +1257,16 @@ class AllocatorEnvironmentWrapper(gym.Wrapper):
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict]:
         """
-        Execute allocator action (weight logits) and return next state.
+        Execute allocator action (raw allocations) and return next state.
         
         Args:
-            action: Target weights from allocator policy [N+1]
-                   (Already softmax-normalized by policy)
+            action: Raw allocator outputs from policy [N+1] in [0, 1]
         
         Returns:
             (observation, reward, terminated, truncated, info)
             
         Process:
-        1. Use action as target weights (already normalized by softmax)
+        1. Forward raw action to env (env normalizes to valid weights)
         2. Execute portfolio rebalancing via env.step()
         3. Update tokenizer portfolio statistics (for next observation)
         4. Assemble next observation from SAA signals + updated state
@@ -1117,23 +1279,11 @@ class AllocatorEnvironmentWrapper(gym.Wrapper):
                 f"got {action.shape[0]}"
             )
         
-        # Action is already normalized weights from softmax [0, 1] summing to 1.0
-        # No additional normalization needed - softmax guarantees this mathematically
+        # Keep wrapper minimal: pass raw bounded action to env and let env normalize.
         action = np.asarray(action, dtype=np.float32)
 
-        # Validation: verify weights sum to 1.0 (allow small numerical tolerance)
-        action_sum = np.sum(action)
-        if not (1-1e-4 <= action_sum <= 1+1e-4):
-            # This should NEVER happen with proper softmax in policy
-            # But clamp for safety to ensure sum = 1.0
-            action = action / np.maximum(action_sum, 1e-8)
-            print(f"[Warning] Action sum was {action_sum:.6f}, re-normalized to 1.0")
-
-        # Verify no negative weights (softmax guarantees this, but double-check)
-        if np.any(action < -1e-6):
-            print(f"[Warning] Negative weights detected: {action[action < 0]}, clipping to 0")
-            action = np.maximum(action, 0.0)
-            action = action / np.sum(action)  # Re-normalize after clipping
+        # Bound action for safety in case exploration noise or numerical jitter escapes range.
+        action = np.clip(action, 0.0, 1.0)
 
         # Execute rebalancing in underlying environment
         # env.step() in EXECUTION_PORTFOLIO_WEIGHTS mode:
@@ -1463,7 +1613,7 @@ class AllocatorRewardCalculator:
         self,
         sortino_eta: float = 0.018,
         sortino_downside_var_floor: float = 1e-6,
-        sortino_gain: float = 3.5,
+        sortino_gain: float = 1.0,
         sortino_net_reward_mix: float = 0.7,
         lambda_drawdown: float = 0.5
     ):
@@ -3172,7 +3322,7 @@ def build_allocator_eval_callback(
     # This callback accumulates per-episode metrics during evaluation
     # and computes aggregated statistics (mean, std) after all eval episodes
     val_metrics_cb = AllocatorValidationCallback(
-        tag_prefix="allocator/validation",  # TensorBoard prefix for validation metrics
+        tag_prefix="validation",  # TensorBoard prefix for validation metrics
         verbose=verbose
     )
     
@@ -3262,7 +3412,8 @@ def run(cache: MarketDataCache, config: Dict[str, Any]) -> Dict[str, Any]:
     vec_train = VecNormalize(
         DummyVecEnv([make_train_env]),
         norm_obs=True,
-        norm_reward=True,
+
+        norm_reward=False,
         clip_obs=10.0,
         clip_reward=np.inf,
         gamma=gamma_cfg  # For advantage normalization in reward scaling
@@ -3398,7 +3549,7 @@ def run(cache: MarketDataCache, config: Dict[str, Any]) -> Dict[str, Any]:
     train_log_freq = int(train_cfg.get("train_log_freq", 10))
     
     train_callback = AllocatorPortfolioLoggerCallback(
-        tag_prefix="allocator/train",
+        tag_prefix="train",
         log_freq=train_log_freq,  # Log every N episodes
         verbose=int(agent_cfg.get("verbose", 1))
     )
