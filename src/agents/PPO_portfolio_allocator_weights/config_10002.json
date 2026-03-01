@@ -1,8 +1,9 @@
 {
     "saa_config":{
-        "saa_run_id": "00041",
+        "saa_run_id": "00076",
         "saa_base_dir":"src/agents/RecurrPPO_target_position_agent/saved_models",
-        "saa_config_id": "00009",
+        "saa_config_id": "00010",
+        "saa_run_date": "26_02_28",
         "device": "cpu"
     },
 

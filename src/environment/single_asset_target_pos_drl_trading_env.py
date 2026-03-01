@@ -1683,8 +1683,8 @@ class TradingEnv(gym.Env):
                     position_notional_total = np.sum(initial_positions * initial_prices)
                     initial_cash = self.initial_portfolio_value - position_notional_total - total_init_tc
                     
-                    print(f"[Portfolio Init] Scaled positions down by {(1.0 - scale_factor) * 100:.1f}% "
-                          f"to avoid negative cash. Final init cash: ${initial_cash:.2f}")
+                    print(f"[Portfolio Init Info] Scaled positions down by {(1.0 - scale_factor) * 100:.2f}% "
+                          f"to avoid negative cash. Final init cash: ${initial_cash:.4f}")
                     
                 # Store initial subportfolio values for SAA mode
                 self.saa_initial_cash = initial_cash
@@ -3717,10 +3717,10 @@ class TradingEnv(gym.Env):
     
     def get_observation_single_step(self):
         """
-        Generate single-step observation for agents like RecurrentPPO that do not require sequences.
+        Generate single-step observation for agents like RecurrentPPO or PPO that do not require sequences.
 
         Returns:
-            Flattened observation array optimized for SB3 LSTM processing
+            Flattened observation array optimized for SB3 processing
             Shape: (total_observation_size,)
             - feature part: [num_assets, num_asset_features]
             - portfolio part: [num_portfolio_features]            

@@ -24,6 +24,14 @@ def load_config(path):
 def load_market_data(csv_path):
     return pd.read_csv(csv_path)
 
+def verify_requested_features(df: pd.DataFrame, config: dict) -> None:
+    """Ensure all features marked True in config['features'] exist as columns in the loaded dataframe."""
+    requested = {name for name, enabled in config.get("features", {}).items() if enabled}
+    missing = requested - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing requested features in data: {sorted(missing)}")
+    print(f"[verify_requested_features] All {len(requested)} requested features are present.")
+
 def run_agent(agent_folder, config_path):
     """
     This function dynamically loads and runs the specified agent with the given configuration based on the .py file.
@@ -40,6 +48,9 @@ def run_agent(agent_folder, config_path):
     # Load market data from CSV into dataframe
     market_data_path = config.get("market_data_path") or os.path.join(os.path.dirname(__file__), "src", "data", "enriched_financial_data.csv")
     df = load_market_data(market_data_path)
+
+    # Verifiy requested features are available in the cache before running the agent
+    verify_requested_features(df, config)
 
     # Initialize MarketDataCache container from dataframe
     cache = MarketDataCache.from_dataframe(

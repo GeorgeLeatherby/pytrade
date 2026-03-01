@@ -4,7 +4,7 @@ It prepares the data by transforming, normalizing and enriching it
 for the subsequent training and validation of machine learning models.
 
 Output:
-- A dataset ready for machine learning utilizing transformer
+- A dataset ready for machine learning
 
 Inputs:
 - Raw financial data files (CSV format)
@@ -53,8 +53,12 @@ class DataEnricher:
     def enrich_data(self):
         # 0. Convert currencies of indices to USD using fx data. Note: Currently not in use!
         # self.convert_to_usd()
+
         # 1. Raw to stationary Feature engineering
         self.convert_raw_to_stationary_data()
+
+        self.trigonometric_date_encoding()
+        
         self.NaN_counting()
         # 2. Technical indicators
         self.technical_indicators()
@@ -75,6 +79,38 @@ class DataEnricher:
         # 6. Save calculated data
         self.save_calculated_data()
         
+    def trigonometric_date_encoding(self):
+        """
+        Continuous cyclic encodings without weekend jumps:
+        - dow_sin/dow_cos: business-day index mod 5
+        - dom_sin/dom_cos: business-day index mod 21 (approx. trading days per month)
+        - moy_sin/moy_cos: business-day index mod 252 (approx. trading days per year)
+        """
+        # copy enriched_data to avoid modifying original dataframe during iteration
+        base_df = self.enriched_data
+        if 'Date' not in base_df.columns:
+            raise ValueError("Column 'Date' is required for trigonometric date encoding.")
+        df = base_df.copy()
+        dates = pd.to_datetime(df['Date'])
+
+        # Business-day index (no gaps for weekends)
+        bdays = pd.bdate_range(dates.min(), dates.max(), freq='C')
+        bday_idx = pd.Index(bdays).get_indexer(dates)
+
+        two_pi = 2 * np.pi
+        dow_cycle = 5.0    # business week
+        dom_cycle = 21.0   # approx. trading days per month
+        moy_cycle = 252.0  # approx. trading days per year
+
+        df['dow_sin'] = np.sin(two_pi * bday_idx / dow_cycle)
+        df['dow_cos'] = np.cos(two_pi * bday_idx / dow_cycle)
+        df['dom_sin'] = np.sin(two_pi * bday_idx / dom_cycle)
+        df['dom_cos'] = np.cos(two_pi * bday_idx / dom_cycle)
+        df['moy_sin'] = np.sin(two_pi * bday_idx / moy_cycle)
+        df['moy_cos'] = np.cos(two_pi * bday_idx / moy_cycle)
+
+        self.enriched_data = df
+
     def convert_to_usd(self):
         """
         Convert asset OHLC prices from their local currency into USD.
@@ -261,9 +297,6 @@ class DataEnricher:
                         f"Local Close={r['Close_local']:.3f} USD Close={r['Close']:.3f}"
                     )
         print("All prices now expressed in USD.")
-
-
-        
 
     def compare_date_ranges(self):
         # TODO: Write actual comparison logic

@@ -6,7 +6,9 @@ The allocator uses a Transformer encoder to process per-asset signals from froze
 (Single-Asset Agents) combined with portfolio-level features.
 
 Architecture:
-- Input: Per-asset features (SAA signals + portfolio state + risk metrics) + global portfolio token
+- Input: 
+    1. Per-asset tokens: raw market features, the injected SAA signal, and per-asset weight
+    2. Global portfolio token
 - Embedding: Linear projection + asset ID embeddings → d_model dimensions
 - Transformer Encoder: Self-attention across N+1 tokens (N assets + 1 portfolio token)
 - Output Heads: Per-asset raw allocation logits + cash logit → sigmoid output in [0, 1]
@@ -32,16 +34,16 @@ from datetime import datetime
 
 from stable_baselines3 import PPO
 from sb3_contrib import RecurrentPPO
-#from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.distributions import Normal
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
+from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv, VecEnvWrapper, VecEnv
 from stable_baselines3.common.evaluation import evaluate_policy
 
 import gymnasium as gym
 
-from src.environment.single_asset_target_pos_drl_trading_env import TradingEnv as PortfolioEnv
+from src.environment.single_asset_target_pos_drl_trading_env import TradingEnv
 from src.environment.single_asset_target_pos_drl_trading_env import MarketDataCache
 
 
@@ -94,1719 +96,6 @@ def _normalize_obs_with_vecnormalize(obs: np.ndarray, vecnorm: VecNormalize) -> 
     obs_norm = np.clip(obs_norm, -clip_obs, clip_obs)
     return obs_norm.astype(np.float32, copy=False)
 
-
-# ================================
-# SAA Ensemble (Frozen single-asset agents)
-# ================================
-
-class FrozenSAAEnsemble:
-    """
-    Manages a collection of pre-trained frozen SAA models (one per asset).
-    Handles inference-only queries to obtain per-asset signals without gradients.
-    Note that the SAAs are stateful wrt time due to LSTM layers!
-    
-    Each SAA is a RecurrentPPO agent trained in single-asset mode. This ensemble:
-    - Loads all N SAA models from disk (.zip files)
-    - Maintains separate LSTM hidden states for each asset
-    - Provides frozen inference (torch.no_grad()) to extract per-asset signals
-    - Resets internal state at episode boundaries
-    
-    SAA Model Paths Convention:
-    - Base directory: src/agents/RecurrPPO_target_position_agent/saved_models/
-    - Subdirectory format: {run_id}_config_{config_id}_{date}/best_model.zip
-    - run_id: 5-digit string (e.g., "00017") controlling which SAA version to use
-    - This allows easy switching via config parameter: "saa_run_id"
-    """
-
-    def __init__(
-            self, asset_to_model_path: Dict[str, str], 
-            vecnormalize_path: Optional[str] = None,device: str = "cpu"
-        ):
-        """
-        Initialize ensemble with paths to trained SAA models.
-        
-        Args:
-            asset_to_model_path: Dict mapping asset symbol → full path to .zip model file
-                                 Example: {"SPY": "/path/to/00017.../best_model.zip", ...}
-            device: PyTorch device for model inference ("cpu", "cuda", etc.)
-        
-        Raises:
-            FileNotFoundError: If any specified model file does not exist
-            RuntimeError: If model loading fails (corrupted .zip, wrong RecurrentPPO format)
-        """
-        self.device = device
-        self.assets = list(asset_to_model_path.keys())
-        self.models = {}
-        self.lstm_states = {}  # Per-asset LSTM hidden states (cell_state, hidden_state)
-        self.vecnormalize = None # Loaded VecNormalize (obs stats) for inference-time normalization
-        
-        # Load all SAA models from disk
-        print(f"[FrozenSAAEnsemble] Loading {len(self.assets)} SAA models...")
-        for asset_symbol, model_path in asset_to_model_path.items():
-            # Verify file exists before attempting load
-            if not os.path.exists(model_path):
-                raise FileNotFoundError(
-                    f"SAA model for asset '{asset_symbol}' not found at: {model_path}"
-                )
-            
-            try:
-                # Load RecurrentPPO model from .zip file
-                # RecurrentPPO.load() restores policy, optimizer state, and hyperparameters
-                self.models[asset_symbol] = RecurrentPPO.load(
-                    model_path,
-                    device=self.device
-                )
-                print(f"  ✓ Loaded SAA for {asset_symbol} from {os.path.basename(model_path)}")
-            except Exception as e:
-                raise RuntimeError(
-                    f"Failed to load SAA model for '{asset_symbol}' from {model_path}: {str(e)}"
-                )
-            
-            # Initialize LSTM hidden states as None; will be set on first reset
-            self.lstm_states[asset_symbol] = None
-        
-        print(f"[FrozenSAAEnsemble] Successfully loaded {len(self.models)} SAA models on device: {device}")
-
-        # Load VecNormalize observation stats (if provided) so frozen inference matches SAA training
-        if vecnormalize_path is not None:
-            if not os.path.exists(vecnormalize_path):
-                print(f"[FrozenSAAEnsemble] WARNING: VecNormalize file not found: {vecnormalize_path}. Proceeding without obs normalization.")
-            else:
-                try:
-                    any_model = next(iter(self.models.values()))
-                    obs_space = any_model.observation_space
-                    dummy_env = DummyVecEnv([lambda: _ObsNormDummyEnv(obs_space)])
-                    self.vecnormalize = VecNormalize.load(vecnormalize_path, dummy_env)
-                    self.vecnormalize.training = False
-                    self.vecnormalize.norm_reward = False
-                    print(f"[FrozenSAAEnsemble] Loaded VecNormalize stats from: {os.path.basename(vecnormalize_path)}")
-                except Exception as e:
-                    raise RuntimeError(f"Failed to load VecNormalize from {vecnormalize_path}: {str(e)}")
-
-    def reset_episode(self) -> None:
-        """
-        Reset LSTM hidden states for all SAAs at episode start.
-        Called by environment/wrapper at reset() to clear temporal memory.
-        
-        After reset, the next get_saa_signals() call will start with fresh LSTM state,
-        effectively marking the episode boundary for RecurrentPPO inference.
-        """
-        # Reset all per-asset LSTM hidden states to None
-        # RecurrentPPO.predict() interprets None as initialization signal
-        for asset in self.assets:
-            self.lstm_states[asset] = None
-        
-        # Optional: Log reset for debugging
-        # print(f"[FrozenSAAEnsemble] Reset LSTM states for all {len(self.assets)} assets")
-
-    def get_saa_signals(
-        self,
-        obs_per_asset: Dict[str, np.ndarray],
-        episode_starts: Dict[str, bool]
-    ) -> Dict[str, float]:
-        """
-        Obtain target position signal from each SAA via inference.
-        
-        Runs each frozen SAA forward once per asset to extract its recommended
-        position change. Uses torch.no_grad() to disable gradient computation,
-        ensuring frozen inference and reduced memory/compute overhead.
-        
-        Args:
-            obs_per_asset: Dict mapping asset symbol → observation array (same format as SAA training)
-                          Observation should be shape [obs_dim] (single step, no batch dimension)
-            episode_starts: Dict mapping asset symbol → boolean (True if episode boundary, False otherwise)
-                           Used to signal LSTM state reset to RecurrentPPO
-        
-        Returns:
-            Dict mapping asset symbol → SAA action scalar (typically [-1, 1] range for target position)
-            
-        Notes:
-            - LSTM states are updated in-place within self.lstm_states; subsequent calls
-              maintain temporal continuity (crucial for LSTM memory)
-            - torch.no_grad() prevents gradient tracking; models remain frozen
-            - Each asset's SAA runs independently (can be parallelized if needed)
-        """
-        saa_signals = {}
-        
-        # Disable gradient computation for frozen inference
-        with torch.no_grad():
-            for asset in self.assets:
-                # Get observation for this asset
-                obs = _normalize_obs_with_vecnormalize(obs_per_asset[asset], self.vecnormalize)
-                
-                # Get episode start flag
-                episode_start = np.array([episode_starts.get(asset, False)])
-                
-                # Run frozen SAA to get action (target position change)
-                # Args:
-                #   obs: observation for this step
-                #   state: current LSTM hidden/cell states (None on first step)
-                #   episode_start: boolean array marking episode boundary
-                #   deterministic: True for inference (use policy mean, not sampled action)
-                # Returns:
-                #   action: [1] array (target position for single-asset agent)
-                #   state: updated LSTM (cell_state, hidden_state) tuple
-                action, self.lstm_states[asset] = self.models[asset].predict(
-                    obs,
-                    state=self.lstm_states[asset],
-                    episode_start=episode_start,
-                    deterministic=True  # Use policy mean for inference (no sampling noise)
-                )
-                
-                # Extract scalar from action array, verify correctness, and store
-                # SAA output is typically in [-1, 1] (position change scaled by action_limiting_factor)
-                if not isinstance(action, np.ndarray) or action.shape != (1,):
-                    raise RuntimeError(
-                        f"SAA action for asset '{asset}' has unexpected shape: {action.shape}"
-                    ) 
-                 
-                # Validate that SAA action is in expected range [-1, 1]
-                if not np.all((action >= -1.0) & (action <= 1.0)):
-                    raise RuntimeError(
-                        f"Warning: SAA action for {asset} outside [-1, 1] range: {action[0]}"
-                    )
-                saa_signals[asset] = float(action[0])
-        
-        return saa_signals
-    
-    # Batched version of get_saa_signals for improved efficiency (runs all SAAs in one forward pass)
-    # Batched version of get_saa_signals for improved efficiency (runs all SAAs in one forward pass)
-    def get_saa_signals_batched(
-        self,
-        obs_per_asset: Dict[str, np.ndarray],
-        episode_starts: Dict[str, bool]
-    ) -> Dict[str, float]:
-        """
-        BATCHED inference: Run all SAA forward passes in a single batch.
-        
-        ~75-85% faster than sequential get_saa_signals() for 11 assets.
-        Uses vectorized operations instead of 11 separate forward passes.
-        
-        Args:
-            obs_per_asset: Dict mapping asset symbol → observation array
-            episode_starts: Dict mapping asset symbol → episode boundary flag
-        
-        Returns:
-            Dict mapping asset symbol → SAA action scalar (typically [-1, 1])
-        """
-        saa_signals = {}
-        
-        with torch.no_grad():
-            # --- Step 1: Normalize and stack all observations ---
-            obs_list = []
-            for asset in self.assets:
-                obs = _normalize_obs_with_vecnormalize(obs_per_asset[asset], self.vecnormalize)
-                obs_list.append(obs)
-            
-            # Stack into batch array: [num_assets, obs_dim]
-            obs_batch = np.stack(obs_list, axis=0).astype(np.float32)
-            
-            # --- Step 2: Stack episode start flags ---
-            episode_start_batch = np.array(
-                [episode_starts.get(asset, False) for asset in self.assets],
-                dtype=bool
-            )
-            
-            # --- Step 3: Prepare LSTM states for batching ---
-            # Extract hidden size from the LSTM layer itself
-            ref_model = self.models[self.assets[0]]
-            
-            try:
-                # Try to get hidden size from lstm_actor layer (MlpLstmPolicy stores it here)
-                lstm_layer = ref_model.policy.lstm_actor
-                hidden_size = lstm_layer.hidden_size
-            except (AttributeError, TypeError):
-                try:
-                    # Fallback: infer from existing LSTM state if any asset has been stepped
-                    first_state = next((s for s in self.lstm_states.values() if s is not None), None)
-                    if first_state is not None:
-                        lstm_c, lstm_h = first_state
-                        hidden_size = lstm_h.shape[1]
-                    else:
-                        # Could not determine hidden size - raise informative error
-                        raise RuntimeError(
-                            f"Could not determine LSTM hidden size from policy.lstm_actor.hidden_size. "
-                            f"Available policy attributes: {[attr for attr in dir(ref_model.policy) if 'lstm' in attr.lower()]}"
-                        )
-                except RuntimeError:
-                    raise
-                except Exception as e:
-                    raise RuntimeError(f"Failed to extract LSTM hidden size: {str(e)}")
-            
-            lstm_h_list = []
-            lstm_c_list = []
-            
-            for asset in self.assets:
-                state = self.lstm_states[asset]
-                
-                if state is None:
-                    # First step: initialize with zeros [1, hidden_size]
-                    lstm_h = np.zeros((1, hidden_size), dtype=np.float32)
-                    lstm_c = np.zeros((1, hidden_size), dtype=np.float32)
-                else:
-                    # Unpack existing state: (cell, hidden) from previous step
-                    lstm_c, lstm_h = state
-                
-                lstm_h_list.append(lstm_h)
-                lstm_c_list.append(lstm_c)
-            
-            # Stack into batch: [num_assets, hidden_size]
-            lstm_h_batch = np.vstack(lstm_h_list)
-            lstm_c_batch = np.vstack(lstm_c_list)
-            lstm_state_batch = (lstm_c_batch, lstm_h_batch)
-            
-            # --- Step 4: Single batched forward pass (THE SPEEDUP!) ---
-            # Convert to tensors on correct device
-            obs_tensor = torch.as_tensor(obs_batch, dtype=torch.float32, device=self.device)
-            
-            # Call policy forward with batched inputs
-            # This runs all 11 LSTM cells in parallel → ~11x faster
-            actions, lstm_states_new = ref_model.policy(
-                obs_tensor,
-                state=lstm_state_batch,
-                episode_start=episode_start_batch,
-                deterministic=True
-            )
-            
-            # --- Step 5: Unpack batched results and update LSTM states ---
-            actions_np = actions.cpu().numpy()
-            lstm_c_new, lstm_h_new = lstm_states_new
-            
-            for idx, asset in enumerate(self.assets):
-                # Extract this asset's action from batch
-                action_val = float(actions_np[idx, 0])
-                
-                # Validate and clip to [-1, 1]
-                action_val = np.clip(action_val, -1.0, 1.0)
-                saa_signals[asset] = action_val
-                
-                # Update LSTM state for next step: [1, hidden_size]
-                self.lstm_states[asset] = (
-                    lstm_c_new[idx:idx+1],  # Cell state
-                    lstm_h_new[idx:idx+1]   # Hidden state
-                )
-        
-        return saa_signals
-    
-    def get_saa_values(
-        self,
-        obs_per_asset: Dict[str, np.ndarray],
-        episode_starts: Dict[str, bool]
-    ) -> Dict[str, float]:
-        """
-        Optionally retrieve value estimates from SAA critic heads.
-        
-        Runs SAA value function (critic) to get per-asset state value estimates.
-        Useful for:
-        - Confidence weighting of per-asset signals (high value = confident region)
-        - Auxiliary loss for allocator training (auxiliary policy distillation)
-        - Analysis of SAA uncertainty
-        
-        Args:
-            obs_per_asset: Dict mapping asset symbol → observation array
-            episode_starts: Dict mapping asset symbol → episode boundary flag
-        
-        Returns:
-            Dict mapping asset symbol → scalar value estimate from SAA critic
-            
-        Notes:
-            - Does NOT update LSTM states (read-only queries)
-            - Use torch.no_grad() to avoid gradient tracking
-            - SAA value is normalized by training environment; typically centered around 0
-        """
-        saa_values = {}
-        
-        with torch.no_grad():
-            for asset in self.assets:
-                obs = _normalize_obs_with_vecnormalize(obs_per_asset[asset], self.vecnormalize)
-                episode_start = np.array([episode_starts.get(asset, False)])
-                
-                # Get value estimate from SAA's value function
-                # Use .policy to access the underlying policy object and extract value directly
-                obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
-                
-                # RecurrentPPO's policy has forward_lstm and value_net methods
-                # We need to extract the value through the policy network
-                try:
-                    # Access policy's value function directly
-                    self.models[asset].policy.set_training_mode(False)
-                    _, value, _ = self.models[asset].policy(
-                        obs_tensor,
-                        state=self.lstm_states[asset],
-                        episode_start=episode_start
-                        )
-                    saa_values[asset] = float(value[0, 0])
-                except Exception as e:
-                    # Throw error if value extraction fails
-                    raise RuntimeError(f"Could not extract value for {asset}: {str(e)}")
-        
-        return saa_values
-
-    def get_saa_hidden_states(
-        self,
-        obs_per_asset: Dict[str, np.ndarray],
-        episode_starts: Dict[str, bool]
-    ) -> Dict[str, np.ndarray]:
-        """
-        Optionally retrieve compressed LSTM hidden states from SAAs.
-        
-        Extracts LSTM hidden state vectors (not cell state) from each SAA.
-        Can be used as additional features for allocator if desired:
-        - Concatenate with SAA signals and asset features
-        - Captures LSTM's internal temporal representation
-        - May improve allocator's ability to model asset-specific dynamics
-        
-        Args:
-            obs_per_asset: Dict mapping asset symbol → observation array
-            episode_starts: Dict mapping asset symbol → episode boundary flag
-        
-        Returns:
-            Dict mapping asset symbol → LSTM hidden state array
-            Shape typically [n_lstm_layers * hidden_size] after compression
-            
-        Notes:
-            - Does NOT modify self.lstm_states (read-only)
-            - LSTM hidden states capture asset-specific temporal patterns
-            - Can be averaged/pooled if multiple LSTM layers exist
-            - Advanced feature; optional for basic allocator
-        """
-        saa_hidden_states = {}
-        
-        with torch.no_grad():
-            for asset in self.assets:
-                obs = _normalize_obs_with_vecnormalize(obs_per_asset[asset], self.vecnormalize)
-                episode_start = np.array([episode_starts.get(asset, False)])
-                
-                # Run prediction but extract hidden state from returned state tuple
-                _, state_tuple = self.models[asset].predict(
-                    obs,
-                    state=self.lstm_states[asset],
-                    episode_start=episode_start,
-                    deterministic=True
-                )
-                
-                # state_tuple is (cell_state, hidden_state) tuple
-                # Extract hidden state (second element) and convert to numpy
-                if state_tuple is not None:
-                    hidden_state = state_tuple[1]  # hidden state
-                    if isinstance(hidden_state, torch.Tensor):
-                        hidden_state = hidden_state.detach().cpu().numpy()
-                    # Flatten if needed (handle multiple LSTM layers)
-                    saa_hidden_states[asset] = hidden_state.flatten().astype(np.float32)
-                else:
-                    # Fallback: return zeros if state extraction fails
-                    saa_hidden_states[asset] = np.zeros(1, dtype=np.float32)
-                    raise RuntimeError(
-                        f"Could not extract hidden state for asset '{asset}'; returning zeros."
-                    )
-        
-        return saa_hidden_states
-    
-
-# ================================
-# Transformer Policy Network (Custom)
-# ================================
-
-class TransformerTokenizer:
-    """
-    Converts per-asset features and portfolio state into tokenized embeddings.
-    Assembles feature vectors and handles normalization/projection.
-    """
-
-    def __init__(
-        self,
-        num_assets: int,
-        saa_feature_dim: int,
-        asset_feature_dim: int,
-        portfolio_feature_dim: int,
-        d_model: int
-
-    ):
-        """
-        Initialize tokenizer with feature dimensions.
-        
-        Args:
-            num_assets: Number of tradable assets (N)
-            saa_feature_dim: Dimension of SAA signal (typically 1 for scalar action)
-            asset_feature_dim: Dimension of per-asset features (weights, returns, risks, etc.)
-            portfolio_feature_dim: Dimension of portfolio/global features
-            d_model: Target embedding dimension for transformer
-        """
-        super().__init__()
-
-        # Store configuration for validation and integration checks
-        self.num_assets = num_assets
-        self.saa_feature_dim = saa_feature_dim
-        self.asset_feature_dim = asset_feature_dim
-        self.portfolio_feature_dim = portfolio_feature_dim
-        self.d_model = d_model
-
-        # Running statistics (updated step-by-step during rollouts)
-        self._portfolio_feature_mean = np.zeros(portfolio_feature_dim, dtype=np.float32)
-        self._portfolio_feature_std = np.ones(portfolio_feature_dim, dtype=np.float32)
-        self._portfolio_feature_count = 0  # Track number of steps seen
-
-        # Total per-asset input features:
-        # [SAA signal] + [portfolio weight for that asset] + [asset_features...]
-        self.per_asset_input_dim = saa_feature_dim + 1 + asset_feature_dim
-
-        # Linear projections into transformer model space (d_model)
-        # These are standard and integrate cleanly with TransformerEncoder
-        self.asset_projection = nn.Linear(self.per_asset_input_dim, d_model)
-        self.portfolio_projection = nn.Linear(portfolio_feature_dim, d_model)
-
-        # Maintain a stable feature order across calls for consistency
-        self._asset_order: Optional[List[str]] = None
-        self._portfolio_feature_keys: Optional[List[str]] = None
-
-        # Optional normalization statistics (placeholders for future enhancement)
-        # If you later compute running means/stds, store them here
-        self._asset_feature_mean: Optional[np.ndarray] = None
-        self._asset_feature_std: Optional[np.ndarray] = None
-        self._portfolio_feature_mean: Optional[np.ndarray] = None
-        self._portfolio_feature_std: Optional[np.ndarray] = None
-
-    def tokenize_assets(
-        self,
-        saa_signals: Dict[str, float],
-        portfolio_weights: np.ndarray,
-        asset_features: Dict[str, np.ndarray]
-    ) -> Tuple[torch.Tensor, List[str]]:
-        """
-        Create asset token embeddings from signals and features.
-        
-        Args:
-            saa_signals: Dict of per-asset SAA actions
-            portfolio_weights: Array of current weights [N]
-            asset_features: Dict mapping asset symbol → feature array
-        
-        Returns:
-            (asset_embeddings, asset_order) where embeddings shape [N, d_model]
-        """
-        # Establish a stable asset order on first call
-        if self._asset_order is None:
-            self._asset_order = list(asset_features.keys())
-
-        asset_order = self._asset_order
-
-        # Basic integrity checks
-        if len(asset_order) != self.num_assets:
-            raise ValueError(
-                f"Expected {self.num_assets} assets, got {len(asset_order)}"
-            )
-        if portfolio_weights.shape[0] != self.num_assets:
-            raise ValueError(
-                f"portfolio_weights length {portfolio_weights.shape[0]} "
-                f"does not match num_assets {self.num_assets}"
-            )
-
-        # Build per-asset feature vectors
-        asset_token_list = []
-        for idx, asset in enumerate(asset_order):
-            if asset not in asset_features:
-                raise KeyError(f"Missing features for asset '{asset}'")
-            if asset not in saa_signals:
-                raise KeyError(f"Missing SAA signal for asset '{asset}'")
-
-            # Raw inputs
-            saa_signal = np.array([saa_signals[asset]], dtype=np.float32)
-            asset_weight = np.array([portfolio_weights[idx]], dtype=np.float32)
-            asset_feat = np.asarray(asset_features[asset], dtype=np.float32)
-
-            # Validate feature size
-            if asset_feat.shape[0] != self.asset_feature_dim:
-                raise ValueError(
-                    f"Asset feature dim mismatch for '{asset}': "
-                    f"expected {self.asset_feature_dim}, got {asset_feat.shape[0]}"
-                )
-
-            # Concatenate into a single per-asset vector
-            per_asset_vec = np.concatenate([saa_signal, asset_weight, asset_feat], axis=0)
-
-            # # Normalize (currently pass-through unless stats are set)
-            # per_asset_vec = self.normalize_features(per_asset_vec, feature_type="asset")
-
-            # Project into model dimension
-            per_asset_tensor = torch.as_tensor(per_asset_vec, dtype=torch.float32)
-            asset_token = self.asset_projection(per_asset_tensor)
-            asset_token_list.append(asset_token)
-
-        # Stack to shape [N, d_model]
-        asset_embeddings = torch.stack(asset_token_list, dim=0)
-
-        return asset_embeddings, asset_order
-
-    def tokenize_portfolio(
-        self,
-        portfolio_state_dict: Dict[str, float]
-    ) -> torch.Tensor:
-        """
-        Create portfolio/global token embedding.
-        
-        Args:
-            portfolio_state_dict: Dict with keys like cash_weight, portfolio_vol, turnover, etc.
-        
-        Returns:
-            Portfolio token embedding shape [d_model]
-        """
-        # Establish a stable feature order on first call
-        if self._portfolio_feature_keys is None:
-            self._portfolio_feature_keys = list(portfolio_state_dict.keys())
-
-        # Enforce consistent ordering across steps
-        if set(portfolio_state_dict.keys()) != set(self._portfolio_feature_keys):
-            raise ValueError(
-                "Portfolio feature keys changed across calls. "
-                "Keep keys stable to ensure consistent encoding."
-            )
-
-        # Build portfolio feature vector in stable key order
-        portfolio_vec = np.array(
-            [portfolio_state_dict[k] for k in self._portfolio_feature_keys],
-            dtype=np.float32
-        )
-
-        # Validate feature size
-        if portfolio_vec.shape[0] != self.portfolio_feature_dim:
-            raise ValueError(
-                f"Portfolio feature dim mismatch: expected {self.portfolio_feature_dim}, "
-                f"got {portfolio_vec.shape[0]}"
-            )
-
-        # Normalize (currently pass-through unless stats are set)
-        portfolio_vec = self.normalize_features(portfolio_vec, feature_type="portfolio")
-
-        # Project into model dimension
-        portfolio_tensor = torch.as_tensor(portfolio_vec, dtype=torch.float32)
-        portfolio_embedding = self.portfolio_projection(portfolio_tensor)
-
-        return portfolio_embedding
-
-    def normalize_features(
-        self,
-        features: np.ndarray,
-        feature_type: str = "asset"
-    ) -> np.ndarray:
-        """
-        Apply online or fixed normalization to feature vectors.
-        
-        Args:
-            features: Raw feature array
-            feature_type: "asset" or "portfolio" (determines which scaler to use)
-        
-        Returns:
-            Normalized feature array (same shape)
-        """
-        # Placeholder normalization: identity transform by default.
-        # If you later compute running mean/std, plug them here.
-        if feature_type == "asset":
-            if self._asset_feature_mean is not None and self._asset_feature_std is not None:
-                return (features - self._asset_feature_mean) / (self._asset_feature_std + 1e-8)
-            return features
-        
-        elif feature_type == "portfolio":
-            if self._portfolio_feature_mean is not None and self._portfolio_feature_std is not None:
-                safe_std = np.maximum(self._portfolio_feature_std, 1e-8)
-                return (features - self._portfolio_feature_mean) / safe_std
-            return features
-        else:
-            raise ValueError(f"Unknown feature_type: {feature_type}")
-
-    def update_portfolio_statistics(self, portfolio_features: np.ndarray) -> None:
-        """
-        Update running mean/std with Welford's online algorithm.
-        Called once per environment step (lookahead-safe: only sees current step).
-        
-        Args:
-            portfolio_features: Current step's portfolio feature vector [portfolio_feature_dim]
-        """
-        # Welford's online algorithm: O(1) memory, O(1) update
-        self._portfolio_feature_count += 1
-        delta = portfolio_features - self._portfolio_feature_mean
-        self._portfolio_feature_mean += delta / self._portfolio_feature_count
-        delta2 = portfolio_features - self._portfolio_feature_mean
-        
-        # Running variance (will divide by count later for unbiased estimate)
-        if self._portfolio_feature_count == 1:
-            self._portfolio_feature_std = np.zeros_like(portfolio_features, dtype=np.float32)
-        else:
-            # Incremental variance update
-            variance = np.sum(delta * delta2) / self._portfolio_feature_count
-            self._portfolio_feature_std = np.sqrt(np.maximum(variance, 1e-8))
-
-
-class TransformerEncoder(nn.Module):
-    """
-    Transformer encoder module for processing asset and portfolio tokens.
-    Uses standard PyTorch TransformerEncoder with self-attention.
-    
-    Architecture:
-    - Input: N+1 tokens (N assets + 1 portfolio), each [d_model]
-    - Processing: Multi-head self-attention across all tokens
-    - Output: Encoded tokens with same shape as input
-    
-    Integration:
-    - TransformerTokenizer produces input tokens → TransformerEncoder processes them
-    - Used within TransformerAllocatorPolicy to encode asset + portfolio representations
-    """
-
-    def __init__(
-        self,
-        d_model: int,
-        n_heads: int,
-        n_layers: int,
-        dim_feedforward: int,
-        dropout: float = 0.0,
-        activation: str = "relu"
-    ):
-        """
-        Initialize transformer encoder.
-        
-        Args:
-            d_model: Model dimension (must be divisible by n_heads)
-            n_heads: Number of attention heads
-            n_layers: Number of transformer layers
-            dim_feedforward: Dimension of feedforward network (typically 2x or 4x d_model)
-            dropout: Dropout rate
-            activation: "relu" or "gelu"
-        
-        Raises:
-            ValueError: If d_model not divisible by n_heads
-        """
-        
-        # Initialize parent nn.Module
-        super().__init__()
-        
-        # Validate that d_model is divisible by n_heads (required by multi-head attention)
-        if d_model % n_heads != 0:
-            raise ValueError(
-                f"d_model ({d_model}) must be divisible by n_heads ({n_heads})"
-            )
-        
-        # Store configuration for reference
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.n_layers = n_layers
-        self.dim_feedforward = dim_feedforward
-        self.dropout = dropout
-        self.activation = activation
-        
-        # Create individual transformer encoder layers
-        # Each layer consists of:
-        #   1. Multi-head self-attention (attends to all N+1 tokens)
-        #   2. Feed-forward network (position-wise, applied independently to each token)
-        #   3. Layer normalization and residual connections (built into TransformerEncoderLayer)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            activation=activation,
-            batch_first=False,  # We use (T, B, d_model) format (sequence length first)
-            norm_first=False    # Apply layer norm after residual (standard Transformer)
-        )
-        
-        # Stack N layers into a complete encoder
-        # Each layer can attend to outputs from previous layer
-        self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer=encoder_layer,
-            num_layers=n_layers,
-            norm=nn.LayerNorm(d_model)  # Final layer norm after all encoder layers
-        )
-
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        """
-        Process tokens through transformer encoder.
-        
-        Args:
-            tokens: Shape [T, d_model] where T = N+1 (assets + portfolio)
-                   - First N tokens: per-asset representations (from TransformerTokenizer)
-                   - Last token: portfolio representation
-                   - Each token is [d_model] dimension
-        
-        Returns:
-            Encoded tokens, shape [T, d_model]
-            - Same shape as input
-            - Each token is updated via multi-head self-attention and FFN
-            - Maintains positional relationships via attention mechanism
-            
-        Notes:
-            - No batch dimension: handles single observation (T, d_model) format
-            - If batch processing needed, reshape to (T, B, d_model) before calling
-            - Self-attention allows each token to attend to all other tokens
-            - Asset tokens can attend to portfolio context and other assets
-            - Portfolio token can attend to all asset signals
-        """
-        
-        # Pass tokens through transformer encoder
-        # Self-attention: each token can attend to all tokens (including itself)
-        # This allows:
-        #   - Each asset token to see other asset signals and portfolio context
-        #   - Portfolio token to see all asset signals
-        #   - Cross-asset dependencies to be modeled
-        encoded_tokens = self.transformer_encoder(tokens)
-        
-        # Return encoded tokens (same shape as input)
-        # encoded_tokens[0:N] = encoded asset tokens (each [d_model])
-        # encoded_tokens[N]   = encoded portfolio token ([d_model])
-        return encoded_tokens
-    
-
-class TransformerAllocatorPolicy(ActorCriticPolicy):
-    """
-    Custom ActorCriticPolicy combining transformer encoder with PPO heads.
-    Inherits from ActorCriticPolicy to provide complete policy interface for SB3.
-    
-    Architecture:
-    1. Transformer Encoder: Processes observation tokens via self-attention
-    2. Actor Head: Outputs raw allocation logits → passed to sigmoid in [0, 1]
-    3. Critic Head: Outputs scalar value estimate
-    
-    Integration with SB3 PPO:
-    - Acts as a complete policy class (no separate features_extractor needed)
-    - Implements required methods: forward(), _predict(), _get_action_dist_and_value()
-    - Uses Gaussian (Normal) distribution for continuous weight outputs
-    - SB3 handles gradient updates, clipping, and training loop
-    """
-
-    def __init__(
-        self,
-        observation_space: gym.spaces.Box,
-        action_space: gym.spaces.Box,
-        lr_schedule: Callable[[float], float],
-        num_assets: int,
-        d_model: int = 128,
-        n_heads: int = 8,
-        n_layers: int = 4,
-        dim_feedforward: int = 512,
-        dropout: float = 0.0,
-        use_asset_id_embedding: bool = True,
-        use_portfolio_token: bool = True,
-        **kwargs
-    ):
-        """
-        Initialize transformer-based actor-critic policy.
-        
-        Args:
-            observation_space: Gymnasium observation space
-            action_space: Gymnasium action space (should be continuous Box)
-            lr_schedule: Learning rate schedule function
-            num_assets: Number of tradable assets (N)
-            d_model: Transformer model dimension
-            n_heads: Number of attention heads
-            n_layers: Number of transformer encoder layers
-            dim_feedforward: Feedforward network dimension in transformer
-            dropout: Dropout rate
-            use_asset_id_embedding: Whether to use learned asset ID embeddings
-            use_portfolio_token: Whether to include dedicated portfolio token
-            **kwargs: Additional arguments for parent ActorCriticPolicy
-        """
-        # Call parent ActorCriticPolicy.__init__()
-        # This sets up the base policy infrastructure
-        super().__init__(
-            observation_space,
-            action_space,
-            lr_schedule,
-            **kwargs
-        )
-        
-        # Store configuration
-        self.num_assets = num_assets
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.n_layers = n_layers
-        self.dim_feedforward = dim_feedforward
-        self.dropout = dropout
-        self.use_asset_id_embedding = use_asset_id_embedding
-        self.use_portfolio_token = use_portfolio_token
-        
-        # Instantiate transformer encoder for token processing
-        self.transformer_encoder = TransformerEncoder(
-            d_model=d_model,
-            n_heads=n_heads,
-            n_layers=n_layers,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            activation="relu"
-        )
-        
-        # Linear layer to project observation into transformer token embedding space
-        # Input: observation vector [obs_dim]
-        # Output: token embedding [d_model]
-        self.obs_to_tokens = nn.Linear(observation_space.shape[0], d_model)
-        
-        # Optional: Asset ID embeddings for distinguishing tokens
-        if use_asset_id_embedding:
-            # Embeddings for N assets + 1 portfolio token
-            self.asset_id_embedding = nn.Embedding(num_assets + 1, d_model)
-        else:
-            self.asset_id_embedding = None
-        
-        # Actor head: maps transformer output → raw allocation logits
-        # Output dimension: N+1 (N assets + cash)
-        action_dim = action_space.shape[0]
-        self.action_head = nn.Linear(d_model, action_dim)
-
-        # Critic head: maps transformer output → scalar value estimate
-        self.value_head = nn.Linear(d_model, 1)
-
-        # Create dummy log_std parameter for SB3 logging compatibility
-        # SB3 tries to log 'std = exp(log_std)' during training (line 295 of ppo.py)
-        # We use Dirichlet distribution, not Normal, so this is just a placeholder
-        # to prevent: TypeError: exp(): argument 'input' must be Tensor, not NoneType
-        # Value doesn't matter - Dirichlet doesn't use it
-        action_dim = action_space.shape[0]
-        self.register_parameter('log_std', nn.Parameter(torch.zeros(action_dim)))
-
-
-    def forward(self, obs: torch.Tensor, deterministic: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Forward pass to extract features and produce weight actions and values.
-        
-        Args:
-            obs: Observation tensor, shape [batch_size, obs_dim]
-            deterministic: If True, use softmax output directly (max probability); else sample from Dirichlet
-        
-        Returns:
-            (actions, values, log_probs) tuple
-                actions: Raw allocations in [0, 1] [batch_size, action_dim]
-                values: Value estimates, shape [batch_size, 1]
-                log_probs: Log probabilities of weight distributions, shape [batch_size]
-        """
-        # Extract features from observations via transformer
-        features = self._extract_features(obs)  # [batch_size, d_model]
-        
-        # Get weight logits and values
-        weight_logits = self.action_head(features)  # [batch_size, N+1]
-        values = self.value_head(features).squeeze(-1)  # [batch_size]
-
-        # Policy produces raw allocations in [0, 1].
-        # IMPORTANT: sum-to-1 normalization is intentionally performed by the environment,
-        # not here, to keep policy output unconstrained except for bounds.
-        actions = torch.sigmoid(weight_logits)  # [batch_size, N+1]
-
-        # Custom log-prob surrogate (used consistently in forward/evaluate_actions).
-        # This keeps PPO bookkeeping stable while leaving simplex projection to env.
-        p = torch.clamp(actions, min=1e-8, max=1.0 - 1e-8)
-        log_probs = (actions * torch.log(p) + (1.0 - actions) * torch.log(1.0 - p)).sum(dim=-1)
-        
-        return actions, values, log_probs
-
-    def _extract_features(self, obs: torch.Tensor) -> torch.Tensor:
-        """
-        Extract transformer features from raw observations.
-        
-        Args:
-            obs: Observation tensor, shape [batch_size, obs_dim]
-        
-        Returns:
-            Features tensor, shape [batch_size, d_model]
-        """
-        batch_size = obs.shape[0]
-        
-        # Project observations to token embeddings
-        tokens = self.obs_to_tokens(obs)  # [batch_size, d_model]
-        
-        # Add asset ID embeddings if enabled
-        if self.use_asset_id_embedding:
-            # Use portfolio token ID (num_assets) for all observations
-            asset_ids = torch.full(
-                (batch_size,),
-                self.num_assets,
-                dtype=torch.long,
-                device=obs.device
-            )
-            asset_id_emb = self.asset_id_embedding(asset_ids)  # [batch_size, d_model]
-            tokens = tokens + asset_id_emb
-        
-        # Process through transformer encoder
-        # Add sequence dimension: [1, batch_size, d_model]
-        tokens_for_transformer = tokens.unsqueeze(0)
-        encoded_tokens = self.transformer_encoder(tokens_for_transformer)  # [1, batch_size, d_model]
-        
-        # Remove sequence dimension
-        features = encoded_tokens.squeeze(0)  # [batch_size, d_model]
-        
-        return features
-
-    def _predict(
-        self,
-        obs: torch.Tensor,
-        deterministic: bool = False
-    ) -> torch.Tensor:
-        """
-        Get actions from the policy (used during rollout collection).
-            
-        Called by SB3 during collect_rollouts(). Ignores log_probs and values
-        since those are handled separately by collect_rollouts().
-
-        Args:
-            obs: Observation tensor
-            deterministic: Whether to use deterministic policy
-        
-        Returns:
-            Action tensor
-        """
-        actions, _, _ = self.forward(obs, deterministic=deterministic)
-        return actions
-    
-    def _get_action_dist_and_value(
-        self,
-        obs: torch.Tensor
-    ) -> Tuple[torch.distributions.Normal, torch.Tensor]:
-        """
-        Get auxiliary Normal distribution and value estimate.
-
-        Note: action projection to valid portfolio weights is done in the environment.
-        This distribution is kept simple and is primarily for compatibility.
-        """
-        features = self._extract_features(obs)
-        weight_logits = self.action_head(features)
-        values = self.value_head(features).squeeze(-1) # should now be: [batch_size]
-
-        mean = torch.sigmoid(weight_logits)
-        std = torch.full_like(mean, 0.1)
-        distribution = torch.distributions.Normal(mean, std)
-        
-        return distribution, values
-    
-    def _get_action_dist_from_latent(self, latent_pi: torch.Tensor) -> torch.distributions.Distribution:
-        """
-        Build a simple Normal distribution around sigmoid-bounded means.
-        
-        Args:
-            latent_pi: Logit tensor from action head [batch_size, num_assets+1]
-        
-        Returns:
-            Normal distribution parameterized by bounded means
-        """
-        mean = torch.sigmoid(latent_pi)
-        std = torch.full_like(mean, 0.1)
-        return torch.distributions.Normal(mean, std)
-    
-    def evaluate_actions(
-        self, 
-        obs: torch.Tensor, 
-        actions: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Override evaluate_actions to match the raw-allocation policy output.
-        
-        SB3 calls this during policy gradient computation in training.
-        The environment handles normalization to simplex weights.
-        
-        Args:
-            obs: Observations tensor [batch_size, obs_dim]
-            actions: Actions taken [batch_size, action_dim] in [0, 1]
-        
-        Returns:
-            (values, log_probs, entropies) tuple for all batch samples
-            - values: Value estimates [batch_size]
-            - log_probs: Log probabilities of actions [batch_size]
-            - entropies: Entropy of action distributions [batch_size]
-        """
-        # Extract features and compute logits + values
-        features = self._extract_features(obs)  # [batch_size, d_model]
-        weight_logits = self.action_head(features)  # [batch_size, N+1]
-        values = self.value_head(features).squeeze(-1)  # [batch_size]
-        
-        probs = torch.sigmoid(weight_logits)
-        probs = torch.clamp(probs, min=1e-8, max=1.0 - 1e-8)
-        clipped_actions = torch.clamp(actions, min=1e-8, max=1.0 - 1e-8)
-
-        # Keep log-prob surrogate consistent with forward() so PPO ratio remains well-defined.
-        log_prob = (
-            clipped_actions * torch.log(probs)
-            + (1.0 - clipped_actions) * torch.log(1.0 - probs)
-        ).sum(dim=-1)
-
-        entropy = -(probs * torch.log(probs) + (1.0 - probs) * torch.log(1.0 - probs)).sum(dim=-1)
-        
-        return values, log_prob, entropy
-
-class AllocatorEnvironmentWrapper(gym.Wrapper):
-    """
-    Wraps the multi-asset portfolio environment to:
-    - Query frozen SAAs for per-asset signals
-    - Assemble transformer input (SAA signals + asset features + portfolio state)
-    - Convert allocator weight outputs to portfolio trades
-    
-    Integration:
-    - Underlying env must be in EXECUTION_PORTFOLIO_WEIGHTS mode
-    - FrozenSAAEnsemble provides per-asset signals from frozen RecurrentPPO models
-    - TransformerTokenizer assembles features into d_model tokens
-    - Allocator outputs N+1 weights (post-softmax) → execute_portfolio_change()
-       (Softmax is applied inside policy, not by environment)
-    
-    Observation Structure:
-    The wrapper constructs observations by:
-    1. Querying SAA ensemble for per-asset signals (frozen inference)
-    2. Extracting current portfolio state (weights, returns, metrics)
-    3. Extracting per-asset features from market data cache
-    4. Assembling into transformer-ready format via tokenizer
-    
-    Action Structure:
-    - Input: Raw allocator outputs [N+1] in [0, 1]
-    - Processing: Wrapper forwards raw action; normalization is done by env
-    - Output: Target portfolio weights [N+1] passed to env.execute_portfolio_change()
-    """
-
-    def __init__(
-        self,
-        env: PortfolioEnv,
-        saa_ensemble: FrozenSAAEnsemble,
-        tokenizer: TransformerTokenizer
-    ):
-        """
-        Initialize environment wrapper.
-        
-        Args:
-            env: Underlying multi-asset trading environment (EXECUTION_PORTFOLIO_WEIGHTS mode)
-            saa_ensemble: FrozenSAAEnsemble instance for signal generation
-            tokenizer: TransformerTokenizer for feature assembly
-
-        Note: By Convention cash weight is assumed to be index 0 by environment.
-        """
-        super().__init__(env)
-        
-        # Store components
-        self.saa_ensemble = saa_ensemble
-        self.tokenizer = tokenizer
-        
-        # Validate asset alignment between ensemble and environment
-        env_assets = set(env.market_data_cache.asset_names)
-        saa_assets = set(saa_ensemble.assets)
-        if env_assets != saa_assets:
-            raise ValueError(
-                f"Asset mismatch between env ({len(env_assets)} assets) "
-                f"and SAA ensemble ({len(saa_assets)} assets)"
-            )
-        
-        # Cache asset order for consistent feature extraction
-        self._asset_order = env.market_data_cache.asset_names
-        self._num_assets = env.market_data_cache.num_assets
-        
-        # Calculate flattened observation dimension
-        # Observation = [saa_signals (N), asset_features (N*num_features), portfolio_features (8)]
-        num_features = env.market_data_cache.num_features
-        portfolio_feature_dim = 8  # cash_weight, portfolio_value, return, sharpe, drawdown, volatility, turnover, alpha
-        
-        obs_dim = (
-            self._num_assets +  # SAA signals (1 per asset)
-            (self._num_assets * num_features) +  # Asset features
-            portfolio_feature_dim  # Portfolio-level features
-        )
-        
-        # Override observation space to match flattened output
-        self.observation_space = gym.spaces.Box(
-            low=-np.inf,
-            high=np.inf,
-            shape=(obs_dim,),
-            dtype=np.float32
-        )
-        
-        print(f"[AllocatorEnvironmentWrapper] Initialized with {self._num_assets} assets")
-        print(f"  SAA models: {', '.join(saa_assets)}")
-        print(f"  Flattened observation dimension: {obs_dim}")
-        print(f"    - SAA signals: {self._num_assets}")
-        print(f"    - Asset features: {self._num_assets} × {num_features} = {self._num_assets * num_features}")
-        print(f"    - Portfolio features: {portfolio_feature_dim}")
-
-    def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None):
-        """
-        Reset environment and reset SAA hidden states.
-        
-        Returns:
-            (observation, info) where observation is transformer-ready feature dict
-            
-        Process:
-        1. Reset underlying environment (samples new episode, initializes portfolio)
-        2. Reset SAA LSTM hidden states (clear temporal memory for new episode)
-        3. Reset tokenizer portfolio statistics (fresh running stats)
-        4. Assemble initial observation from SAA signals + current state
-        """
-        # Reset underlying environment (EXECUTION_PORTFOLIO mode)
-        # This samples a new episode block, initializes portfolio with random weights
-        obs, info = self.env.reset(seed=seed, option=options)
-        
-        # Reset SAA ensemble LSTM states (episode boundary for frozen models)
-        self.saa_ensemble.reset_episode()
-        
-        # Reset tokenizer portfolio statistics (fresh running mean/std for new episode)
-        self.tokenizer._portfolio_feature_count = 0
-        self.tokenizer._portfolio_feature_mean = np.zeros(
-            self.tokenizer.portfolio_feature_dim, dtype=np.float32
-        )
-        self.tokenizer._portfolio_feature_std = np.ones(
-            self.tokenizer.portfolio_feature_dim, dtype=np.float32
-        )
-        
-        # Assemble initial observation from current state
-        # This queries SAAs and extracts features
-        transformer_input = self._assemble_transformer_input()
-        
-        # Add transformer input details to info for debugging
-        info['saa_signals'] = transformer_input['saa_signals']
-        info['num_assets'] = self._num_assets
-        
-        # Return raw observation (not tokenized yet; policy will tokenize)
-        # For SB3 integration, we return a flattened observation array
-        observation = self._flatten_transformer_input(transformer_input)
-        
-        return observation, info
-
-    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict]:
-        """
-        Execute allocator action (raw allocations) and return next state.
-        
-        Args:
-            action: Raw allocator outputs from policy [N+1] in [0, 1]
-        
-        Returns:
-            (observation, reward, terminated, truncated, info)
-            
-        Process:
-        1. Forward raw action to env (env normalizes to valid weights)
-        2. Execute portfolio rebalancing via env.step()
-        3. Update tokenizer portfolio statistics (for next observation)
-        4. Assemble next observation from SAA signals + updated state
-        5. Return step results
-        """
-        # Validate action shape
-        if action.shape[0] != self._num_assets + 1:
-            raise ValueError(
-                f"Action shape mismatch: expected {self._num_assets + 1}, "
-                f"got {action.shape[0]}"
-            )
-        
-        # Keep wrapper minimal: pass raw bounded action to env and let env normalize.
-        action = np.asarray(action, dtype=np.float32)
-
-        # Bound action for safety in case exploration noise or numerical jitter escapes range.
-        action = np.clip(action, 0.0, 1.0)
-
-        # Execute rebalancing in underlying environment
-        # env.step() in EXECUTION_PORTFOLIO_WEIGHTS mode:
-        # - Receives target weights [N+1] that sum to 1.0
-        # - Validates weights
-        # - Calls execute_portfolio_change() with exact weight targets
-        # - Advances time by one day
-        # - Calculates reward
-        # - Records metrics
-        obs, reward, terminated, truncated, info = self.env.step(action)
-
-        """ 
-        Important note on why the obs is disregarded here:
-        The environment doesn't know about frozen SAAs—it's a generic trading environment. 
-        Only the wrapper knows:
-        - Which SAA models to query
-        - How to tokenize data for the transformer
-        - How to extract portfolio-specific features
-        - So the wrapper reconstructs a custom observation optimized for the transformer-based allocator policy.
-        """
-        
-        # Update tokenizer portfolio statistics BEFORE assembling next observation
-        # Extract current portfolio features for running statistics update
-        portfolio_features = self._extract_portfolio_features()
-        self.tokenizer.update_portfolio_statistics(portfolio_features)
-        
-        # Assemble next observation from updated state
-        transformer_input = self._assemble_transformer_input()
-        
-        # Add transformer input details to info for debugging
-        info['saa_signals'] = transformer_input['saa_signals']
-        
-        # Return flattened observation
-        observation = self._flatten_transformer_input(transformer_input)
-        
-        return observation, reward, terminated, truncated, info
-
-    def _assemble_transformer_input(self) -> Dict[str, Any]:
-        """
-        Query SAAs and assemble full transformer input from environment state.
-        
-        Returns:
-            Dict with keys:
-                - saa_signals: Dict[asset_symbol, float] - SAA target position signals
-                - asset_features: Dict[asset_symbol, np.ndarray] - Per-asset market features
-                - portfolio_state: Dict[str, float] - Portfolio-level features
-                
-        Process:
-        1. Extract per-asset observations from environment
-        2. Query SAA ensemble for frozen inference (per-asset signals)
-        3. Extract per-asset features from market data cache
-        4. Extract portfolio-level features from episode buffer
-        5. Return structured dict for tokenizer consumption
-        """
-        # Step 1: Extract per-asset observations for SAA inference
-        obs_per_asset = {}
-        episode_starts = {}
-        
-        for asset_symbol in self._asset_order:
-            # Extract observation for this asset in SAA's expected format
-            # SAAs were trained in SINGLE_ASSET_TARGET_POS mode with specific obs structure
-            obs_per_asset[asset_symbol] = self._extract_per_asset_observation(asset_symbol)
-            
-            # Episode starts are False after first step (LSTM continuity)
-            episode_starts[asset_symbol] = (self.env.current_step == 0)
-        
-        # Step 2: Query SAA ensemble for per-asset signals (frozen inference)
-        saa_signals = self.saa_ensemble.get_saa_signals(
-            obs_per_asset=obs_per_asset,
-            episode_starts=episode_starts
-        )
-        
-        # Step 3: Extract per-asset features from market data cache
-        # These are the selected technical indicators, returns, volumes, etc.
-        asset_features = {}
-        current_features = self.env.market_data_cache.get_features_at_step(
-            self.env.current_absolute_step
-        )  # Shape: [num_assets, num_features]
-        
-        for idx, asset_symbol in enumerate(self._asset_order):
-            asset_features[asset_symbol] = current_features[idx]
-        
-        # Step 4: Extract portfolio-level features from episode buffer
-        # These include: weights, returns, sharpe, drawdown, volatility, turnover
-        portfolio_state = self._extract_portfolio_features()
-        
-        # Return structured dict
-        return {
-            'saa_signals': saa_signals,
-            'asset_features': asset_features,
-            'portfolio_state': portfolio_state
-        }
-
-    def _extract_per_asset_observation(self, asset_symbol: str) -> np.ndarray:
-        """
-        Extract single-asset observation for a given asset (for SAA input).
-        
-        Mimics the observation structure SAAs were trained on:
-        - Asset features: [num_selected_features] from market data
-        - Portfolio features: [cash_weight, asset_weight, portfolio_return]
-        
-        Args:
-            asset_symbol: Asset identifier
-        
-        Returns:
-            Observation array compatible with SAA input format
-            Shape: [num_selected_features + 3]
-        """
-        # Get asset index
-        asset_idx = self.env.market_data_cache.asset_to_index[asset_symbol]
-        
-        # Extract asset features from market data cache
-        # Shape: [num_selected_features]
-        asset_features = self.env.market_data_cache.get_features_at_step(
-            self.env.current_absolute_step
-        )[asset_idx]
-        
-        # Extract portfolio features from episode buffer
-        # Map current step to internal buffer index
-        external_step = self.env.current_step
-        if self.env.maybe_provide_sequence:
-            internal_step = external_step + self.env.lookback_window
-        else:
-            internal_step = external_step
-        
-        # # Clamp to valid buffer range
-        # internal_step = int(np.clip(
-        #     internal_step, 
-        #     0, 
-        #     self.env.episode_buffer.portfolio_values.shape[0] - 1
-        # ))
-        
-        # Extract weights: index 0 is cash, index (asset_idx + 1) is this asset
-        weights_vec = self.env.episode_buffer.portfolio_weights[internal_step]
-        cash_weight = float(weights_vec[0])
-        asset_weight = float(weights_vec[asset_idx + 1])
-
-        rel_cash_weight = cash_weight / (cash_weight + asset_weight + 1e-8)
-        rel_asset_weight = asset_weight / (cash_weight + asset_weight + 1e-8)
-        
-        # Extract asset return over last step. SAA used daily portfolio return as proxy.
-        asset_prices = self.env.market_data_cache.close_prices
-        abs_step = self.env.current_absolute_step
-        prev_step = max(abs_step - 1, 0)
-        px_t = float(asset_prices[abs_step, asset_idx])
-        px_prev = float(asset_prices[prev_step, asset_idx])
-        asset_return = (px_t / px_prev - 1.0) if px_prev > 0 else 0.0
-
-        portfolio_features = np.array([
-            rel_cash_weight,
-            rel_asset_weight,
-            asset_return
-        ], dtype=np.float32)
-        
-        # Concatenate asset + portfolio features
-        observation = np.concatenate([
-            asset_features,
-            portfolio_features
-        ]).astype(np.float32)
-        
-        # Guard against non-finite values
-        if not np.all(np.isfinite(observation)):
-            observation = np.nan_to_num(observation, nan=0.0, posinf=0.0, neginf=0.0)
-            print(
-                f"Warning: Non-finite values in observation for {asset_symbol} "
-                f"at step {self.env.current_step}. Replaced with zeros."
-            )
-        
-        return observation
-
-    def _extract_portfolio_features(self) -> np.ndarray:
-        """
-        Extract portfolio-level features as a dict for tokenizer.
-        
-        Returns:
-            Dict with portfolio metrics:
-                - cash_weight: float
-                - portfolio_value: float
-                - portfolio_return: float
-                - sharpe_ratio: float (rolling)
-                - max_drawdown: float (rolling)
-                - volatility: float (rolling annualized)
-                - turnover: float (current step)
-                - Various other metrics from episode buffer
-                
-        NOTE: Keys must be stable across calls for tokenizer feature order consistency
-        """
-        # Map current step to internal buffer index
-        external_step = self.env.current_step
-        if self.env.maybe_provide_sequence:
-            internal_step = external_step + self.env.lookback_window
-        else:
-            internal_step = external_step
-        
-        # Clamp to valid buffer range
-        internal_step = int(np.clip(
-            internal_step,
-            0,
-            self.env.episode_buffer.portfolio_values.shape[0] - 1
-        ))
-        
-        # Extract metrics from episode buffer
-        weights = self.env.episode_buffer.portfolio_weights[internal_step]
-        cash_weight = float(weights[0])
-        
-        portfolio_value = float(self.env.episode_buffer.portfolio_values[internal_step])
-        portfolio_return = float(self.env.episode_buffer.returns[internal_step])
-        
-        # Rolling metrics (use small window at start of episode)
-        risk_window = min(max(self.env.current_step, 2), self.env.max_reward_risk_window)
-        
-        sharpe_ratio = float(self.env.episode_buffer.calculate_sharpe_ratio(risk_window))
-        max_drawdown = float(self.env.episode_buffer.calculate_max_drawdown(risk_window))
-        
-        # Volatility
-        recent_returns = self.env.episode_buffer.get_returns_window(risk_window)
-        if len(recent_returns) > 1:
-            volatility = float(np.std(recent_returns) * np.sqrt(252))  # Annualized
-        else:
-            volatility = 0.0
-        
-        # Turnover (current step)
-        turnover = float(self.env.episode_buffer.turnover[internal_step])
-        
-        # Alpha (excess return over benchmark)
-        alpha = float(self.env.episode_buffer.alpha[internal_step])
-        
-        # Assemble into numpy array with stable key order
-        # This order must match what tokenizer expects
-        portfolio_features = np.array([
-            cash_weight,
-            portfolio_value,
-            portfolio_return,
-            sharpe_ratio,
-            max_drawdown,
-            volatility,
-            turnover,
-            alpha
-        ], dtype=np.float32)
-        
-        return portfolio_features
-
-    def _flatten_transformer_input(self, transformer_input: Dict[str, Any]) -> np.ndarray:
-        """
-        Flatten transformer input dict into a single observation array for SB3.
-        
-        This is a SIMPLIFIED approach where we concatenate all features into a flat vector.
-        The actual tokenization happens inside TransformerAllocatorPolicy.forward().
-        
-        Args:
-            transformer_input: Dict with saa_signals, asset_features, portfolio_state
-        
-        Returns:
-            Flattened observation array [obs_dim]
-            
-        Structure:
-            [saa_signals (N), asset_features (N * num_features), portfolio_features (num_portfolio_features)]
-        """
-        saa_signals = transformer_input['saa_signals']
-        asset_features = transformer_input['asset_features']
-        portfolio_state = transformer_input['portfolio_state']
-        
-        # Extract SAA signals in stable order
-        saa_signal_vec = np.array([
-            saa_signals[asset] for asset in self._asset_order
-        ], dtype=np.float32)
-        
-        # Extract asset features in stable order and flatten
-        asset_feature_matrix = np.array([
-            asset_features[asset] for asset in self._asset_order
-        ], dtype=np.float32)  # Shape: [N, num_features]
-        asset_feature_vec = asset_feature_matrix.flatten()
-        
-        # Portfolio features are already a flat array
-        portfolio_feature_vec = portfolio_state
-        
-        # Concatenate all components
-        observation = np.concatenate([
-            saa_signal_vec,
-            asset_feature_vec,
-            portfolio_feature_vec
-        ]).astype(np.float32)
-        
-        # Guard against non-finite values
-        if not np.all(np.isfinite(observation)):
-            observation = np.nan_to_num(observation, nan=0.0, posinf=0.0, neginf=0.0)
-            print(
-                f"Warning: Non-finite values in flattened observation "
-                f"at step {self.env.current_step}. Replaced with zeros."
-            )
-        
-        return observation
-    
-
-# ================================
-# Portfolio-Level Reward Computation
-# ================================
-
-class AllocatorRewardCalculator:
-    """
-    Computes portfolio-level rewards using differential Sortino approach.
-    Mirrors SAA reward logic but operates on full portfolio returns.
-    
-    This calculator implements the same reward mechanism as used for single-asset agents,
-    but at the portfolio level. The reward is based on:
-    1. Differential Sortino ratio (primary component)
-    2. Raw portfolio return (secondary component)
-    3. Drawdown penalty (risk management)
-    
-    The Sortino ratio focuses on downside volatility rather than total volatility,
-    making it more appropriate for trading strategies where upside volatility is desirable.
-    
-    Key Features:
-    - EMA-based running statistics for mean return and downside variance
-    - Differential approach: reward = current_sortino - previous_sortino
-    - Mixed reward: combines Sortino with raw returns
-    - Drawdown penalty based on rolling window
-    - Tanh compression for bounded rewards
-    
-    Integration:
-    - Reset at episode start (clear running statistics)
-    - Update at each step with portfolio return
-    - Compute step reward based on current state
-    """
-
-    def __init__(
-        self,
-        sortino_eta: float = 0.018,
-        sortino_downside_var_floor: float = 1e-6,
-        sortino_gain: float = 1.0,
-        sortino_net_reward_mix: float = 0.7,
-        lambda_drawdown: float = 0.5
-    ):
-        """
-        Initialize reward calculator with Sortino parameters.
-        
-        Args:
-            sortino_eta: EMA adaptation rate for mean/downside variance (typically 0.01-0.02)
-                        Higher values = faster adaptation to recent returns
-            sortino_downside_var_floor: Floor for downside variance to avoid division by zero
-                                       Typically 1e-6
-            sortino_gain: Gain factor for tanh compression (amplification before squashing)
-                         Higher values = more sensitive to small changes
-                         Typically 2.0-4.0
-            sortino_net_reward_mix: Alpha in [0,1] weighting Sortino vs raw return
-                                   1.0 = pure Sortino, 0.0 = pure return
-                                   Typically 0.6-0.8
-            lambda_drawdown: Penalty factor for drawdown increases
-                            Higher values = stronger penalty for drawdowns
-                            Typically 0.3-0.7
-        """
-        # Store hyperparameters
-        self.sortino_eta = float(sortino_eta)
-        self.sortino_downside_var_floor = float(sortino_downside_var_floor)
-        self.sortino_gain = float(sortino_gain)
-        self.sortino_net_reward_mix = float(np.clip(sortino_net_reward_mix, 0.0, 1.0))
-        self.lambda_drawdown = float(lambda_drawdown)
-        
-        # Running statistics (EMA-based)
-        # These track long-term mean return and downside variance
-        self.running_mean_ema = 1e-4  # Small positive initial value
-        self.running_downside_variance_ema = 2.5e-5  # Small positive initial variance
-        
-        # Previous Sortino value for differential calculation
-        self.previous_sortino = 0.0
-        
-        # Track previous max drawdown for penalty calculation
-        self.previous_max_drawdown = 0.0
-        
-        print(f"[AllocatorRewardCalculator] Initialized with:")
-        print(f"  sortino_eta: {self.sortino_eta}")
-        print(f"  sortino_gain: {self.sortino_gain}")
-        print(f"  sortino_net_reward_mix: {self.sortino_net_reward_mix}")
-        print(f"  lambda_drawdown: {self.lambda_drawdown}")
-
-    def reset_episode(self) -> None:
-        """
-        Reset running statistics at episode start.
-        
-        Called by AllocatorEnvironmentWrapper at the beginning of each episode
-        to clear temporal memory and start fresh.
-        
-        This ensures each episode starts with clean slate for EMA tracking,
-        preventing information leakage across episodes.
-        """
-        # Reset running statistics to initial values
-        self.running_mean_ema = 1e-4
-        self.running_downside_variance_ema = 2.5e-5
-        
-        # Reset differential tracking
-        self.previous_sortino = 0.0
-        
-        # Reset drawdown tracking
-        self.previous_max_drawdown = 0.0
-
-    def compute_step_reward(
-        self,
-        portfolio_return: float,
-        current_max_drawdown: float,
-        current_step: int,
-        max_reward_risk_window: int
-    ) -> float:
-        """
-        Compute reward for single step using differential Sortino.
-        
-        This is the core reward calculation matching the environment's implementation.
-        The reward is computed as:
-        1. Update running mean and downside variance with EMA
-        2. Calculate current Sortino ratio
-        3. Compute differential: current_sortino - previous_sortino
-        4. Mix Sortino with raw return
-        5. Apply drawdown penalty
-        6. Compress with tanh
-        
-        Args:
-            portfolio_return: Daily return at this step (simple return, e.g., 0.01 for 1%)
-            current_max_drawdown: Current rolling max drawdown from episode buffer
-            current_step: Current step number in episode (for risk window calculation)
-            max_reward_risk_window: Maximum window size for risk metrics
-        
-        Returns:
-            Scalar reward (typically bounded in [-1, 1] due to tanh compression)
-            
-        Notes:
-            - This method updates internal state (running_mean_ema, running_downside_variance_ema)
-            - Call once per step in sequential order
-            - Do not call in parallel or out of order
-        """
-        # 1. Update EMA of mean return
-        # delta = current_return - current_mean
-        # new_mean = current_mean + eta * delta
-        delta = portfolio_return - self.running_mean_ema
-        self.running_mean_ema += self.sortino_eta * delta
-        
-        # 2. Update EMA of downside variance
-        # Only penalize negative returns (downside risk)
-        # downside_sq = (min(return, 0))^2
-        downside_sq = (min(portfolio_return, 0.0)) ** 2
-        
-        # EMA update: new_var = old_var + eta * (downside_sq - old_var)
-        self.running_downside_variance_ema += self.sortino_eta * (
-            downside_sq - self.running_downside_variance_ema
-        )
-        
-        # 3. Calculate current Sortino ratio
-        # Sortino = mean_return / sqrt(downside_variance)
-        # Apply floor to avoid division by zero
-        downside_var = max(self.running_downside_variance_ema, self.sortino_downside_var_floor)
-        current_sortino = self.running_mean_ema / np.sqrt(downside_var)
-        
-        # 4. Compute differential Sortino (this is the main reward signal)
-        # Differential approach rewards improvement in Sortino, not absolute level
-        # This encourages continuous improvement and avoids saturation
-        sortino_reward = current_sortino - self.previous_sortino
-        self.previous_sortino = current_sortino
-        
-        # 5. Calculate drawdown penalty
-        # Penalize increases in drawdown (delta from previous max)
-        # This discourages risky behavior that increases drawdown
-        max_drawdown_delta = max(0.0, current_max_drawdown - self.previous_max_drawdown)
-        self.previous_max_drawdown = current_max_drawdown
-        max_drawdown_penalty = self.lambda_drawdown * max_drawdown_delta
-        
-        # 6. Mix Sortino with raw return
-        # sortino_net_reward_mix controls the balance:
-        # - Higher values (0.7-0.9): More weight on risk-adjusted return (Sortino)
-        # - Lower values (0.3-0.5): More weight on raw return
-        # This prevents the agent from being too conservative or too aggressive
-        reward = (
-            self.sortino_net_reward_mix * sortino_reward +
-            (1.0 - self.sortino_net_reward_mix) * portfolio_return
-        ) - max_drawdown_penalty
-        
-        # 7. Compress and amplify with tanh
-        # tanh(gain * x) bounds reward to [-1, 1] while amplifying small values
-        # gain controls sensitivity: higher gain = more sensitive to small changes
-        reward = float(np.tanh(self.sortino_gain * reward))
-        
-        return reward
-
-    def update_running_statistics(self, portfolio_return: float) -> None:
-        """
-        Update EMA of mean return and downside variance.
-        
-        This method is for external tracking only (not used in reward calculation).
-        The actual updates happen inside compute_step_reward().
-        
-        Args:
-            portfolio_return: Daily return to incorporate
-            
-        Notes:
-            - This is a convenience method for diagnostics/logging
-            - Not required for reward calculation (which updates internally)
-            - Can be used to pre-warm statistics if needed
-        """
-        # Update mean
-        delta = portfolio_return - self.running_mean_ema
-        self.running_mean_ema += self.sortino_eta * delta
-        
-        # Update downside variance
-        downside_sq = (min(portfolio_return, 0.0)) ** 2
-        self.running_downside_variance_ema += self.sortino_eta * (
-            downside_sq - self.running_downside_variance_ema
-        )
-    
-    def get_statistics(self) -> Dict[str, float]:
-        """
-        Get current running statistics for diagnostics/logging.
-        
-        Returns:
-            Dict with current state:
-                - running_mean_ema: Current EMA of mean return
-                - running_downside_variance_ema: Current EMA of downside variance
-                - previous_sortino: Last computed Sortino ratio
-                - previous_max_drawdown: Last observed max drawdown
-        """
-        return {
-            'running_mean_ema': float(self.running_mean_ema),
-            'running_downside_variance_ema': float(self.running_downside_variance_ema),
-            'previous_sortino': float(self.previous_sortino),
-            'previous_max_drawdown': float(self.previous_max_drawdown)
-        }
-    
 
 # ================================
 # Callbacks and Logging
@@ -2504,381 +793,6 @@ class AllocatorEvalCallback(BaseCallback):
         # Continue training
         return True
 
-
-# ================================
-# Allocator Environment Builder
-# ================================
-
-def build_allocator_env(
-    cache: MarketDataCache,
-    config: Dict[str, Any],
-    saa_ensemble: FrozenSAAEnsemble,
-    seed: Optional[int] = None,
-    for_eval: bool = False
-) -> gym.Env:
-    """
-    Build a portfolio allocator environment with SAA ensemble and tokenizer.
-    
-    Args:
-        cache: MarketDataCache instance
-        config: Configuration dict with all settings
-        saa_ensemble: FrozenSAAEnsemble for signal generation
-        seed: Random seed
-        for_eval: If True, use validation data blocks; else training blocks
-    
-    Returns:
-        Wrapped environment ready for SB3 training/evaluation
-    """
-    # ------------------------------
-    # Validate required inputs
-    # ------------------------------
-    if cache is None:
-        raise ValueError("MarketDataCache is required to build allocator environment.")
-    if config is None:
-        raise ValueError("Config dict is required to build allocator environment.")
-    if saa_ensemble is None:
-        raise ValueError("FrozenSAAEnsemble is required to build allocator environment.")
-
-    # ------------------------------
-    # Select train vs validation mode
-    # ------------------------------
-    mode = "validation" if for_eval else "train"
-
-    # ------------------------------
-    # Instantiate base portfolio environment
-    # ------------------------------
-    # Uses the same TradingEnv as the single-asset agent, but in portfolio execution mode.
-    base_env = PortfolioEnv(config=config, market_data_cache=cache, mode=mode)
-
-    # Guard: allocator requires portfolio execution mode
-    # (TradingEnv stores this as a string in config["environment"]["execution_mode"])
-    if getattr(base_env, "execution_mode", None) != "portfolio_weights":
-        raise ValueError(
-            "AllocatorEnvironmentWrapper requires execution_mode='portfolio_weights'. "
-            f"Got: {getattr(base_env, 'execution_mode', None)}"
-        )
-
-    # ------------------------------
-    # Build tokenizer (uses cache + config)
-    # ------------------------------
-    tokenizer = build_tokenizer(cache=cache, config=config)
-
-    # ------------------------------
-    # Wrap base env with allocator wrapper (injects SAA signals + portfolio features)
-    # ------------------------------
-    wrapped_env = AllocatorEnvironmentWrapper(
-        env=base_env,
-        saa_ensemble=saa_ensemble,
-        tokenizer=tokenizer
-    )
-
-    # ------------------------------
-    # Optional seeding for reproducibility
-    # ------------------------------
-    if seed is not None:
-        try:
-            wrapped_env.action_space.seed(seed)
-            wrapped_env.observation_space.seed(seed)
-        except Exception:
-            # Not all spaces implement seeding; ignore gracefully
-            pass
-
-    return wrapped_env
-
-
-def load_saa_models(config: Dict[str, Any], device: str = "cpu") -> FrozenSAAEnsemble:
-    """
-    Load all pre-trained SAA models from paths specified in config.
-    
-    This function constructs model paths for each asset based on the config structure:
-    - Base directory: src/agents/RecurrPPO_target_position_agent/saved_models/
-    - Run directory: {saa_run_id}_config_{saa_config_id}_{date}/
-    - Model file: best_model.zip
-    
-    The function automatically discovers all available run directories matching the
-    specified run_id and config_id, then selects the most recent one (by date).
-    
-    Args:
-        config: Config dict with "saa_config" section containing:
-                - saa_run_id: 5-digit run identifier (e.g., "00017")
-                - saa_config_id: 5-digit config identifier (e.g., "00006")
-                - saa_base_dir: Base directory for saved models
-                - device: PyTorch device ("cpu", "cuda", etc.)
-                AND "environment" section with:
-                - asset list from market_data_cache
-        device: PyTorch device override (default from config if not specified)
-    
-    Returns:
-        FrozenSAAEnsemble instance with all loaded SAA models
-        
-    Raises:
-        ValueError: If config missing required keys
-        FileNotFoundError: If no matching SAA models found
-        RuntimeError: If model loading fails
-        
-    Notes:
-        - Assumes all assets share the same SAA run_id and config_id
-        - Uses best_model.zip from the most recent matching directory
-        - Model paths follow convention: {run_id}_config_{config_id}_{date}/best_model.zip
-        
-    """
-    # Extract SAA configuration
-    saa_config = config.get("saa_config", {})
-    if not saa_config:
-        raise ValueError(
-            "Config missing 'saa_config' section. Required keys: "
-            "saa_run_id, saa_config_id, saa_base_dir"
-        )
-    
-    # Get required parameters
-    saa_run_id = saa_config.get("saa_run_id")
-    saa_config_id = saa_config.get("saa_config_id")
-    saa_base_dir = saa_config.get("saa_base_dir")
-    saa_device = saa_config.get("device", device)  # Use config device or override
-    
-    # Validate required parameters
-    if not saa_run_id:
-        raise ValueError("Config missing 'saa_run_id' in saa_config section")
-    if not saa_config_id:
-        raise ValueError("Config missing 'saa_config_id' in saa_config section")
-    if not saa_base_dir:
-        raise ValueError("Config missing 'saa_base_dir' in saa_config section")
-    
-    # Normalize run_id and config_id to 5-digit format
-    saa_run_id = str(saa_run_id).zfill(5)
-    saa_config_id = str(saa_config_id).zfill(5)
-    
-    # Construct base directory path (relative to project root)
-    # Handle both absolute and relative paths
-    if not os.path.isabs(saa_base_dir):
-        # Get project root (3 levels up from this file)
-        current_file = os.path.abspath(__file__)
-        agent_dir = os.path.dirname(current_file)
-        agents_dir = os.path.dirname(agent_dir)
-        src_dir = os.path.dirname(agents_dir)
-        project_root = os.path.dirname(src_dir)
-        saa_base_dir = os.path.join(project_root, saa_base_dir)
-    
-    # Verify base directory exists
-    if not os.path.exists(saa_base_dir):
-        raise FileNotFoundError(
-            f"SAA base directory not found: {saa_base_dir}"
-        )
-    
-    # Pattern to match: {run_id}_config_{config_id}_{date}/
-    # Example: 00017_config_00006_26_01_21/
-    pattern = f"{saa_run_id}_config_{saa_config_id}_"
-    
-    # Find all matching directories
-    matching_dirs = []
-    try:
-        for entry in os.listdir(saa_base_dir):
-            entry_path = os.path.join(saa_base_dir, entry)
-            # Check if it's a directory and matches the pattern
-            if os.path.isdir(entry_path) and entry.startswith(pattern):
-                matching_dirs.append(entry)
-    except Exception as e:
-        raise RuntimeError(
-            f"Failed to list contents of {saa_base_dir}: {str(e)}"
-        )
-    
-    # Check if any matching directories found
-    if not matching_dirs:
-        raise FileNotFoundError(
-            f"No SAA model directories found matching pattern: {pattern}* in {saa_base_dir}\n"
-            f"Expected directory format: {pattern}YY_MM_DD/"
-        )
-    
-    # Sort by directory name (chronological order due to date suffix)
-    # Most recent will be last
-    matching_dirs.sort()
-    selected_dir = matching_dirs[-1]  # Use most recent
-    
-    print(f"[load_saa_models] Found {len(matching_dirs)} matching SAA directories")
-    print(f"[load_saa_models] Selected most recent: {selected_dir}")
-    
-    # Construct path to best_model.zip
-    model_dir = os.path.join(saa_base_dir, selected_dir)
-    model_path = os.path.join(model_dir, "best_model.zip")
-
-    vecnormalize_path = os.path.join(model_dir, "best_model_vecnormalize.pkl")
-    if not os.path.exists(vecnormalize_path):
-        print(f"[load_saa_models] WARNING: VecNormalize stats not found at {vecnormalize_path}. Proceeding without obs normalization.")
-        vecnormalize_path = None
-    
-    # Verify model file exists
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(
-            f"SAA model file not found: {model_path}\n"
-            f"Expected file: best_model.zip in directory {selected_dir}"
-        )
-    
-    # Get asset list from market_data_cache
-    # This requires the cache to be passed or available in config
-    # For now, we'll assume config has an "assets" key or we need to infer from cache
-    
-    # Get asset list from config if explicitly listed
-    assets = config["environment"].get("assets")
-    
-    
-    if not assets:
-        raise ValueError(
-            "Config missing asset list. Please provide 'assets' key in 'environment' section."
-        )
-    
-    # Build asset_to_model_path dict
-    # All assets use the same model path (single-model approach)
-    # OR each asset has its own model (multi-model approach)
-    
-    # Based on the documentation, it seems each asset uses the SAME SAA model
-    # trained in single-asset mode, not separate models per asset
-    # The SAA is generic and asset-agnostic
-    
-    # However, looking at FrozenSAAEnsemble.__init__, it expects:
-    # asset_to_model_path: Dict[str, str] mapping each asset to a model path
-    
-    # This suggests two possible interpretations:
-    # 1. Each asset has its own trained SAA model (separate training per asset)
-    # 2. All assets share the same SAA model (single generic model)
-    
-    # Based on the SAA training approach (randomly selects asset per episode),
-    # it's likely a SINGLE model trained on all assets, not per-asset models
-    
-    # So we'll map all assets to the same model path
-    asset_to_model_path = {}
-    for asset in assets:
-        asset_to_model_path[asset] = model_path
-    
-    print(f"[load_saa_models] Loading SAA model for {len(assets)} assets")
-    print(f"[load_saa_models] Model path: {model_path}")
-    print(f"[load_saa_models] Device: {saa_device}")
-    
-    # Create and return FrozenSAAEnsemble
-    try:
-        saa_ensemble = FrozenSAAEnsemble(
-            asset_to_model_path=asset_to_model_path,
-            vecnormalize_path=vecnormalize_path,
-            device=saa_device
-        )
-        return saa_ensemble
-    
-    except Exception as e:
-        raise RuntimeError(
-            f"Failed to create FrozenSAAEnsemble: {str(e)}\n"
-            f"Model path: {model_path}\n"
-            f"Assets: {assets}"
-        )
-
-
-def build_tokenizer(
-    cache: MarketDataCache,
-    config: Dict[str, Any]
-) -> TransformerTokenizer:
-    """
-    Instantiate TransformerTokenizer with dimensions from config and cache.
-    
-    Args:
-        cache: MarketDataCache for asset list
-        config: Config dict with feature selections
-    
-    Returns:
-        TransformerTokenizer instance
-    """
-    # ------------------------------
-    # Validate required inputs
-    # ------------------------------
-    if cache is None:
-        raise ValueError("MarketDataCache is required to build tokenizer.")
-    if config is None:
-        raise ValueError("Config dict is required to build tokenizer.")
-
-    # ------------------------------
-    # Derive core dimensions from cache
-    # ------------------------------
-    num_assets = int(cache.num_assets)
-    asset_feature_dim = int(cache.num_features)  # Selected technical indicator count
-    saa_feature_dim = 1  # SAA signal is a scalar action per asset
-
-    if num_assets <= 0:
-        raise ValueError(f"Invalid num_assets from cache: {num_assets}")
-    if asset_feature_dim <= 0:
-        raise ValueError(f"Invalid asset_feature_dim from cache: {asset_feature_dim}")
-
-    # ------------------------------
-    # Optional validation: asset list consistency
-    # ------------------------------
-    # If config declares an asset list, ensure it matches cache for correctness.
-    config_assets = config.get("assets") or config.get("environment", {}).get("assets")
-    if config_assets is not None:
-        if set(config_assets) != set(cache.asset_names):
-            raise ValueError(
-                "Asset list mismatch between config and MarketDataCache.\n"
-                f"Config assets ({len(config_assets)}): {config_assets}\n"
-                f"Cache assets ({len(cache.asset_names)}): {cache.asset_names}"
-            )
-
-    # ------------------------------
-    # Portfolio feature dimension
-    # ------------------------------
-    # This must match AllocatorEnvironmentWrapper._extract_portfolio_features(),
-    # which currently produces 8 features:
-    # [cash_weight, portfolio_value, portfolio_return, sharpe_ratio,
-    #  max_drawdown, volatility, turnover, alpha]
-    tokenizer_config = config.get("allocator_tokenizer", {}) or config.get("tokenizer", {})
-    portfolio_feature_dim = tokenizer_config.get("portfolio_feature_dim")
-    if portfolio_feature_dim is None:
-        portfolio_feature_dim = 8  # Default aligned with wrapper feature extraction
-    portfolio_feature_dim = int(portfolio_feature_dim)
-
-    if portfolio_feature_dim <= 0:
-        raise ValueError(f"Invalid portfolio_feature_dim: {portfolio_feature_dim}")
-
-    # ------------------------------
-    # Transformer model dimension
-    # ------------------------------
-    # Prefer allocator_transformer config, then tokenizer config, then top-level.
-    transformer_config = config.get("allocator_transformer", {}) or config.get("transformer", {})
-    d_model = (
-        transformer_config.get("d_model")
-        or tokenizer_config.get("d_model")
-        or config.get("d_model")
-    )
-    if d_model is None:
-        # Conservative default if not specified in config
-        d_model = 128
-        print("[build_tokenizer] d_model not found in config; defaulting to 128")
-
-    d_model = int(d_model)
-    if d_model <= 0:
-        raise ValueError(f"Invalid d_model: {d_model}")
-
-    # ------------------------------
-    # Instantiate tokenizer
-    # ------------------------------
-    tokenizer = TransformerTokenizer(
-        num_assets=num_assets,
-        saa_feature_dim=saa_feature_dim,
-        asset_feature_dim=asset_feature_dim,
-        portfolio_feature_dim=portfolio_feature_dim,
-        d_model=d_model
-    )
-
-    # Log final dimensions for debugging/integration visibility
-    print("[build_tokenizer] Tokenizer initialized with:")
-    print(f"  num_assets: {num_assets}")
-    print(f"  saa_feature_dim: {saa_feature_dim}")
-    print(f"  asset_feature_dim: {asset_feature_dim}")
-    print(f"  portfolio_feature_dim: {portfolio_feature_dim}")
-    print(f"  d_model: {d_model}")
-
-    return tokenizer
-
-
-# ================================
-# PPO Model Building
-# ================================
-
-
 # Three-Phase Linear schedule to be used with learning rate and entropy coefficient
 def linear_three_phase_schedule(start: float, end: float, warmup_pct: float, ramping_pct: float) -> Callable[[float], float]:
     """
@@ -3029,26 +943,349 @@ class EntropyScheduleCallback(BaseCallback):
         return True
     
 
-# Build PPO model with custom transformer policy and hyperparameters from config
+class SAASignalWrapper(VecEnvWrapper):
+    """
+    Injects frozen SAA signal into observations while preserving recurrent state fidelity.
+    Maintains SAA hidden states per (env, asset) and uses episode_start masks.
+    """
+    def __init__(self, venv: VecEnv, saa_model, saa_vecnormalize: Optional[VecNormalize],
+                 num_assets: int, raw_feat_dim: int, device: torch.device):
+        
+        super().__init__(venv)
+
+        self.saa_model = saa_model
+        self.saa_vecnormalize = saa_vecnormalize
+        self.num_assets = num_assets
+        self.device = device
+
+        # Infer per-asset feature dim from the env observation space
+        obs_len = self.observation_space.shape[0]
+        portfolio_dim = self.num_assets + 7  # weights (N+1) + 6 metrics
+        asset_block = obs_len - portfolio_dim
+        if asset_block <= 0 or asset_block % self.num_assets != 0:
+            raise ValueError(
+                f"Cannot infer per-asset dim: obs_len={obs_len}, num_assets={self.num_assets}, portfolio_dim={portfolio_dim}"
+            )
+        self.raw_feat_dim = asset_block // self.num_assets
+
+        # SAA states: (None -> zero-init inside predict)
+        self.saa_state = None
+        # episode_start flags per (env, asset)
+        self.episode_start = np.ones((venv.num_envs * num_assets,), dtype=bool)
+
+        # Resize obs space: add +1 feature per asset for SAA signal
+        old_low, old_high = self.observation_space.low, self.observation_space.high
+        asset_size = self.num_assets * self.raw_feat_dim
+        low_assets = old_low[:asset_size].reshape(self.num_assets, self.raw_feat_dim)
+        high_assets = old_high[:asset_size].reshape(self.num_assets, self.raw_feat_dim)
+        low_assets = np.concatenate([low_assets, np.full((self.num_assets, 1), -np.inf, dtype=np.float32)], axis=1)
+        high_assets = np.concatenate([high_assets, np.full((self.num_assets, 1), np.inf, dtype=np.float32)], axis=1)
+        new_low_assets = low_assets.reshape(-1)
+        new_high_assets = high_assets.reshape(-1)
+        self.observation_space = gym.spaces.Box(
+            low=np.concatenate([new_low_assets, old_low[asset_size:]]),
+            high=np.concatenate([new_high_assets, old_high[asset_size:]]),
+            dtype=np.float32,
+        )
+
+    def reset(self):
+        res = self.venv.reset()
+        if isinstance(res, tuple) and len(res) == 2:
+            obs, _info = res
+        else:
+            obs = res
+        # Wipe memory for all (env, asset)
+        self.episode_start[:] = True
+        self.saa_state = None
+        obs = self._augment_obs_with_saa(obs)
+        return obs
+
+    def step_wait(self):
+        obs, rewards, dones, infos = self.venv.step_wait()
+        flat_dones = np.repeat(dones, self.num_assets)
+        self.episode_start = flat_dones
+        obs = self._augment_obs_with_saa(obs)
+        return obs, rewards, dones, infos
+
+    def _augment_obs_with_saa(self, obs: np.ndarray) -> np.ndarray:
+        """
+        Input obs: (B, num_assets*raw_feat_dim + portfolio_dim)
+        Output obs: asset part becomes num_assets*(raw_feat_dim+1) with SAA signal appended per asset.
+        """
+        B = obs.shape[0]
+        asset_flat = obs[:, : self.num_assets * self.raw_feat_dim]  # (B, N*F)
+        portfolio_part = obs[:, self.num_assets * self.raw_feat_dim :]  # (B, P)
+
+        asset_feats = asset_flat.reshape(B * self.num_assets, self.raw_feat_dim)  # (B*N, F)
+
+        # Portfolio-derived fields
+        weights_full = portfolio_part[:, : self.num_assets + 1]  # (B, 1+N)
+        cash_w = weights_full[:, [0]]  # (B,1)
+        asset_w = weights_full[:, 1:]  # (B,N)
+        cash_w_rep = np.repeat(cash_w, self.num_assets, axis=1)  # (B,N)
+
+        # TODO: replace daily_agent_return placeholder with real per-asset sub-portfolio return once available
+        daily_agent_return = np.zeros_like(asset_w, dtype=np.float32)  # (B,N)
+
+        # Build per-asset SAA obs: [raw_features, cash_w, asset_w, daily_agent_return]
+        per_asset_obs = np.concatenate(
+            [
+                asset_feats.reshape(B, self.num_assets, self.raw_feat_dim),
+                cash_w_rep[..., None],
+                asset_w[..., None],
+                daily_agent_return[..., None],
+            ],
+            axis=-1,
+        ).reshape(B * self.num_assets, self.raw_feat_dim + 3)  # (B*N, F+3)
+
+        # Apply VecNormalize stats if present (obs_rms only)
+        if self.saa_vecnormalize is not None and hasattr(self.saa_vecnormalize, "obs_rms"):
+            rms = self.saa_vecnormalize.obs_rms
+            mean = torch.as_tensor(rms.mean, device=self.device, dtype=torch.float32)
+            var = torch.as_tensor(rms.var, device=self.device, dtype=torch.float32)
+            eps = 1e-8
+            per_asset_obs_t = torch.as_tensor(per_asset_obs, device=self.device, dtype=torch.float32)
+            per_asset_obs_t = (per_asset_obs_t - mean) / torch.sqrt(var + eps)
+            per_asset_obs = per_asset_obs_t.cpu().numpy()
+
+        # Recurrent predict
+        with torch.no_grad():
+            torch_obs = torch.as_tensor(per_asset_obs, device=self.device, dtype=torch.float32)
+            episode_start = torch.as_tensor(self.episode_start, device=self.device, dtype=torch.bool)
+            actions, self.saa_state = self.saa_model.policy.predict(
+                torch_obs, 
+                state=self.saa_state, 
+                episode_start=episode_start, 
+                deterministic=True
+            )
+
+        # actions can be np.ndarray or torch.Tensor; normalize to np
+        if isinstance(actions, np.ndarray):
+            actions_np = actions
+        else:
+            actions_np = actions.detach().cpu().numpy()
+        saa_sig = actions_np.reshape(B, self.num_assets, -1)
+        # Use the first action dimension as signal
+        saa_sig = saa_sig[..., 0:1]  # (B, N, 1)
+
+        # Inject SAA signal into asset features
+        augmented_assets = np.concatenate(
+            [
+                asset_feats.reshape(B, self.num_assets, self.raw_feat_dim),
+                saa_sig,
+            ],
+            axis=-1,
+        ).reshape(B, -1)  # (B, N*(F+1))
+
+        return np.concatenate([augmented_assets, portfolio_part], axis=1)
+    
+
+class AttentionEngine(nn.Module):
+    def __init__(self, feature_dim: int, n_assets: int, d_model: int, n_heads: int, n_layers: int):
+        super().__init__()
+        self.n_assets = n_assets
+        self.d_model = d_model
+
+        # 1. Transformer Encoder: Using batch_first = True simplifies shapes
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=d_model * 4,  # Common choice for feedforward dimension
+            batch_first=True  # Use batch_first for easier integration with SB3
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+        # 2. SB3 Dimension Requirements
+        # Actor (pi) will see all asset tokens flattened
+        self.latent_dim_pi = n_assets * d_model 
+        # Critic (vf) will see ONLY the portfolio [CLS] token
+        self.latent_dim_vf = d_model 
+
+    def forward(self, features: torch.Tensor):
+        batch_size = features.shape[0]
+
+        # 1. Reshape to (Batch, Sequence, Features)
+        # Sequence length = N_assets + 1 (portfolio token)
+        x = features.view(batch_size, self.n_assets + 1, self.d_model)
+
+        # 2. Cross-Asset Attention Pass
+        # Assets attend to each other and the portfolio token
+        attended = self.transformer(x)  
+
+        # 3. Extract Actor and Critic Latent Representations
+        # latent pi: Tokens 0 to N-1 (assets)
+        latent_pi = attended[:, :self.n_assets, :].reshape(batch_size, -1)
+
+        # latent vf: Token N (portfolio [CLS])
+        latent_vf = attended[:, -1, :]
+
+        return latent_pi, latent_vf
+
+
+class TransformerAllocatorPolicy(ActorCriticPolicy):
+    """
+    Custom policy that swaps the default MlpExtractor with AttentionEngine.
+    Expects features_dim = (n_assets + 1) * d_model from the tokenizer.
+    """
+    def __init__(self, observation_space, action_space, lr_schedule, n_assets, d_model, n_heads, n_layers, **kwargs):
+        self._n_assets = n_assets
+        self._d_model = d_model
+        self._n_heads = n_heads
+        self._n_layers = n_layers
+        super().__init__(observation_space, action_space, lr_schedule, **kwargs)
+
+    def _build_mlp_extractor(self) -> None:
+        # Replace with attention engine; note AttentionEngine.latent_dim_pi/vf attributes
+        self.mlp_extractor = AttentionEngine(
+            feature_dim=self.features_dim,
+            n_assets=self._n_assets,
+            d_model=self._d_model,
+            n_heads=self._n_heads,
+            n_layers=self._n_layers
+        )
+
+
+class SAATokenizer(BaseFeaturesExtractor):
+    def __init__(
+            self, 
+            observation_space: gym.Space, 
+            num_assets: int, 
+            raw_feat_dim: int, 
+            d_model: int, 
+            saa_model: Optional[Any] = None,           # preloaded, unused in forward
+            saa_vecnormalize: Optional[VecNormalize] = None,  # preloaded, unused in forward
+            saa_config: Optional[Dict[str, Any]] = None       # kept for compatibility
+        
+        ):
+        # Calculate final flattened output: (N_assets + 1) * d_model. The +1 is for the portfolio-level token.
+        total_features_dim = (num_assets + 1) * d_model
+        super().__init__(observation_space, features_dim=total_features_dim)
+
+        self.n_assets = num_assets
+        self.raw_feat_dim = raw_feat_dim
+        self.d_model = d_model
+        # self.saa_config = saa_config or {}
+        # self.saa_device = torch.device(self.saa_config.get("device", "cpu"))
+
+        # 1. Asset Token Embedding: Projects raw features + SAA return (1) + assets weight to d_model
+        self.asset_embedding = nn.Linear(raw_feat_dim + 1 + 1, d_model)  # +1 for SAA signal, +1 for asset weight
+
+        # 2. Portfolio Token Embedding
+        asset_block = num_assets * (raw_feat_dim + 1)  
+        self.portfolio_dimension = observation_space.shape[0] - asset_block
+        self.portfolio_embedding = nn.Linear(self.portfolio_dimension, d_model)
+
+    def _normalize_obs(self, obs: torch.Tensor) -> torch.Tensor:
+        # Normalize raw observations using the loaded VecNormalize stats
+        # This ensures the SAA model receives inputs in the same scale as during its training
+        # VecNormalize uses: (obs - mean) / sqrt(var + eps)
+        mean = torch.tensor(self.saa_vecnormalize.obs_rms.mean, device=self.saa_device)
+        var = torch.tensor(self.saa_vecnormalize.obs_rms.var, device=self.saa_device)
+        eps = 1e-8
+        normalized_obs = (obs - mean) / torch.sqrt(var + eps)
+        return normalized_obs
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        """
+        Expects observations already augmented with SAA signal:
+        - asset part shape: [B, num_assets, raw_feat_dim + 1] (raw features + SAA signal)
+        - portfolio part shape: [B, portfolio_dim]
+        """
+        B = observations.shape[0]
+        asset_block = self.num_assets * (self.raw_feat_dim + 1)
+        asset_flat = observations[:, :asset_block]
+        portfolio_part = observations[:, asset_block:]
+
+        asset_feats = asset_flat.view(B, self.num_assets, self.raw_feat_dim + 1)  # (B, N, F+1)
+        raw_feats = asset_feats[:, :, : self.raw_feat_dim]                       # (B, N, F)
+        saa_signal = asset_feats[:, :, self.raw_feat_dim:].float()               # (B, N, 1)
+
+        # Portfolio weights: first entry cash, then per-asset
+        asset_weights = portfolio_part[:, 1:1 + self.num_assets].view(B, self.num_assets, 1)  # (B, N, 1)
+
+        # Token build: raw features + SAA signal + asset weight
+        token_inputs = torch.cat([raw_feats, saa_signal, asset_weights], dim=-1)  # (B, N, F+2)
+        asset_tokens = self.asset_embedding(token_inputs)                        # (B, N, d_model)
+
+        # Portfolio token
+        portfolio_token = self.portfolio_embedding(portfolio_part).unsqueeze(1)    # (B,1,d_model)
+        full_sequence = torch.cat([portfolio_token, asset_tokens], dim=1)          # (B, N+1, d_model)
+
+        return full_sequence.flatten(start_dim=1)  # (B, (N+1)*d_model)
+
+
+# Utility function to load SAA model and VecNormalize stats from config
+def _load_saa_from_config(saa_config: Dict[str, Any]) -> Tuple[Any, Optional[VecNormalize], torch.device]:
+    """
+    Load the frozen SAA (RecurrentPPO preferred, fallback to PPO) plus VecNormalize stats.
+    Expects keys: saa_run_id, saa_base_dir, saa_config_id, device.
+    """
+    required = ("saa_run_id", "saa_base_dir", "saa_config_id")
+    missing = [k for k in required if k not in saa_config]
+    if missing:
+        raise ValueError(f"Missing required SAA config keys: {missing}")
+
+    device = torch.device(saa_config.get("device", "cpu"))
+    run_id = str(saa_config["saa_run_id"])
+    base_dir = saa_config["saa_base_dir"]
+    config_id = str(saa_config["saa_config_id"])
+    saa_run_date = saa_config.get("saa_run_date", "unknown_date")
+
+    model_dir = os.path.join(base_dir, f"{run_id}_config_{config_id}_{saa_run_date}")
+    model_path = os.path.join(model_dir, "best_model.zip")
+    vecnorm_path = os.path.join(model_dir, "vecnormalize.pkl")
+
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"SAA model not found at: {model_path}")
+
+    load_errors: List[str] = []
+    saa_model = None
+    try:
+        saa_model = RecurrentPPO.load(model_path, device=device)
+    except Exception as e:
+        load_errors.append(f"RecurrentPPO.load failed: {e}")
+        raise RuntimeError(f"Failed to load SAA model. Errors: {load_errors}")
+
+    saa_vecnormalize = None
+    if os.path.exists(vecnorm_path):
+        dummy_env = _ObsNormDummyEnv(
+            saa_model.observation_space if hasattr(saa_model, "observation_space")
+            else gym.spaces.Box(low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32)
+        )
+        saa_vecnormalize = VecNormalize.load(vecnorm_path, dummy_env)
+        saa_vecnormalize.training = False
+        saa_vecnormalize.norm_reward = False
+
+    return saa_model, saa_vecnormalize, device
+
+# Build PPO model 
 def build_allocator_model(
     env: gym.Env,
-    config: Dict[str, Any]
+    config: Dict[str, Any],
+    saa_model: Any,
+    saa_vecnormalize: Optional[VecNormalize],
+    saa_device: torch.device,
+    num_assets: int,
+    raw_feature_dim: int
 ) -> PPO:
     """
-    Instantiate PPO model with custom transformer policy and hyperparameters from config.
-    
+    Instantiate PPO model 
     Args:
         env: Vectorized training environment
         config: Full configuration dict
-    
+        saa_model: Pretrained SAA model
+        saa_vecnormalize: Optional VecNormalize instance for SAA model
+        saa_device: Device for SAA model ("cpu" or "cuda")
+        num_assets: Number of assets in the portfolio
+        raw_feature_dim: Dimension of raw features for each asset
+
     Returns:
         PPO model instance ready for training
         
     Integration:
     - Reads hyperparameters from config["portfolio_allocator_agent"] section
     - Creates learning rate schedule using linear_three_phase_schedule
-    - Uses standard PPO algorithm from SB3 with custom TransformerAllocatorPolicy
-    - Policy is TransformerAllocatorPolicy via policy_kwargs
+    - Uses standard PPO algorithm from SB3
     
     Config Keys Used (from portfolio_allocator_agent section):
     - learning_rate_start, learning_rate_end: LR schedule endpoints
@@ -3067,22 +1304,17 @@ def build_allocator_model(
     - verbose: Logging verbosity
     """
     
-    # Extract agent configuration section
-    # Config uses "portfolio_allocator_agent" key instead of "agent"
+    # --- Extract agent configuration section ---
     agent_cfg = config.get("portfolio_allocator_agent", {})
-    
-    # Fallback: also check "agent" key for compatibility
-    if not agent_cfg:
-        agent_cfg = config.get("agent", {})
+    saa_config = config.get("saa_config", {})
+    transformer_cfg = config.get("allocator_transformer", {})
     
     # --- Learning Rate Schedule ---
-    
     # Extract LR schedule parameters
     lr_start = float(agent_cfg.get("learning_rate_start", 3e-4))
     lr_end = float(agent_cfg.get("learning_rate_end", 3e-5))
     lr_warmup_pct = float(agent_cfg.get("lr_schedule_warmup_pct", 0.2))
     lr_ramping_pct = float(agent_cfg.get("lr_schedule_ramping_pct", 0.6))
-    
     # Create learning rate schedule using three-phase linear interpolation
     lr_schedule = linear_three_phase_schedule(
         start=lr_start,
@@ -3090,26 +1322,22 @@ def build_allocator_model(
         warmup_pct=lr_warmup_pct,
         ramping_pct=lr_ramping_pct
     )
-    
+
     # --- Entropy Coefficient ---
-    
     # Initial entropy coefficient (will be updated by EntropyScheduleCallback)
     # Higher entropy = more exploration, lower = more exploitation
     ent_coef_start = float(agent_cfg.get("ent_coef_start", 0.01))
     
     # --- Clip Range Schedule (Optional) ---
-    
     # PPO clip range for policy ratio clipping
     # Can be constant or scheduled (using linear_three_phase_schedule)
     clip_range_start = float(agent_cfg.get("clip_range_start", 0.2))
     clip_range_end = float(agent_cfg.get("clip_range_end", 0.2))
-    
     # Check if clip range should be scheduled
     if clip_range_start != clip_range_end:
         # Create schedule if start != end
         clip_warmup_pct = float(agent_cfg.get("clip_schedule_warmup_pct", 0.2))
         clip_ramping_pct = float(agent_cfg.get("clip_schedule_ramping_pct", 0.6))
-        
         clip_range = linear_three_phase_schedule(
             start=clip_range_start,
             end=clip_range_end,
@@ -3120,39 +1348,36 @@ def build_allocator_model(
         # Use constant clip range
         clip_range = clip_range_start
     
-    # --- Policy Architecture Configuration ---
-    
-    # Extract transformer configuration for policy network
-    transformer_cfg = config.get("allocator_transformer", {})
-    
-    # Number of assets (needed for policy architecture)
-    num_assets = len(config.get("environment", {}).get("assets", []))
-    if num_assets == 0:
-        raise ValueError("Config must specify assets in environment section")
-    
-    # Build policy_kwargs for TransformerAllocatorPolicy
+    # Build policy_kwargs
     # These parameters are passed directly to the policy class constructor
-    policy_kwargs = {
-        # Transformer architecture parameters
-        "num_assets": num_assets,
-        "d_model": int(transformer_cfg.get("d_model", 128)),
-        "n_heads": int(transformer_cfg.get("n_heads", 8)),
-        "n_layers": int(transformer_cfg.get("n_layers", 4)),
-        "dim_feedforward": int(transformer_cfg.get("dim_feedforward", 512)),
-        "dropout": float(transformer_cfg.get("dropout", 0.1)),
-        "use_asset_id_embedding": bool(transformer_cfg.get("use_asset_id_embedding", True)),
-        "use_portfolio_token": bool(transformer_cfg.get("use_portfolio_token", True)),
-        # SB3 default actor/critic network architecture (applied after policy)
-        # Empty list = linear mapping from transformer output to actions/values
-        "net_arch": []
-    }
+    policy_kwargs = dict(
+        features_extractor_class=SAATokenizer,
+        features_extractor_kwargs=dict(
+            num_assets=num_assets, 
+            raw_feat_dim=raw_feature_dim, # ONLY raw market features without SAA signal or weights, since those are handled inside the tokenizer
+            d_model=transformer_cfg.get("d_model", 128),
+            saa_model=saa_model,
+            saa_vecnormalize=saa_vecnormalize,
+            saa_config=saa_config
+        ),
+        # mlp_extractor_class=AttentionEngine,
+        # mlp_extractor_kwargs=dict(
+        #     d_model=transformer_cfg.get("d_model", 128),
+        #     n_heads=transformer_cfg.get("n_heads", 4),
+        #     n_layers=transformer_cfg.get("n_layers", 2),
+        #     activation_fn=nn.ReLU
+        # ),
+        net_arch=dict(pi=[], vf=[])  # No additional MLP layers after attention; all processing in attention engine! Vital!           
+    )
+
+    # Environment wrapper to handle stateful SAA signal injection
+    wrapped_env = SAASignalWrapper(env, saa_model, saa_vecnormalize, num_assets, raw_feature_dim, saa_device)
     
     # --- Core PPO Hyperparameters ---
-    
     # Rollout buffer size: number of steps to collect before update
     # Should be divisible by batch_size for efficient training
     n_steps = int(agent_cfg.get("n_steps", 2048))
-    
+
     # Minibatch size for gradient updates
     # Smaller = more updates per rollout but noisier gradients
     batch_size = int(agent_cfg.get("batch_size", 256))
@@ -3195,8 +1420,8 @@ def build_allocator_model(
     # Rolling window size for statistics (e.g., episode rewards)
     stats_window_size = int(agent_cfg.get("stats_window_size", 100))
     
+
     # --- TensorBoard Logging ---
-    
     # Get TensorBoard log directory from config or use default
     training_cfg = config.get("training", {})
     tb_log_dir = training_cfg.get(
@@ -3206,13 +1431,20 @@ def build_allocator_model(
     # Ensure directory exists, create if not
     os.makedirs(tb_log_dir, exist_ok=True)
     
+
     # --- Instantiate PPO Model ---
-    
     # Create PPO model with all configured parameters
-    # Uses standard PPO (not RecurrentPPO) since transformer handles sequences
+    # Uses standard PPO (not RecurrentPPO). Tokens of transformer are assets/portfolio
     model = PPO(
-        policy=TransformerAllocatorPolicy,  # Custom transformer policy class
-        env=env,  # Vectorized environment (DummyVecEnv + VecNormalize)
+        policy=TransformerAllocatorPolicy,  # Placeholder, actual architecture defined in policy_kwargs
+        env=wrapped_env,  # Use the wrapped environment that injects stateful SAA signal
+        policy_kwargs=dict(
+            **policy_kwargs,
+            n_assets=num_assets,
+            d_model=transformer_cfg.get("d_model", 128),
+            n_heads=transformer_cfg.get("n_heads", 8),
+            n_layers=transformer_cfg.get("n_layers", 4)
+        ),
         
         # Optimization hyperparameters
         learning_rate=lr_schedule,  # Scheduled learning rate
@@ -3231,9 +1463,6 @@ def build_allocator_model(
         max_grad_norm=max_grad_norm,  # Gradient clipping
         normalize_advantage=normalize_advantage,  # Advantage normalization
         target_kl=target_kl,  # Early stopping KL threshold
-        
-        # Policy architecture
-        policy_kwargs=policy_kwargs,  # Custom transformer policy
         
         # System configuration
         device=device,  # PyTorch device
@@ -3378,89 +1607,70 @@ def run(cache: MarketDataCache, config: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         Summary dict with training results, model path, timing, hyperparameters
     """
+
+    # --- Seeds & Gamma Extraction ---
     # Set seeds for reproducibility (PyTorch, NumPy, env wrappers)
     seed = int(config.get("training", {}).get("seed", 42))
     np.random.seed(seed)
-    
+    torch.manual_seed(seed)
     # Extract gamma for VecNormalize reward normalization
     gamma_cfg = config.get("portfolio_allocator_agent", {}).get("gamma", 0.99)
+    saa_config = config.get("saa_config", {})
+    num_assets = cache.num_assets
+    raw_feature_dim = cache.num_features
     
-    # --- Load Pre-trained SAA Models ---
-    
-    # Load frozen SAA ensemble from disk (used for per-asset signal generation)
-    # SAA models are trained in single-asset mode; allocator learns to weight them
-    print("[run] Loading pre-trained SAA models...")
-    saa_ensemble = load_saa_models(config=config, device="cpu")
-    print(f"[run] SAA ensemble loaded for {len(saa_ensemble.assets)} assets")
-    
-    # --- Build Training Environment ---
-    
-    # Create environment wrapper for training (uses training data blocks)
-    # Wraps base portfolio environment with SAA signals + transformer tokenizer
-    def make_train_env():
-        env = build_allocator_env(
-            cache=cache,
-            config=config,
-            saa_ensemble=saa_ensemble,
-            seed=seed,
-            for_eval=False  # Use training data blocks
-        )
-        return env
-    
-    # Vectorize training environment (DummyVecEnv for single env, then VecNormalize)
-    # VecNormalize: obs/reward normalization + discount gamma handling
-    vec_train = VecNormalize(
-        DummyVecEnv([make_train_env]),
-        norm_obs=True,
+    # Load frozen SAA once
+    saa_model, saa_vecnorm, saa_device = _load_saa_from_config(saa_config)
 
-        norm_reward=False,
-        clip_obs=10.0,
-        clip_reward=np.inf,
-        gamma=gamma_cfg  # For advantage normalization in reward scaling
-    )
-    
-    print("[run] Training environment created and vectorized")
-    
-    # --- Build Evaluation Environment ---
-    
-    # Create environment wrapper for evaluation (uses validation data blocks)
-    def make_eval_env():
-        env = build_allocator_env(
-            cache=cache,
-            config=config,
-            saa_ensemble=saa_ensemble,
-            seed=seed + 1,  # Different seed for eval
-            for_eval=True  # Use validation data blocks
+    # --- Build Environments for train/validation ---
+    print("[run] Building training and evaluation environments...")
+    def make_env(mode: str):
+        return lambda: TradingEnv(
+            config=config, 
+            market_data_cache=cache, 
+            mode=mode
         )
-        return env
     
-    # Vectorize evaluation environment (same structure, but training=False in VecNormalize)
-    # training=False: freeze norm statistics, don't update them during eval
-    vec_eval = VecNormalize(
-        DummyVecEnv([make_eval_env]),
-        training=False,
-        norm_obs=True,
-        norm_reward=False,  # Raw rewards for evaluation reporting
-        clip_obs=10.0,
-        clip_reward=np.inf,
-        gamma=gamma_cfg
-    )
+    # Create vectorized environments for training and evaluation
+    vec_train = DummyVecEnv([make_env("train")])
+    vec_eval = DummyVecEnv([make_env("validation")])
 
-    vec_eval.obs_rms = vec_train.obs_rms  # Share observation normalization stats
-    if vec_eval.norm_reward==True:
-        vec_eval.ret_rms = vec_train.ret_rms
-    
-    print("[run] Evaluation environment created and vectorized")
-    
-    # --- Build PPO Model ---
-    
+    # Infer per-asset dim from the env observation space (unwrapped)
+    sample_space = vec_train.observation_space
+    obs_len = sample_space.shape[0]
+    portfolio_dim = num_assets + 7  # weights (N+1) + 6 metrics
+    asset_block = obs_len - portfolio_dim
+    if asset_block <= 0 or asset_block % num_assets != 0:
+        raise ValueError(
+            f"Cannot infer per-asset dim: obs_len={obs_len}, num_assets={num_assets}, portfolio_dim={portfolio_dim}"
+        )
+    raw_feat_dim = asset_block // num_assets
+
+
+    # Wrap envs with SAA signal injection
+    vec_train = SAASignalWrapper(vec_train, saa_model, saa_vecnorm, num_assets, raw_feat_dim, saa_device)
+    vec_eval = SAASignalWrapper(vec_eval, saa_model, saa_vecnorm, num_assets, raw_feat_dim, saa_device)
+    print("[run] Environments built successfully")
+
+
+    # --- Build PPO Model: with provided SAA deps ---
     # Instantiate PPO with custom transformer policy and learning rate/entropy schedules
-    print("[run] Building PPO model with custom transformer policy...")
-    model = build_allocator_model(env=vec_train, config=config)
-    print("[run] PPO model built successfully")
+    print("[run] Building PPO allocator model...")
+
+    model = build_allocator_model(
+        env=vec_train, 
+        config=config,
+        saa_model=saa_model,
+        saa_vecnormalize=saa_vecnorm,
+        saa_device=saa_device,
+        num_assets=num_assets,
+        raw_feature_dim=raw_feature_dim
+    )
+
+    print("[run] PPO allocator model built successfully")
     
+
     # --- Setup Logging Directories ---
-    
     # Get agent directory (same folder as this module)
     agent_dir = os.path.dirname(os.path.abspath(__file__))
     

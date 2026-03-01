@@ -50,7 +50,7 @@ from typing import Callable, Dict, Any, Optional
 from datetime import datetime
 
 
-#import torch
+import torch
 import torch.nn as nn
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
@@ -790,7 +790,7 @@ def run(cache, config: Dict[str, Any]) -> Dict[str, Any]:
     """
     # Set seeds for reproducibility (PyTorch, NumPy, env wrappers)
     seed = int(config.get("training", {}).get("seed", 42))
-    # torch.manual_seed(seed)
+    torch.manual_seed(seed)
     np.random.seed(seed)
 
     gamma_cfg = config.get("agent", {}).get("gamma", 0.99)
