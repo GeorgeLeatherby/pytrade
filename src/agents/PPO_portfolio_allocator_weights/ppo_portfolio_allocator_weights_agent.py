@@ -10,7 +10,7 @@ Architecture:
     1. Per-asset tokens: raw market features, the injected SAA signal, and per-asset weight
     2. Global portfolio token
 - Embedding: Linear projection + asset ID embeddings → d_model dimensions
-- Transformer Encoder: Self-attention across N+1 tokens (N assets + 1 portfolio token)
+- Transformer Encoder: Self-attention across N+1 tokens (N assets tokens + 1 portfolio token)
 - Output Heads: Per-asset raw allocation logits + cash logit → sigmoid output in [0, 1]
     (Environment applies post-policy normalization to valid portfolio weights)
 - Value Head: Portfolio token → scalar value estimate
@@ -1048,7 +1048,7 @@ class SAASignalWrapper(VecEnvWrapper):
             per_asset_obs_t = (per_asset_obs_t - mean) / torch.sqrt(var + eps)
             per_asset_obs = per_asset_obs_t.cpu().numpy()
 
-        # Recurrent predict
+        # Recurrent predict: SAA 
         with torch.no_grad():
             torch_obs = torch.as_tensor(per_asset_obs, device=self.device, dtype=torch.float32)
             episode_start = torch.as_tensor(self.episode_start, device=self.device, dtype=torch.bool)
