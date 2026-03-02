@@ -4,7 +4,7 @@ import numpy as np
 from typing import Dict, Any, List
 from scipy import optimize
 
-from src.environment.trading_env import TradingEnv, TradeInstruction, EXECUTION_TRANCHE
+from obsolete.trading_env import TradingEnv, TradeInstruction, EXECUTION_TRANCHE
 
 class EarlyStop(Exception):
     pass

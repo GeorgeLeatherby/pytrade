@@ -7,7 +7,7 @@
 
 - train/approx_kl: approximate KL divergence between old and new policies. Small values indicate conservative updates; too high can imply policy instability. 
 - train/clip_fraction: fraction of policy gradient terms that were clipped by PPO’s ratio clamp. Near 0 means updates are within the trust region; large values mean frequent clipping.
-- train/clip_range: current PPO clip hyperparameter. It’s scheduled via your clip schedule (here 0.2).
+- train/clip_range: current PPO clip hyperparameter. It’s scheduled via config defined clip schedule 
 - train/entropy_loss: negative policy entropy; more negative implies higher entropy (more exploration). As policy converges, magnitude should decrease.
 - train/explained_variance: EV of the value function over returns; near 1 is good fit, near 0 or negative indicates poor value learning (common early in training).
 - train/learning_rate: current LR from the schedule. Starts at learning_rate_start and will decay toward learning_rate_end.

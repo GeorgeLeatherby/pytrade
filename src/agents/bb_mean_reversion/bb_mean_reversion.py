@@ -52,7 +52,7 @@ import numpy as np
 import pandas as pd
 from dataclasses import dataclass
 from typing import Dict, Any, List, Tuple
-from src.environment.trading_env import MarketDataCache
+from obsolete.trading_env import MarketDataCache
 
 # ----------------------------
 # Parameter Dataclass

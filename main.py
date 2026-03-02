@@ -3,7 +3,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
 import json, importlib
 import pandas as pd
 from tkinter import Tk, Listbox, SINGLE, MULTIPLE, Button, Label, END, Toplevel, messagebox
-from src.environment.trading_env import MarketDataCache
+from src.environment.single_asset_target_pos_drl_trading_env import MarketDataCache
 
 AGENTS_DIR = os.path.join(os.path.dirname(__file__), "src", "agents")
 
@@ -25,8 +25,10 @@ def load_market_data(csv_path):
     return pd.read_csv(csv_path)
 
 def verify_requested_features(df: pd.DataFrame, config: dict) -> None:
-    """Ensure all features marked True in config['features'] exist as columns in the loaded dataframe."""
-    requested = {name for name, enabled in config.get("features", {}).items() if enabled}
+    """Ensure all features marked True in config feature dictionaries exist as columns in the loaded dataframe."""
+    requested = set()
+    for key in ["saa_features", "paa_asset_token_features", "paa_portfolio_token_features"]:
+        requested.update(name for name, enabled in config.get(key, {}).items() if enabled)
     missing = requested - set(df.columns)
     if missing:
         raise ValueError(f"Missing requested features in data: {sorted(missing)}")

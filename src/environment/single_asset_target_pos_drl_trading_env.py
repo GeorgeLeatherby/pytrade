@@ -237,6 +237,7 @@ class EpisodeBuffer:
     # Metadata
     current_step: int = 0                   # Current step in episode
     num_portfolio_features: int = field(init=False)  # Number of portfolio features for observation
+    effective_asset_concentration_norm: np.ndarray = field(init=False)  # [episode_buffer_length_days] - effective asset concentration norm 
 
     # weights, alpha, sharpe_ratio, drawdown, volatility, turnover, allocator_rewards
 
@@ -274,6 +275,7 @@ class EpisodeBuffer:
         self.reward_turnover = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         self.reward_concentration = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         self.reward_survival = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.effective_asset_concentration_norm = np.zeros(self.episode_buffer_length_days, dtype=dtype)
 
     def record_step(self, external_step: int, portfolio_value: float, weights: np.ndarray, portfolio_positions: np.ndarray,
                    daily_return: float, saa_return: float, reward: float, saa_reward: float,action: np.ndarray,
@@ -282,7 +284,8 @@ class EpisodeBuffer:
                    comparison_portfolio_value: float = 0.0,
                    traded_dollar_volume: float = 0.0, traded_shares_total: float = 0.0,
                    action_entropy: float = 0.0, saa_reward_parts: Optional[Dict[str, float]] = None,
-                   reward_parts: Optional[Dict[str, float]] = None) -> None:
+                   reward_parts: Optional[Dict[str, float]] = None,
+                   effective_asset_concentration_norm: float = 0.0) -> None:
         
         """
         Record step data efficiently. external_step: 0-based episode day index (first real day = 0)
@@ -314,6 +317,7 @@ class EpisodeBuffer:
         self.traded_dollar_volume[internal_offset_step] = float(traded_dollar_volume)
         self.traded_shares_total[internal_offset_step] = float(traded_shares_total)
         self.action_entropy[internal_offset_step] = float(action_entropy)
+        self.effective_asset_concentration_norm[internal_offset_step] = float(effective_asset_concentration_norm)
         # Reward components
         if reward_parts is not None:
             self.reward_alpha[internal_offset_step] = reward_parts.get("alpha_component", 0.0)
@@ -535,11 +539,12 @@ class EpisodeBuffer:
         drawdown = self.drawdown[internal_step]
         volatility = self.volatility[internal_step]
         turnover = self.turnover[internal_step]
-        rewards = self.allocator_rewards[internal_step]
+        # rewards = self.allocator_rewards[internal_step] # Why feed reward.
+        effective_asset_concentration_norm = self.effective_asset_concentration_norm[internal_step]
 
         observation = np.concatenate([
             weights,
-            [alpha, sharpe, drawdown, volatility, turnover, rewards]
+            [alpha, sharpe, drawdown, volatility, turnover, effective_asset_concentration_norm]
         ]).astype(np.float32)
 
         return observation
@@ -723,7 +728,6 @@ class MarketDataCache:
         num_days = len(unique_dates)
         num_assets = len(assets)  
         num_features = len(selected_features)
-        num_available_features = len(available_feature_cols)
         
         print(f"Dimensions: {num_days:,} days × {num_assets} assets × {num_features} features")
         print(f"Total data points: {num_days * num_assets * (5 + num_features):,}")
@@ -1028,44 +1032,82 @@ class MarketDataCache:
     def _select_features_from_config(available_features: List[str], config: Dict[str, Any]) -> List[str]:
         """
         Select features based on configuration settings.
+        Supports the new config sections: ``saa_features``, ``paa_asset_token_features``,
+        and ``paa_portfolio_token_features``. The legacy ``features`` key is not accepted.
         
         Args:
             available_features: List of all available feature names from CSV
-            config: Configuration dict with features section
+            config: Configuration dict with feature sections
             
         Returns:
-            List of selected feature names
-            
-        Example config:
-            config = {
-                "features": {
-                    "return_1d": True,
-                    "return_3d": False,
-                    "rsi_14": True,
-                    "macd": True,
-                    # ... more features
-                }
-            }
+            List of selected feature names (no duplicates)
         """
-        if 'features' not in config:
-            print("Warning: No 'features' section in config. Using all available features.")
-            return available_features
+        feature_keys = [
+            "saa_features",
+            "paa_asset_token_features",
+            "paa_portfolio_token_features",
+        ]
+
+        if "features" in config:
+            raise ValueError(
+                "Config key 'features' is deprecated. Use 'saa_features', "
+                "'paa_asset_token_features', or 'paa_portfolio_token_features' instead."
+            )
+
+        feature_sections: Dict[str, Dict[str, Any]] = {}
+        for key in feature_keys:
+            section = config.get(key, {}) or {}
+            if not isinstance(section, dict):
+                raise ValueError(f"Config section '{key}' must be a mapping of feature flags.")
+            feature_sections[key] = section
+
+        # Detect duplicate feature definitions across sections
+        # Note: Duplicates in the config feature keys are allowed for sorting/filtering operations later!
+        # We just need to ensure each unique feature is loaded only once
+        feature_origin: Dict[str, str] = {}
+        duplicates_found: Dict[str, list] = {}
         
-        features_config = config['features']
-        selected_features = []
+        for section_name, section in feature_sections.items():
+            for feat_name in section:
+                if feat_name in feature_origin:
+                    # Track which sections define the same feature
+                    if feat_name not in duplicates_found:
+                        duplicates_found[feat_name] = [feature_origin[feat_name]]
+                        duplicates_found[feat_name].append(section_name)
+            else:
+                feature_origin[feat_name] = section_name
         
-        # Check each available feature against config
+        # Inform user about duplicates but don't raise error
+        if duplicates_found:
+            print("\nWarning: The following features are defined in multiple config sections:")
+            for feat_name, sections in duplicates_found.items():
+                print(f"  '{feat_name}' found in: {', '.join(sections)}")
+                print("Each feature will be loaded only once to avoid redundant data loading.\n")
+
+        if all(len(section) == 0 for section in feature_sections.values()):
+            raise ValueError(
+                "No features specified in config sections. Please enable at least one feature in "
+                "'saa_features', 'paa_asset_token_features', or 'paa_portfolio_token_features'."    
+            )
+
+        # Flatten enabled flags while preserving the available_features order below
+        combined_flags: Dict[str, bool] = {}
+        for section in feature_sections.values():
+            for feat_name, enabled in section.items():
+                combined_flags[feat_name] = bool(enabled)
+
+        selected_features: List[str] = []
         for feature_name in available_features:
-            if feature_name in features_config:
-                if features_config[feature_name] is True:
+            if feature_name in combined_flags:
+                if combined_flags[feature_name]:
                     selected_features.append(feature_name)
             else:
-                # Feature not in config - you can decide default behavior
-                print(f"Warning: Feature '{feature_name}' not found in config. Skipping.")
+                print(
+                    f"Warning: Feature '{feature_name}' not found in provided feature sections in config. Skipping."
+                )
         
         if not selected_features:
-            print("Warning: No features selected! Using all available features as fallback.")
-            return available_features
+            raise ValueError("No features selected. Please enable at least one feature in the config sections.")
         
         return selected_features
     
@@ -1436,7 +1478,9 @@ class TradingEnv(gym.Env):
         num_features = self.market_data_cache.num_features
         num_portfolio_features = self.episode_buffer.num_portfolio_features
 
+
         # ------ Action space design ------
+
         if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
             # ------ Action space: Target position for single selected asset ------
             self.action_space = spaces.Box(
@@ -1452,7 +1496,9 @@ class TradingEnv(gym.Env):
             # Keep a generic Box to satisfy Gym, but we validate structure in step().
             self.action_space = spaces.Box(low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32)
 
-        # ------ Observation space design for multi-encoder architecture ------
+
+        # ------ Observation space design ------
+
         if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
             asset_obs_size = num_features # Single step asset features for selected asset
             portfolio_obs_size = 3 # rel_cash_weight, rel_asset_weight, day_return
@@ -1481,6 +1527,8 @@ class TradingEnv(gym.Env):
             dtype=np.float32
         )
         
+        print(f"\nObservation space setup complete: {self.observation_space}")
+
         # Store dimensions for observation construction and splitting
         self.asset_obs_size = asset_obs_size
         self.portfolio_obs_size = portfolio_obs_size
@@ -1616,6 +1664,7 @@ class TradingEnv(gym.Env):
         self._ep_action_outputs = []  # raw single-asset action outputs
         self._ep_exposure_sum = 0.0
         self._ep_exposure_steps = 0
+
         # Shadow (frictionless) portfolio mirrors live trades without costs
         self.shadow_portfolio_state = PortfolioState(
             cash=self.initial_portfolio_value,
@@ -1837,6 +1886,11 @@ class TradingEnv(gym.Env):
         # Seed a pre-step entry in the EpisodeBuffer so the first observation contains real weights
         initial_weights = self.portfolio_state.get_weights().astype(np.float32)
         zero_action = np.zeros(self.market_data_cache.num_assets + 1, dtype=np.float32)
+        sum_sq = float(np.sum(initial_weights[1:] ** 2))
+        if sum_sq < 1e-8:
+            effective_asset_concentration_norm = 0.0
+        else:
+            effective_asset_concentration_norm = float(1.0 / sum_sq) /  float(len(initial_weights[1:]))
 
         self.episode_buffer.record_step(
             external_step=0, 
@@ -1856,7 +1910,8 @@ class TradingEnv(gym.Env):
             turnover=0.0,
             alpha=0.0,
             benchmark_portfolio_value=self.benchmark_portfolio_state.get_total_value(),
-            comparison_portfolio_value=self.comparison_portfolio_state.get_total_value()
+            comparison_portfolio_value=self.comparison_portfolio_state.get_total_value(),
+            effective_asset_concentration_norm=effective_asset_concentration_norm
         )
         
         # Initialize previous portfolio value for return calculation
@@ -2247,6 +2302,12 @@ class TradingEnv(gym.Env):
         current_weights_after_execution = self.portfolio_state.get_weights()
         daily_return = (portfolio_value_after / portfolio_value_before - 1.0 if portfolio_value_before > 0 else 0.0)
         
+        sum_sq = float(np.sum(current_weights_after_execution[1:] ** 2))
+        if sum_sq < 1e-8:
+            effective_asset_concentration_norm = 0.0
+        else:
+            effective_asset_concentration_norm = float(1.0 / sum_sq) /  float(len(current_weights_after_execution[1:]))
+
         # FIX: Set external step to current step (already incremented)
         external_step = self.current_step  # zero-based index for buffer, is called first time at reset!
 
@@ -2275,7 +2336,8 @@ class TradingEnv(gym.Env):
             reward_parts={k: float(v) for k, v in reward_parts.items()},
             saa_reward_parts={k: float(v) for k, v in saa_reward_parts.items()},
             benchmark_portfolio_value=float(benchmark_portfolio_value_after),
-            comparison_portfolio_value=float(comparison_portfolio_value_after)
+            comparison_portfolio_value=float(comparison_portfolio_value_after),
+            effective_asset_concentration_norm=float(effective_asset_concentration_norm)
         )
 
         # Check termination conditions -----------------------------------

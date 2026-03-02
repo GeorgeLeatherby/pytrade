@@ -193,8 +193,8 @@ class EpisodeBuffer:
     traded_dollar_volume: np.ndarray = field(init=False)         # [episode_buffer_length_days, num_assets] - dollar volume traded each step
     traded_shares_total: np.ndarray = field(init=False)        # [episode_buffer_length_days, num_assets] - total shares traded each step
     # Metadata
-    current_step: int = 0                   # Current step in episode
-    num_portfolio_features: int = field(init=False)  # Number of portfolio features for observation
+    current_step: int = 0                                       # Current step in episode
+    num_portfolio_features: int = field(init=False)             # Number of portfolio features for observation
 
     # weights, alpha, sharpe_ratio, drawdown, volatility, turnover, allocator_rewards
 
@@ -237,7 +237,8 @@ class EpisodeBuffer:
                    sharpe_ratio: float = 0.0, drawdown: float = 0.0, volatility: float = 0.0, turnover: float = 0.0, alpha: float = 0.0, benchmark_portfolio_value: float = 0.0,
                    traded_dollar_volume: float = 0.0, traded_shares_total: float = 0.0,
                    action_entropy: float = 0.0,
-                   reward_parts: Optional[Dict[str, float]] = None) -> None:
+                   reward_parts: Optional[Dict[str, float]] = None,
+                   effective_asset_concentration_norm: float = 0.0) -> None:
         
         """
         Record step data efficiently. external_step: 0-based episode day index (first real day = 0)
@@ -591,7 +592,6 @@ class MarketDataCache:
         num_days = len(unique_dates)
         num_assets = len(assets)  
         num_features = len(selected_features)
-        num_available_features = len(available_feature_cols)
         
         print(f"Dimensions: {num_days:,} days × {num_assets} assets × {num_features} features")
         print(f"Total data points: {num_days * num_assets * (5 + num_features):,}")
@@ -896,44 +896,82 @@ class MarketDataCache:
     def _select_features_from_config(available_features: List[str], config: Dict[str, Any]) -> List[str]:
         """
         Select features based on configuration settings.
+        Supports the new config sections: ``saa_features``, ``paa_asset_token_features``,
+        and ``paa_portfolio_token_features``. The legacy ``features`` key is not accepted.
         
         Args:
             available_features: List of all available feature names from CSV
-            config: Configuration dict with features section
+            config: Configuration dict with feature sections
             
         Returns:
-            List of selected feature names
-            
-        Example config:
-            config = {
-                "features": {
-                    "return_1d": True,
-                    "return_3d": False,
-                    "rsi_14": True,
-                    "macd": True,
-                    # ... more features
-                }
-            }
+            List of selected feature names (no duplicates)
         """
-        if 'features' not in config:
-            print("Warning: No 'features' section in config. Using all available features.")
-            return available_features
+        feature_keys = [
+            "saa_features",
+            "paa_asset_token_features",
+            "paa_portfolio_token_features",
+        ]
+
+        if "features" in config:
+            raise ValueError(
+                "Config key 'features' is deprecated. Use 'saa_features', "
+                "'paa_asset_token_features', or 'paa_portfolio_token_features' instead."
+            )
+
+        feature_sections: Dict[str, Dict[str, Any]] = {}
+        for key in feature_keys:
+            section = config.get(key, {}) or {}
+            if not isinstance(section, dict):
+                raise ValueError(f"Config section '{key}' must be a mapping of feature flags.")
+            feature_sections[key] = section
+
+        # Detect duplicate feature definitions across sections
+        # Note: Duplicates in the config feature keys are allowed for sorting/filtering operations later!
+        # We just need to ensure each unique feature is loaded only once
+        feature_origin: Dict[str, str] = {}
+        duplicates_found: Dict[str, list] = {}
         
-        features_config = config['features']
-        selected_features = []
+        for section_name, section in feature_sections.items():
+            for feat_name in section:
+                if feat_name in feature_origin:
+                    # Track which sections define the same feature
+                    if feat_name not in duplicates_found:
+                        duplicates_found[feat_name] = [feature_origin[feat_name]]
+                        duplicates_found[feat_name].append(section_name)
+            else:
+                feature_origin[feat_name] = section_name
         
-        # Check each available feature against config
+        # Inform user about duplicates but don't raise error
+        if duplicates_found:
+            print("\nWarning: The following features are defined in multiple config sections:")
+            for feat_name, sections in duplicates_found.items():
+                print(f"  '{feat_name}' found in: {', '.join(sections)}")
+                print("Each feature will be loaded only once to avoid redundant data loading.\n")
+
+        if all(len(section) == 0 for section in feature_sections.values()):
+            raise ValueError(
+                "No features specified in config sections. Please enable at least one feature in "
+                "'saa_features', 'paa_asset_token_features', or 'paa_portfolio_token_features'."    
+            )
+
+        # Flatten enabled flags while preserving the available_features order below
+        combined_flags: Dict[str, bool] = {}
+        for section in feature_sections.values():
+            for feat_name, enabled in section.items():
+                combined_flags[feat_name] = bool(enabled)
+
+        selected_features: List[str] = []
         for feature_name in available_features:
-            if feature_name in features_config:
-                if features_config[feature_name] is True:
+            if feature_name in combined_flags:
+                if combined_flags[feature_name]:
                     selected_features.append(feature_name)
             else:
-                # Feature not in config - you can decide default behavior
-                print(f"Warning: Feature '{feature_name}' not found in config. Skipping.")
+                print(
+                    f"Warning: Feature '{feature_name}' not found in provided feature sections in config. Skipping."
+                )
         
         if not selected_features:
-            print("Warning: No features selected! Using all available features as fallback.")
-            return available_features
+            raise ValueError("No features selected. Please enable at least one feature in the config sections.")
         
         return selected_features
     
@@ -1178,8 +1216,9 @@ class TradingEnv(gym.Env):
 
     metadata = {'render.modes': ['human']}
     
-    def __init__(self, config: Dict[str, Any], market_data_cache: MarketDataCache,
-    mode: str = 'train'):
+    def __init__(
+            self, config: Dict[str, Any], market_data_cache: MarketDataCache, mode: str = 'train'
+        ):
         """
         Initialize trading environment with configuration and pre-built market data cache.
         
@@ -1250,9 +1289,12 @@ class TradingEnv(gym.Env):
             required_buffer_size_days = self.lookback_window + self.episode_length_days
         else:
             required_buffer_size_days = self.episode_length_days
+
+        # Create episode buffer with the required size and configuration
         self.episode_buffer = EpisodeBuffer(
             episode_buffer_length_days=required_buffer_size_days,
-            num_assets=self.market_data_cache.num_assets, lookback_window=self.lookback_window,
+            num_assets=self.market_data_cache.num_assets, 
+            lookback_window=self.lookback_window,
             maybe_provide_sequence=self.maybe_provide_sequence
         )
 
@@ -1271,12 +1313,14 @@ class TradingEnv(gym.Env):
             self.action_space = spaces.Box(
                 low=-5.0, high=5.0, shape=(num_assets + 1,), dtype=np.float32
             )
+        
         else:
             # Simple/Tranche modes: action is a list of instructions; Gym does not have a list space.
             # Keep a generic Box to satisfy Gym, but we validate structure in step().
             self.action_space = spaces.Box(low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32)
 
         # ------ Observation space design for multi-encoder architecture ------
+        # Provision here for a lookback window 
         if self.maybe_provide_sequence:
             # 1. Asset features: [lookback_window, num_assets, num_features]
             asset_obs_size = self.lookback_window * num_assets * num_features
@@ -1285,6 +1329,8 @@ class TradingEnv(gym.Env):
             #    Portfolio-level metrics:
             #    weights + alpha + sharpe + drawdown + volatility + turnover + allocator_rewards
             portfolio_obs_size = self.lookback_window * num_portfolio_features
+
+        # No lookback window, only current step features
         else:
             # 1. Asset features: [num_assets, num_features]
             asset_obs_size = num_assets * num_features # Single step asset features
@@ -1293,6 +1339,8 @@ class TradingEnv(gym.Env):
         
         # Single flattened observation space for maximum performance
         total_obs_size = asset_obs_size + portfolio_obs_size
+
+        # Observation space definition
         self.observation_space = spaces.Box(
             low=-np.inf, 
             high=np.inf, 
@@ -1489,11 +1537,13 @@ class TradingEnv(gym.Env):
             terminated=False
         )
 
+        effective_asset_concentration_norm = (1/float(np.sum(current_weights_after_execution[1:] ** 2))) /  len(current_weights_after_execution[1:])  # Exclude cash for concentration calculation
+
         # Seed a pre-step entry in the EpisodeBuffer so the first observation contains real weights
         initial_weights = self.portfolio_state.get_weights().astype(np.float32)
         zero_action = np.zeros(self.market_data_cache.num_assets + 1, dtype=np.float32)
         self.episode_buffer.record_step(
-            external_step=0,  # BEFORE: mapped to internal index lookback_window - 1, or -1 directly
+            external_step=0,  
             portfolio_value=actual_initial_value,
             weights=initial_weights,
             portfolio_positions=self.portfolio_state.positions.copy(),
@@ -1507,7 +1557,8 @@ class TradingEnv(gym.Env):
             volatility=0.0,
             turnover=0.0,
             alpha=0.0,
-            benchmark_portfolio_value=self.benchmark_portfolio_state.get_total_value()
+            benchmark_portfolio_value=self.benchmark_portfolio_state.get_total_value(),
+            effective_asset_concentration_norm=effective_asset_concentration_norm
         )
         
         # Initialize previous portfolio value for return calculation
@@ -1769,7 +1820,7 @@ class TradingEnv(gym.Env):
         # Record step data
         current_weights_after_execution = self.portfolio_state.get_weights()
         daily_return = (portfolio_value_after / portfolio_value_before - 1.0 if portfolio_value_before > 0 else 0.0)
-        
+        effective_asset_concentration_norm = (1/float(np.sum(current_weights_after_execution[1:] ** 2))) /  len(current_weights_after_execution[1:])  # Exclude cash for concentration calculation
         # FIX: off-by-one error in episode buffer recording
         external_step = self.current_step - 1  # zero-based index for buffer
 
@@ -1797,7 +1848,8 @@ class TradingEnv(gym.Env):
             traded_dollar_volume=execution_result.traded_dollar_value,
             traded_shares_total=execution_result.traded_shares_total,
             action_entropy=entropy,
-            reward_parts=reward_parts
+            reward_parts=reward_parts,
+            effective_asset_concentration_norm=effective_asset_concentration_norm
         )
         
         # Prepare info
@@ -2017,7 +2069,6 @@ class TradingEnv(gym.Env):
         # f"Total Portfolio Value: {self.portfolio_state.get_total_value():.2f}\n")
 
         # Return all step outputs (observation, reward, terminated, truncated, info)
-        # NOTE: only next_observation must be a sequence for LSTM! TODO: Verify this statement
         return next_observation, allocator_reward, terminated, truncated, info
     
 
@@ -2714,7 +2765,7 @@ class TradingEnv(gym.Env):
     
     def get_observation_single_step(self):
         """
-        Generate single-step observation for agents like RecurrentPPO that do not require sequences.
+        Generate single-step observation for agents like RecurrentPPO or PPO that do not require sequences.
 
         Returns:
             Flattened observation array optimized for SB3 LSTM processing

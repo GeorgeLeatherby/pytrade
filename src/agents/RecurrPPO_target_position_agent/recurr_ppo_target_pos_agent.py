@@ -14,9 +14,7 @@ The agent uses GAE (Generalized Advantage Estimation).
 Agent randomly decides each episode which asset to trade from a predefined list of assets which is retrieved
 from the environments asset universe. The agent only trades one asset per episode.
 
-The agent uses the features: return_1d, volume_percentile_40d, rsi_14, macd, bb_position,
-bb_width, volatility_5d, market_beta, avg_correlation, composite_risk_score, return_kurtosis
-which are marked as true in the config file
+The agent uses the features which are marked as true in the config file
 
 The basic architecture of the agent is as follows:
 MlpLstmPolicy from sb3_contrib as the policy network architecture.
@@ -59,14 +57,14 @@ from sb3_contrib.ppo_recurrent import MlpLstmPolicy
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
-from stable_baselines3.common.utils import configure_logger
+#from stable_baselines3.common.utils import configure_logger
 
 import gymnasium as gym
 
 # Import the single-asset environment (reuses data containers/classes defined there)
-# The `cache` object passed by main.py comes from src.environment.trading_env.MarketDataCache;
+# The `cache` object passed by main.py comes from src.environment.single_asset_target_pos_drl_trading_env.MarketDataCache;
 # runtime type checks are duck-typed—if attributes match, it works.
-from src.environment.single_asset_target_pos_drl_trading_env import TradingEnv as SingleAssetEnv
+from src.environment.single_asset_target_pos_drl_trading_env import TradingEnv
 import json
 
 
@@ -564,7 +562,7 @@ def build_env(cache, config: Dict[str, Any], seed: Optional[int] = None, for_eva
 
     Args:
         cache: MarketDataCache instance provided by main.py (duck-typed).
-        config: full configuration dict (environment, features, agent).
+        config: full configuration dict (environment, saa_features, agent).
         seed: optional PRNG seed for environment internal sampling.
         for_eval: choose eval mode ('validation' blocks) if True, else training.
 
@@ -572,7 +570,7 @@ def build_env(cache, config: Dict[str, Any], seed: Optional[int] = None, for_eva
         Gymnasium Env, wrapped to select one asset per episode and (optionally) scale actions.
     """
     mode = "validation" if for_eval else "train"
-    env = SingleAssetEnv(config, cache, mode=mode)
+    env = TradingEnv(config, cache, mode=mode)
 
     # Action limiting factor schedule (multiplicative) — supports flat agent config keys
     agent_cfg = config.get("agent", {})
@@ -613,9 +611,6 @@ def build_env(cache, config: Dict[str, Any], seed: Optional[int] = None, for_eva
     # Wrap env in the episode adapter to choose asset and apply action scaling
     wrapped = SingleAssetEpisodeAdapter(env=env, action_factor_fn=alf_fn, seed=seed)
 
-    # # Optional: transform rewards (e.g., scale) — here we keep identity for clarity
-    # wrapped = TransformReward(wrapped, lambda r: r)
-
     return wrapped
 
 
@@ -639,8 +634,8 @@ def build_policy_kwargs(config: Dict[str, Any]) -> Dict[str, Any]:
         "n_lstm_layers": int(pk.get("n_lstm_layers", 1)),
         "lstm_hidden_size": int(pk.get("lstm_hidden_size", 128)),
         "features_extractor_class": InputMLPFeatures,
-        "features_extractor_kwargs": {"features_dim": 64},
-        "ortho_init": True # ortho init: 
+        "features_extractor_kwargs": {"features_dim": 64}, # MLP features before LSTM
+        "ortho_init": True # init with orthogonal matrices for stability
     }
 
 
@@ -783,7 +778,7 @@ def run(cache, config: Dict[str, Any]) -> Dict[str, Any]:
 
     Args:
         cache: MarketDataCache from main.py (duck-typed).
-        config: dict containing environment, features, agent, training settings.
+        config: dict containing environment, saa_features, agent, training settings.
 
     Returns:
         dict with summary: paths, timings, and key hyperparameters used.
@@ -824,6 +819,7 @@ def run(cache, config: Dict[str, Any]) -> Dict[str, Any]:
         clip_reward=np.inf,
         gamma=gamma_cfg,
     )
+    
     # Build model
     model = build_model(vec_train, config)
 
@@ -902,6 +898,7 @@ def run(cache, config: Dict[str, Any]) -> Dict[str, Any]:
     # Starttime
     t0 = time.time()
 
+    # Train with callbacks (evaluation, entropy scheduling, progress sync, training metrics logging)
     model.learn(
         total_timesteps=total_timesteps, 
         callback=callback, 

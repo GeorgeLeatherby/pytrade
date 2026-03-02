@@ -13,16 +13,14 @@
         "n_layers": 2,
         "dim_feedforward": 256,
         "dropout": 0.1,
-        "activation": "relu",
-        "use_asset_id_embedding": true,
-        "use_portfolio_token": true
+        "activation": "relu"
   },
 
   "allocator_tokenizer": {
         "portfolio_feature_dim": 8
   },
 
-    "features": {
+    "saa_features": {
         "dow_sin": true,
         "dow_cos": true,
         "dom_sin": true,
@@ -52,6 +50,42 @@
         "return_kurtosis": true,
         "trend_strength_20d": true,
         "drawdown_adjusted_return_30d": true
+    },
+
+    "paa_asset_token_features": {
+        "relative_performance_20d": true,
+        "return_1d": true,
+        "return_5d": true,
+        "return_20d": true,
+        "return_40d": true,
+        "volume_change_1d": true,
+        "volume_change_5d": true,
+        "volume_change_20d": true,
+        "volume_change_40d": true,
+        "volume_percentile_20d": true,
+        "volume_percentile_40d": true,
+        "daily_range_pct": true,
+        "rsi_14": true,
+        "macd": true,
+        "bb_position": true,
+        "bb_width": true,
+        "volatility_5d": true,
+        "volatility_20d": true,
+        "market_beta": true,
+        "avg_correlation": true,
+        "composite_risk_score": true,
+        "return_kurtosis": true,
+        "trend_strength_20d": true,
+        "drawdown_adjusted_return_30d": true
+    },
+
+    "paa_portfolio_token_features": {
+        "dow_sin": true,
+        "dow_cos": true,
+        "dom_sin": true,
+        "dom_cos": true,
+        "moy_sin": true,
+        "moy_cos": true
     },
 
     "environment": {
@@ -87,7 +121,8 @@
         "commission_bps": 0.0002,
         "half_spread_bps": 0.0015,
         "impact_coeff": 0.125,
-        "adv_window": 21
+        "adv_window": 21,
+        "portfolio_features": false
   },
 
     "portfolio_allocator_agent":{
@@ -100,10 +135,15 @@
         "gae_lambda": 0.98,
         "vf_coef": 0.5,
         "max_grad_norm": 0.5,
-        "target_kl": 0.05,
-        "normalize_advantage": true,        
+        "target_kl": 0.08,
+        "normalize_advantage": true, 
+        
+        "clip_range_start": 0.4,
+        "clip_range_end": 0.1,
+        "clip_schedule_warmup_pct": 0.3,
+        "clip_schedule_ramping_pct": 0.6,
 
-        "learning_rate_start":  5.0e-4,
+        "learning_rate_start":  2.0e-4,
         "learning_rate_end": 5.0e-5,
         "lr_schedule_type": "linear",
         "lr_schedule_warmup_pct": 0.3,

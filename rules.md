@@ -2,7 +2,7 @@
 Only implement what is requested.
 Always reason and seek context of other code and conversation before implementing.
 If there is an unclarity, instead of providing code, ask questions to clarify.
-State all your assumptions.
+State all your assumptions. Explain why you implement each change. Explain why a proposed bug fix should help in context with the existing code and the error.
 Verify all handshakes. Verify all shapes of returned objects with the expected shapes.
 
 When working with environment incorporation, only introduce a wrapper if really necessary! If possible use or add to existing wrappers! Make sure to fully understand the relevant environment sections first, before starting to code. If there are unclarities, ask first.
@@ -26,6 +26,15 @@ DRL hierarchical on-policy agent(s) working with a custom Trading Environment to
 N: # of assets (here 11)
 Single Env always only! No multiple Envs in training ever.
 
+# Simulation (single_asset_target_pos_drl_trading.env)
+2 different execution_mode: EXECUTION_SINGLE_ASSET_TARGET_POS & EXECUTION_PORTFOLIO_WEIGHTS
+
+In EXECUTION_SINGLE_ASSET_TARGET_POS the defined observation space is (num_features + 3) = (32,)
+In EXECUTION_PORTFOLIO_WEIGHTS the defined observation space is (num_assets * num_features + num_portfolio_features) = (348,)
+portfolio_features = {weights, alpha, sharpe, drawdown, volatility, turnover, eff.asset.concentration}
+with weights[0] = cash_weight and len(weights)= N+1
+
+
 # SAA setup (recurr_ppo_target_pos_agent.py):
 SB3 Recurrent PPO, LSTM. Perceiving a randomly (by env) choosen asset each episode. Intended to find general patterns inside the time sequence data. 
 
@@ -44,8 +53,8 @@ Action space: (12,), between 0 to 1. Interpreted by the TradingEnv as requested 
 
 PAA observation: 
 Features to receive from the MarketDataCache object via TradingEnv for asset tokens are marked inside config key: paa_asset_token_features. They have a boolean which is set to True.
-N Asset-tokens: 23 asset-specific (29-6 (dow_sin, dow_cos, dom_sin, dom_cos, moy_sin, moy_cos)) + 1 SAA signal (1 individual model per asset (stateful) delivering (1,)) + 1 asset_weight
-form: (25,)
+N Asset-tokens: 24 asset-specific (defined in paa_asset_token_features) + assets SAA signal + asset_weight
+form: (26,)
 
 Features to receive from the MarketDataCache object via TradingEnv for portfolio tokens are marked inside config key: paa_asset_portfolio_features. They have a boolean which is set to True.
 1 Portfolio Token: 6 time features (dow_sin, dow_cos, dom_sin, dom_cos, moy_sin, moy_cos), 8 portfolio-wide features: (cash_weight, differential_sharpe, max_drawdown_level_change, volatilty, turnover, effective_concentration (Inverse Herfindahl-Hirschman Index), vix (Volatility Index), alpha (to benchmark. Given as Differential Log return. Maybe one for 1-day one for 20-day))

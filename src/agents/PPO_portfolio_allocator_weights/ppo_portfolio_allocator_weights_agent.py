@@ -28,15 +28,16 @@ import json
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.distributions
-from typing import Callable, Dict, Any, Optional, Tuple, List
+
+import copy
+from typing import Callable, Dict, Any, Optional, Tuple, List, Sequence, Mapping
 from datetime import datetime
 
 from stable_baselines3 import PPO
 from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.policies import ActorCriticPolicy
-from stable_baselines3.common.distributions import Normal
+# from stable_baselines3.common.distributions import Normal
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv, VecEnvWrapper, VecEnv
 from stable_baselines3.common.evaluation import evaluate_policy
@@ -945,33 +946,49 @@ class EntropyScheduleCallback(BaseCallback):
 
 class SAASignalWrapper(VecEnvWrapper):
     """
-    Injects frozen SAA signal into observations while preserving recurrent state fidelity.
-    Maintains SAA hidden states per (env, asset) and uses episode_start masks.
+    Manages N independent SAA models (one per asset) and injects their signals
+    into the allocator's observations. Preserves recurrent state per asset/env.
     """
     def __init__(self, venv: VecEnv, saa_model, saa_vecnormalize: Optional[VecNormalize],
-                 num_assets: int, raw_feat_dim: int, device: torch.device):
+                num_assets: int, device: torch.device,
+                config: Mapping[str, Any], feature_to_index: Mapping[str, int]):
         
         super().__init__(venv)
 
-        self.saa_model = saa_model
         self.saa_vecnormalize = saa_vecnormalize
         self.num_assets = num_assets
         self.device = device
+        # keep config and feature mapping locally (DummyVecEnv has no .config)
+        self.config = config
+        self.feature_to_index = feature_to_index
 
         # Infer per-asset feature dim from the env observation space
         obs_len = self.observation_space.shape[0]
-        portfolio_dim = self.num_assets + 7  # weights (N+1) + 6 metrics
+        portfolio_dim = self.num_assets + 7  # weights (N+1) + 6 metrics = 18
         asset_block = obs_len - portfolio_dim
         if asset_block <= 0 or asset_block % self.num_assets != 0:
             raise ValueError(
                 f"Cannot infer per-asset dim: obs_len={obs_len}, num_assets={self.num_assets}, portfolio_dim={portfolio_dim}"
             )
-        self.raw_feat_dim = asset_block // self.num_assets
 
-        # SAA states: (None -> zero-init inside predict)
-        self.saa_state = None
-        # episode_start flags per (env, asset)
-        self.episode_start = np.ones((venv.num_envs * num_assets,), dtype=bool)
+        self.raw_feat_dim = asset_block // self.num_assets
+        if self.raw_feat_dim != 30:
+            raise ValueError(
+                f"Inferred raw_feat_dim={self.raw_feat_dim} does not match expected 30. Check env observation space."
+            )
+
+        # Create N distinct SAA models (deep copies) and keep their own recurrent states
+        self.saa_models: List[Any] = []
+        for _ in range(self.num_assets):
+            m = copy.deepcopy(saa_model)
+            m.policy.to(self.device)
+            m.device = self.device # Ensure model's device attribute is set for VecNormalize    
+            m.policy.eval() # Set to eval mode (important for layers like LayerNorm, Dropout)
+            self.saa_models.append(m)
+        # per-asset recurrent states (None -> auto-init), shape managed by SB3
+        self.saa_states: List[Optional[Any]] = [None for _ in range(self.num_assets)]
+        # episode_start flags per asset (vector over envs)
+        self.episode_start = np.ones((self.num_assets, venv.num_envs), dtype=bool)
 
         # Resize obs space: add +1 feature per asset for SAA signal
         old_low, old_high = self.observation_space.low, self.observation_space.high
@@ -994,17 +1011,27 @@ class SAASignalWrapper(VecEnvWrapper):
             obs, _info = res
         else:
             obs = res
-        # Wipe memory for all (env, asset)
+        # reset per-asset states and episode flags
+        self.saa_states = [None for _ in range(self.num_assets)]
         self.episode_start[:] = True
-        self.saa_state = None
         obs = self._augment_obs_with_saa(obs)
         return obs
 
     def step_wait(self):
         obs, rewards, dones, infos = self.venv.step_wait()
-        flat_dones = np.repeat(dones, self.num_assets)
-        self.episode_start = flat_dones
+        dones_arr = np.asarray(dones, dtype=bool)  # shape (B,)
+        # update per-asset episode_start flags (same done for all assets in this env)
+        for a in range(self.num_assets):
+            self.episode_start[a] = dones_arr
         obs = self._augment_obs_with_saa(obs)
+
+        # also augment terminal_observation in infos to match new obs shape
+        for i, info in enumerate(infos):
+            if "terminal_observation" in info:
+                term = info["terminal_observation"]
+                if term is not None:
+                    term_aug = self._augment_obs_with_saa(term[None, ...])
+                    info["terminal_observation"] = term_aug[0]
         return obs, rewards, dones, infos
 
     def _augment_obs_with_saa(self, obs: np.ndarray) -> np.ndarray:
@@ -1012,70 +1039,61 @@ class SAASignalWrapper(VecEnvWrapper):
         Input obs: (B, num_assets*raw_feat_dim + portfolio_dim)
         Output obs: asset part becomes num_assets*(raw_feat_dim+1) with SAA signal appended per asset.
         """
-        B = obs.shape[0]
-        asset_flat = obs[:, : self.num_assets * self.raw_feat_dim]  # (B, N*F)
-        portfolio_part = obs[:, self.num_assets * self.raw_feat_dim :]  # (B, P)
+        B = obs.shape[0]  # typically 1 (single DummyVecEnv)
+        asset_block = self.num_assets * self.raw_feat_dim
+        asset_flat = obs[:, :asset_block]           # (B, N*F)
+        portfolio_part = obs[:, asset_block:]       # (B, P)
+        asset_feats = asset_flat.reshape(B, self.num_assets, self.raw_feat_dim)  # (B, N, 30)
 
-        asset_feats = asset_flat.reshape(B * self.num_assets, self.raw_feat_dim)  # (B*N, F)
+        # Indices of the 29 SAA features from config (assumed available on the wrapper)
+        saa_idx = np.array([self.feature_to_index[f] for f, on in self.config["saa_features"].items() if on], dtype=int)
+        saa_market_feats = asset_feats[:, :, saa_idx]  # (B, N, 29)
 
-        # Portfolio-derived fields
-        weights_full = portfolio_part[:, : self.num_assets + 1]  # (B, 1+N)
-        cash_w = weights_full[:, [0]]  # (B,1)
-        asset_w = weights_full[:, 1:]  # (B,N)
-        cash_w_rep = np.repeat(cash_w, self.num_assets, axis=1)  # (B,N)
+        # Portfolio-derived pieces
+        cash_w = portfolio_part[:, 0:1]                                # (B, 1)
+        asset_w = portfolio_part[:, 1:1 + self.num_assets]             # (B, N)
+        cash_w_exp = np.repeat(cash_w[:, None, :], self.num_assets, axis=1)  # (B, N, 1)
+        asset_w_exp = asset_w[:, :, None]                              # (B, N, 1)
+        third_component = np.zeros_like(asset_w_exp, dtype=np.float32) # (B, N, 1)
 
-        # TODO: replace daily_agent_return placeholder with real per-asset sub-portfolio return once available
-        daily_agent_return = np.zeros_like(asset_w, dtype=np.float32)  # (B,N)
+        # Final per-asset SAA obs: 29 market feats + 3 portfolio feats = 32
+        saa_obs = np.concatenate([saa_market_feats, cash_w_exp, asset_w_exp, third_component], axis=-1)  # (B, N, 32)
 
-        # Build per-asset SAA obs: [raw_features, cash_w, asset_w, daily_agent_return]
-        per_asset_obs = np.concatenate(
-            [
-                asset_feats.reshape(B, self.num_assets, self.raw_feat_dim),
-                cash_w_rep[..., None],
-                asset_w[..., None],
-                daily_agent_return[..., None],
-            ],
-            axis=-1,
-        ).reshape(B * self.num_assets, self.raw_feat_dim + 3)  # (B*N, F+3)
+        # Collect SAA signals per asset using distinct models/states
+        signals = []
+        for a in range(self.num_assets):
+            asset_obs = saa_obs[:, a, :]  # (B, 32)
+            per_asset_obs = asset_obs
+            if self.saa_vecnormalize is not None and hasattr(self.saa_vecnormalize, "obs_rms"):
+                rms = self.saa_vecnormalize.obs_rms
+                mean = torch.as_tensor(rms.mean, device=self.device, dtype=torch.float32)
+                var = torch.as_tensor(rms.var, device=self.device, dtype=torch.float32)
+                eps = 1e-8
+                per_asset_obs_t = torch.as_tensor(asset_obs, device=self.device, dtype=torch.float32)
+                per_asset_obs_t = (per_asset_obs_t - mean) / torch.sqrt(var + eps)
+                per_asset_obs = per_asset_obs_t.cpu().numpy()
 
-        # Apply VecNormalize stats if present (obs_rms only)
-        if self.saa_vecnormalize is not None and hasattr(self.saa_vecnormalize, "obs_rms"):
-            rms = self.saa_vecnormalize.obs_rms
-            mean = torch.as_tensor(rms.mean, device=self.device, dtype=torch.float32)
-            var = torch.as_tensor(rms.var, device=self.device, dtype=torch.float32)
-            eps = 1e-8
-            per_asset_obs_t = torch.as_tensor(per_asset_obs, device=self.device, dtype=torch.float32)
-            per_asset_obs_t = (per_asset_obs_t - mean) / torch.sqrt(var + eps)
-            per_asset_obs = per_asset_obs_t.cpu().numpy()
+            with torch.no_grad():
+                torch_obs = torch.as_tensor(per_asset_obs, device=self.device, dtype=torch.float32)
+                episode_start = torch.as_tensor(self.episode_start[a], device=self.device, dtype=torch.bool)
+                actions, state_out = self.saa_models[a].policy.predict(
+                    torch_obs,
+                    state=self.saa_states[a],
+                    episode_start=episode_start,
+                    deterministic=True,
+                )
+                self.saa_states[a] = state_out
 
-        # Recurrent predict: SAA 
-        with torch.no_grad():
-            torch_obs = torch.as_tensor(per_asset_obs, device=self.device, dtype=torch.float32)
-            episode_start = torch.as_tensor(self.episode_start, device=self.device, dtype=torch.bool)
-            actions, self.saa_state = self.saa_model.policy.predict(
-                torch_obs, 
-                state=self.saa_state, 
-                episode_start=episode_start, 
-                deterministic=True
-            )
+            actions_np = actions if isinstance(actions, np.ndarray) else actions.detach().cpu().numpy()
+            signals.append(actions_np[:, 0:1])  # (B, 1)
 
-        # actions can be np.ndarray or torch.Tensor; normalize to np
-        if isinstance(actions, np.ndarray):
-            actions_np = actions
-        else:
-            actions_np = actions.detach().cpu().numpy()
-        saa_sig = actions_np.reshape(B, self.num_assets, -1)
-        # Use the first action dimension as signal
-        saa_sig = saa_sig[..., 0:1]  # (B, N, 1)
+        saa_sig = np.stack(signals, axis=1)  # (B, N, 1)
 
         # Inject SAA signal into asset features
         augmented_assets = np.concatenate(
-            [
-                asset_feats.reshape(B, self.num_assets, self.raw_feat_dim),
-                saa_sig,
-            ],
+            [asset_feats, saa_sig],
             axis=-1,
-        ).reshape(B, -1)  # (B, N*(F+1))
+        ).reshape(B, -1)  # (B, N*(F+1)) => N*(31)
 
         return np.concatenate([augmented_assets, portfolio_part], axis=1)
     
@@ -1120,6 +1138,15 @@ class AttentionEngine(nn.Module):
         latent_vf = attended[:, -1, :]
 
         return latent_pi, latent_vf
+    
+    # SB3 expects these helpers (mirrors MlpExtractor API)
+    def forward_actor(self, features: torch.Tensor) -> torch.Tensor:
+        latent_pi, _ = self.forward(features)
+        return latent_pi
+
+    def forward_critic(self, features: torch.Tensor) -> torch.Tensor:
+        _, latent_vf = self.forward(features)
+        return latent_vf
 
 
 class TransformerAllocatorPolicy(ActorCriticPolicy):
@@ -1147,71 +1174,102 @@ class TransformerAllocatorPolicy(ActorCriticPolicy):
 
 class SAATokenizer(BaseFeaturesExtractor):
     def __init__(
-            self, 
-            observation_space: gym.Space, 
-            num_assets: int, 
-            raw_feat_dim: int, 
-            d_model: int, 
-            saa_model: Optional[Any] = None,           # preloaded, unused in forward
-            saa_vecnormalize: Optional[VecNormalize] = None,  # preloaded, unused in forward
-            saa_config: Optional[Dict[str, Any]] = None       # kept for compatibility
-        
-        ):
-        # Calculate final flattened output: (N_assets + 1) * d_model. The +1 is for the portfolio-level token.
-        total_features_dim = (num_assets + 1) * d_model
+        self,
+        observation_space: gym.Space,
+        num_assets: int,
+        raw_feat_dim: int,
+        d_model: int,
+        asset_feature_idx: Sequence[int],
+        portfolio_time_idx: Sequence[int],
+    ):
+        """
+        Builds asset and portfolio tokens from the augmented observation.
+
+        Observation (after SAASignalWrapper):
+            - Asset block: N * (raw_feat_dim + 1)  where +1 is the injected SAA signal
+            - Portfolio block: remaining dims (portfolio_dim)
+
+        Asset token:
+            selected asset features (len(asset_feature_idx)) + SAA signal (1) + asset_weight (1)
+            => expected size: len(asset_feature_idx) + 2 (should be 26 per rules)
+
+        Portfolio token:
+            time features (len(portfolio_time_idx)) taken from asset-0 raw features
+            + full portfolio block (portfolio_dim)
+            => size: len(portfolio_time_idx) + portfolio_dim
+        """
+        self.n_assets = num_assets
+        self.raw_feat_dim = raw_feat_dim                      # 30 (without SAA signal)
+        self.d_model = d_model
+        self.asset_feature_idx = list(asset_feature_idx)      # expected length 24
+        self.portfolio_time_idx = list(portfolio_time_idx)    # expected length 6
+
+        # Compute expected portfolio_dim from observation space
+        obs_len = observation_space.shape[0]
+        asset_block = self.n_assets * (self.raw_feat_dim + 1)  # +1 for SAA signal
+        if obs_len <= asset_block:
+            raise ValueError(f"Observation too small. obs_len={obs_len}, asset_block={asset_block}")
+        self.portfolio_dim = obs_len - asset_block             # expected 18
+
+        # Validate target sizes
+        asset_token_in_dim = len(self.asset_feature_idx) + 2   # + SAA signal + asset_weight
+        if asset_token_in_dim != 26:
+            raise ValueError(f"Asset token dim mismatch: got {asset_token_in_dim}, expected 26 "
+                             f"(len(asset_feature_idx)={len(self.asset_feature_idx)})")
+        portfolio_token_in_dim = len(self.portfolio_time_idx) + self.portfolio_dim
+        # Total features out = (N assets + 1 portfolio) * d_model
+        total_features_dim = (self.n_assets + 1) * d_model
         super().__init__(observation_space, features_dim=total_features_dim)
 
-        self.n_assets = num_assets
-        self.raw_feat_dim = raw_feat_dim
-        self.d_model = d_model
-        # self.saa_config = saa_config or {}
-        # self.saa_device = torch.device(self.saa_config.get("device", "cpu"))
-
-        # 1. Asset Token Embedding: Projects raw features + SAA return (1) + assets weight to d_model
-        self.asset_embedding = nn.Linear(raw_feat_dim + 1 + 1, d_model)  # +1 for SAA signal, +1 for asset weight
-
-        # 2. Portfolio Token Embedding
-        asset_block = num_assets * (raw_feat_dim + 1)  
-        self.portfolio_dimension = observation_space.shape[0] - asset_block
-        self.portfolio_embedding = nn.Linear(self.portfolio_dimension, d_model)
-
-    def _normalize_obs(self, obs: torch.Tensor) -> torch.Tensor:
-        # Normalize raw observations using the loaded VecNormalize stats
-        # This ensures the SAA model receives inputs in the same scale as during its training
-        # VecNormalize uses: (obs - mean) / sqrt(var + eps)
-        mean = torch.tensor(self.saa_vecnormalize.obs_rms.mean, device=self.saa_device)
-        var = torch.tensor(self.saa_vecnormalize.obs_rms.var, device=self.saa_device)
-        eps = 1e-8
-        normalized_obs = (obs - mean) / torch.sqrt(var + eps)
-        return normalized_obs
+        # Embeddings
+        self.asset_embedding = nn.Linear(asset_token_in_dim, d_model)
+        self.portfolio_embedding = nn.Linear(portfolio_token_in_dim, d_model)
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         """
-        Expects observations already augmented with SAA signal:
-        - asset part shape: [B, num_assets, raw_feat_dim + 1] (raw features + SAA signal)
-        - portfolio part shape: [B, portfolio_dim]
+        observations: (B, n_assets*(raw_feat_dim+1) + portfolio_dim)  == (B, 359)
+        Returns: flattened tokens (B, (n_assets+1)*d_model)
         """
         B = observations.shape[0]
-        asset_block = self.num_assets * (self.raw_feat_dim + 1)
-        asset_flat = observations[:, :asset_block]
-        portfolio_part = observations[:, asset_block:]
+        asset_block = self.n_assets * (self.raw_feat_dim + 1)
+        portfolio_block = observations[:, asset_block:]                    # (B, portfolio_dim)
+        asset_flat = observations[:, :asset_block]                         # (B, N*(F+1))
+        asset_feats_full = asset_flat.view(B, self.n_assets, self.raw_feat_dim + 1)  # (B, N, 31)
 
-        asset_feats = asset_flat.view(B, self.num_assets, self.raw_feat_dim + 1)  # (B, N, F+1)
-        raw_feats = asset_feats[:, :, : self.raw_feat_dim]                       # (B, N, F)
-        saa_signal = asset_feats[:, :, self.raw_feat_dim:].float()               # (B, N, 1)
+        # Split raw features and SAA signal
+        raw_feats = asset_feats_full[:, :, : self.raw_feat_dim]            # (B, N, 30)
+        saa_sig = asset_feats_full[:, :, self.raw_feat_dim : self.raw_feat_dim + 1]  # (B, N, 1)
 
-        # Portfolio weights: first entry cash, then per-asset
-        asset_weights = portfolio_part[:, 1:1 + self.num_assets].view(B, self.num_assets, 1)  # (B, N, 1)
+        # Select configured asset features
+        asset_feats_sel = raw_feats[:, :, self.asset_feature_idx]          # (B, N, len(idx))
+        if asset_feats_sel.shape[-1] != len(self.asset_feature_idx):
+            raise ValueError("Selected asset features shape mismatch")
 
-        # Token build: raw features + SAA signal + asset weight
-        token_inputs = torch.cat([raw_feats, saa_signal, asset_weights], dim=-1)  # (B, N, F+2)
-        asset_tokens = self.asset_embedding(token_inputs)                        # (B, N, d_model)
+        # Asset weights from portfolio block: weights are first (N+1): cash + N assets
+        asset_weights = portfolio_block[:, 1 : 1 + self.n_assets].unsqueeze(-1)  # (B, N, 1)
+        if asset_weights.shape[1] != self.n_assets:
+            raise ValueError("Asset weights shape mismatch")
 
-        # Portfolio token
-        portfolio_token = self.portfolio_embedding(portfolio_part).unsqueeze(1)    # (B,1,d_model)
-        full_sequence = torch.cat([portfolio_token, asset_tokens], dim=1)          # (B, N+1, d_model)
+        # Build asset tokens: selected feats + SAA signal + asset_weight
+        asset_token_inputs = torch.cat([asset_feats_sel, saa_sig, asset_weights], dim=-1)  # (B, N, 26)
+        if asset_token_inputs.shape[-1] != 26:
+            raise ValueError(f"Asset token final dim mismatch: {asset_token_inputs.shape}")
 
-        return full_sequence.flatten(start_dim=1)  # (B, (N+1)*d_model)
+        asset_tokens = self.asset_embedding(asset_token_inputs)            # (B, N, d_model)
+
+        # Portfolio token: time features (from asset 0 raw feats) + full portfolio block
+        time_feats = raw_feats[:, 0, self.portfolio_time_idx]              # (B, len(portfolio_time_idx))
+        if time_feats.shape[-1] != len(self.portfolio_time_idx):
+            raise ValueError("Portfolio time features shape mismatch")
+
+        portfolio_token_input = torch.cat([time_feats, portfolio_block], dim=-1)  # (B, len(time_idx)+portfolio_dim)
+        if portfolio_token_input.shape[-1] != (len(self.portfolio_time_idx) + self.portfolio_dim):
+            raise ValueError("Portfolio token dim mismatch")
+        portfolio_token = self.portfolio_embedding(portfolio_token_input).unsqueeze(1)  # (B,1,d_model)
+
+        # Stitch tokens: [portfolio_token, asset_tokens]
+        full_sequence = torch.cat([portfolio_token, asset_tokens], dim=1)  # (B, N+1, d_model)
+        return full_sequence.flatten(start_dim=1)     
 
 
 # Utility function to load SAA model and VecNormalize stats from config
@@ -1262,11 +1320,10 @@ def _load_saa_from_config(saa_config: Dict[str, Any]) -> Tuple[Any, Optional[Vec
 def build_allocator_model(
     env: gym.Env,
     config: Dict[str, Any],
-    saa_model: Any,
-    saa_vecnormalize: Optional[VecNormalize],
-    saa_device: torch.device,
     num_assets: int,
-    raw_feature_dim: int
+    raw_feature_dim: int,
+    paa_asset_token_idx: List[int],
+    paa_portfolio_token_idx: List[int]
 ) -> PPO:
     """
     Instantiate PPO model 
@@ -1306,7 +1363,6 @@ def build_allocator_model(
     
     # --- Extract agent configuration section ---
     agent_cfg = config.get("portfolio_allocator_agent", {})
-    saa_config = config.get("saa_config", {})
     transformer_cfg = config.get("allocator_transformer", {})
     
     # --- Learning Rate Schedule ---
@@ -1356,22 +1412,15 @@ def build_allocator_model(
             num_assets=num_assets, 
             raw_feat_dim=raw_feature_dim, # ONLY raw market features without SAA signal or weights, since those are handled inside the tokenizer
             d_model=transformer_cfg.get("d_model", 128),
-            saa_model=saa_model,
-            saa_vecnormalize=saa_vecnormalize,
-            saa_config=saa_config
+            asset_feature_idx=paa_asset_token_idx,
+            portfolio_time_idx=paa_portfolio_token_idx
         ),
-        # mlp_extractor_class=AttentionEngine,
-        # mlp_extractor_kwargs=dict(
-        #     d_model=transformer_cfg.get("d_model", 128),
-        #     n_heads=transformer_cfg.get("n_heads", 4),
-        #     n_layers=transformer_cfg.get("n_layers", 2),
-        #     activation_fn=nn.ReLU
-        # ),
         net_arch=dict(pi=[], vf=[])  # No additional MLP layers after attention; all processing in attention engine! Vital!           
     )
 
-    # Environment wrapper to handle stateful SAA signal injection
-    wrapped_env = SAASignalWrapper(env, saa_model, saa_vecnormalize, num_assets, raw_feature_dim, saa_device)
+    # # Environment wrapper to handle stateful SAA signal injection
+    """ENV already wrapped in run() with SAASignalWrapper, so we can pass it directly to PPO."""
+    # wrapped_env = SAASignalWrapper(env, saa_model, saa_vecnormalize, num_assets, raw_feature_dim, saa_device)
     
     # --- Core PPO Hyperparameters ---
     # Rollout buffer size: number of steps to collect before update
@@ -1437,7 +1486,7 @@ def build_allocator_model(
     # Uses standard PPO (not RecurrentPPO). Tokens of transformer are assets/portfolio
     model = PPO(
         policy=TransformerAllocatorPolicy,  # Placeholder, actual architecture defined in policy_kwargs
-        env=wrapped_env,  # Use the wrapped environment that injects stateful SAA signal
+        env=env,  # env wrapped for saa signal injection in run()
         policy_kwargs=dict(
             **policy_kwargs,
             n_assets=num_assets,
@@ -1618,6 +1667,10 @@ def run(cache: MarketDataCache, config: Dict[str, Any]) -> Dict[str, Any]:
     saa_config = config.get("saa_config", {})
     num_assets = cache.num_assets
     raw_feature_dim = cache.num_features
+    portfolio_features = config.get("portfolio_features", {})
+    if portfolio_features:
+        num_portfolio_features = sum(1 for f, on in portfolio_features.items() if on)
+
     
     # Load frozen SAA once
     saa_model, saa_vecnorm, saa_device = _load_saa_from_config(saa_config)
@@ -1635,6 +1688,22 @@ def run(cache: MarketDataCache, config: Dict[str, Any]) -> Dict[str, Any]:
     vec_train = DummyVecEnv([make_env("train")])
     vec_eval = DummyVecEnv([make_env("validation")])
 
+    # Create and validate feature index lists for SAA signal and PAA token construction
+    saa_idx = [cache.feature_to_index[f] for f, on in config["saa_features"].items() if on]
+    saa_market_data_feat_length = len(saa_idx)
+    if saa_market_data_feat_length == 0:
+        raise ValueError("No SAA features enabled in config['saa_features']. At least one feature must be enabled for SAA signal generation.")
+    
+    paa_asset_token_idx = [cache.feature_to_index[f] for f, on in config["paa_asset_token_features"].items() if on]
+    paa_asset_token_market_data_feat_length = len(paa_asset_token_idx)
+    if paa_asset_token_market_data_feat_length == 0:
+        raise ValueError("No asset token features enabled in config['paa_asset_token_features']. At least one feature must be enabled for asset token construction.")
+    
+    paa_portfolio_token_idx = [cache.feature_to_index[f] for f, on in config["paa_portfolio_token_features"].items() if on]
+    paa_portfolio_token_market_data_feat_length = len(paa_portfolio_token_idx)
+    if paa_portfolio_token_market_data_feat_length == 0:
+        raise ValueError("No portfolio token features enabled in config['paa_portfolio_token_features']. At least one feature must be enabled for portfolio token construction.")
+    
     # Infer per-asset dim from the env observation space (unwrapped)
     sample_space = vec_train.observation_space
     obs_len = sample_space.shape[0]
@@ -1644,12 +1713,16 @@ def run(cache: MarketDataCache, config: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError(
             f"Cannot infer per-asset dim: obs_len={obs_len}, num_assets={num_assets}, portfolio_dim={portfolio_dim}"
         )
-    raw_feat_dim = asset_block // num_assets
-
 
     # Wrap envs with SAA signal injection
-    vec_train = SAASignalWrapper(vec_train, saa_model, saa_vecnorm, num_assets, raw_feat_dim, saa_device)
-    vec_eval = SAASignalWrapper(vec_eval, saa_model, saa_vecnorm, num_assets, raw_feat_dim, saa_device)
+    vec_train = SAASignalWrapper(
+        vec_train, saa_model, saa_vecnorm, num_assets, saa_device, config=config, 
+        feature_to_index=cache.feature_to_index
+        )
+    vec_eval = SAASignalWrapper(
+        vec_eval, saa_model, saa_vecnorm, num_assets, saa_device, config=config, 
+        feature_to_index=cache.feature_to_index
+        )
     print("[run] Environments built successfully")
 
 
@@ -1660,11 +1733,10 @@ def run(cache: MarketDataCache, config: Dict[str, Any]) -> Dict[str, Any]:
     model = build_allocator_model(
         env=vec_train, 
         config=config,
-        saa_model=saa_model,
-        saa_vecnormalize=saa_vecnorm,
-        saa_device=saa_device,
         num_assets=num_assets,
-        raw_feature_dim=raw_feature_dim
+        raw_feature_dim=raw_feature_dim,
+        paa_asset_token_idx=paa_asset_token_idx,
+        paa_portfolio_token_idx=paa_portfolio_token_idx
     )
 
     print("[run] PPO allocator model built successfully")

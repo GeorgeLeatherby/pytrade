@@ -3,7 +3,7 @@ import pandas as pd
 import pytest
 import inspect
 from datetime import datetime, timedelta
-from environment.trading_env import MarketDataCache, TradingEnv
+from obsolete.trading_env import MarketDataCache, TradingEnv
 
 # ---------------------------
 # Configuration & Data Setup
@@ -332,6 +332,6 @@ def test_ohlcv_lookback_shape(market_cache_single):
 # Known Issues / Code Hygiene
 # ---------------------------
 def test_duplicate_transaction_cost_function_definition():
-    import environment.trading_env as te
+    import obsolete.trading_env as te
     source = inspect.getsource(te.TradingEnv)
     assert source.count("def _calculate_transaction_costs(") == 2
