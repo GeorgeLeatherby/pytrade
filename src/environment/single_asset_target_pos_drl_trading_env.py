@@ -1365,7 +1365,7 @@ class TradingEnv(gym.Env):
         
         # Configuration parameters
         self.episode_length_days = config["environment"]["episode_length_days"]
-        self.max_reward_risk_window = int(min(self.episode_length_days // 4, 50))
+        self.max_reward_risk_window = int(min(self.episode_length_days // 2, 63))
         self.lookback_window = config["environment"]["lookback_window"]
         self.initial_portfolio_value = config["environment"]["initial_portfolio_value"]
         self.early_stopping_threshold = config["environment"]["early_stopping_threshold"]
@@ -1489,7 +1489,7 @@ class TradingEnv(gym.Env):
         elif self.execution_mode == EXECUTION_PORTFOLIO_WEIGHTS:
             # ------ Action space: Continuous weights for each asset + cash (sum to 1) ------
             self.action_space = spaces.Box(
-                low=0.0, high=1.0, shape=(num_assets + 1,), dtype=np.float32
+                low=-10.0, high=10.0, shape=(num_assets + 1,), dtype=np.float32
             )
         else:
             # Simple/Tranche modes: action is a list of instructions; Gym does not have a list space.
@@ -2080,23 +2080,32 @@ class TradingEnv(gym.Env):
             if len(raw_action) != self.market_data_cache.num_assets + 1:
                 raise ValueError(f"Action length must be {self.market_data_cache.num_assets + 1}, got {len(raw_action)}")
 
-            # Environment-side normalization (requested architecture):
-            # w = a_raw / sum(a_raw), with epsilon handling.
-            # We clip to [0, 1] for numerical safety if exploration noise drifts.
-            a_raw = np.clip(raw_action, 0.0, 1.0)
-            raw_sum = float(np.sum(a_raw))
-            eps = 1e-8
-            if raw_sum <= eps:
-                # Fallback when policy emits near-zero vector: stay fully in cash.
-                w = np.zeros_like(a_raw, dtype=np.float32)
-                w[0] = 1.0
-            else:
-                w = (a_raw / (raw_sum + eps)).astype(np.float32)
+            # # Environment-side normalization (requested architecture):
+            # # w = a_raw / sum(a_raw), with epsilon handling.
+            # # We clip to [0, 1] for numerical safety if exploration noise drifts.
+            # a_raw = np.clip(raw_action, 0.0, 1.0)
+            # raw_sum = float(np.sum(a_raw))
+            # eps = 1e-8
+            # if raw_sum <= eps:
+            #     # Fallback when policy emits near-zero vector: stay fully in cash.
+            #     w = np.zeros_like(a_raw, dtype=np.float32)
+            #     w[0] = 1.0
+            # else:
+            #     w = (a_raw / (raw_sum + eps)).astype(np.float32)
 
-            # Keep exact simplex numerically stable for execution engine.
-            w = np.clip(w, 0.0, 1.0)
-            w = w / np.maximum(np.sum(w), eps)
-            weight_change_target = w
+            # # Keep exact simplex numerically stable for execution engine.
+            # w = np.clip(w, 0.0, 1.0)
+            # w = w / np.maximum(np.sum(w), eps)
+
+
+            # Softmax logits directly from raw action for stable simplex projection and more stable gradients.
+            logits = np.asarray(action, dtype=np.float32)
+            # single softmax to obtain valid weights (cash + assets sum to 1)
+            exp_logits = np.exp(logits - np.max(logits))
+            weights = exp_logits / np.sum(exp_logits)
+
+            # legacy, dont know exactly, didnt bother
+            weight_change_target = weights
 
             # Diagnostics
             raw_logits_mean = float(np.mean(raw_action))
@@ -2107,12 +2116,11 @@ class TradingEnv(gym.Env):
             softmax_temp    = float(np.sqrt(softmax_var) + 1e-8)  # indicative temperature
 
             # Allocation entropy from normalized executed weights
-            diagnostic_entropy = float(-np.sum(w * np.log(np.clip(w, 1e-8, 1.0))))                
+            diagnostic_entropy = float(-np.sum(weights * np.log(np.clip(weights, 1e-8, 1.0))))                
 
-            # Placeholder for future EXECUTOR logic ----------------------
-            # NOTE: Will be replaced by EXECUTOR in future
+            # Execution ----------------------
             execution_result = self.execute_portfolio_change(
-                target_weights=w,
+                target_weights=weights,
                 portfolio_state=self.portfolio_state
             )
 
@@ -2308,6 +2316,11 @@ class TradingEnv(gym.Env):
         else:
             effective_asset_concentration_norm = float(1.0 / sum_sq) /  float(len(current_weights_after_execution[1:]))
 
+        # Get all available portfolio values of episode
+        window = min(20, self.current_step)  # use up to 20 most recent returns
+        returns_window = self.episode_buffer.get_returns_window(window)
+        step_volatility = float(np.std(returns_window)) if len(returns_window) > 1 else 0.0
+
         # FIX: Set external step to current step (already incremented)
         external_step = self.current_step  # zero-based index for buffer, is called first time at reset!
 
@@ -2326,9 +2339,9 @@ class TradingEnv(gym.Env):
             transaction_cost=float(execution_result.transaction_cost),
             prices=new_prices.copy(),
             sharpe_ratio=reward_parts.get("sharpe_ratio", 0.0),
-            drawdown=reward_parts.get("max_drawdown", 0.0),
-            volatility=reward_parts.get("volatility", 0.0),
-            turnover=reward_parts.get("turnover_component", 0.0),
+            drawdown=reward_parts.get("max_drawdown_delta", 0.0),
+            volatility=step_volatility,
+            turnover=reward_parts.get("turnover", 0.0),
             alpha=reward_parts.get("raw_alpha", 0.0),
             traded_dollar_volume=float(execution_result.traded_dollar_value),
             traded_shares_total=float(execution_result.traded_shares_total),
@@ -2657,8 +2670,6 @@ class TradingEnv(gym.Env):
             ) -> Tuple[float, Dict[str, float]]:
         """
 
-        NOTE: This reward calculator currently ONLY feedbacks the Differential SORTINO RATIO!
-
         Calculate the allocator reward for this step. Its a combined metric of:
         - alpha over benchmark 
         - risk_features: sharpe-ratio, drawdown, volatility
@@ -2672,6 +2683,7 @@ class TradingEnv(gym.Env):
             action: Target portfolio weights [num_assets + 1] including cash
         Returns:
             Scalar reward value for this step
+            Reward_parts: Dict of individual reward components for diagnostics
         """
 
         # Calculate basic returns
@@ -2691,15 +2703,6 @@ class TradingEnv(gym.Env):
         # 1. Update EMAs
         delta = portfolio_return_absolut - self.running_mean_ema
         self.running_mean_ema += self.sortino_eta * delta
-
-        # downside_sq_ema = portfolio_return_absolut**2 if portfolio_return_absolut < 0 else 0
-        # downside = max(downside_sq_ema, 1e-8)  # avoid zero downside
-        # delta_downside = downside - self.running_downside_variance_ema
-        # self.running_downside_variance_ema += self.sortino_eta * delta_downside
-
-        # # 2. Calc real-time Sortino
-        # epsilon = 1e-8  # small constant to avoid division by zero
-        # current_sortino = self.running_mean_ema / np.sqrt(self.running_downside_variance_ema + epsilon)
 
         # Alternative: use squared downside returns
         downside_sq = (min(portfolio_return_absolut, 0.0))**2
@@ -2728,25 +2731,25 @@ class TradingEnv(gym.Env):
         self.previous_max_drawdown = max_drawdown
         max_drawdown_penalty = float(self.lambda_drawdown * max_drawdown_delta)
 
-        # 4. Mix in raw return & windowed drawdown penalty
+        # 4. Mix in raw return & windowed drawdown level penalty
 
         first_reward = (self.sortino_net_reward_mix * sortino_reward + 
                   (1 - self.sortino_net_reward_mix) * portfolio_return_absolut) - max_drawdown_penalty
         reward = first_reward
 
-        # 4b. Concentration term on executed normalized weights.
-        # action is expected to be the already-normalized execution target w.
-        concentration_pen = 0.0
-        if action is not None:
-            w_exec = np.asarray(action, dtype=np.float32)
-            if w_exec.ndim == 1 and w_exec.size == (self.market_data_cache.num_assets + 1):
-                w_exec = np.clip(w_exec, 0.0, 1.0)
-                w_exec = w_exec / np.maximum(np.sum(w_exec), 1e-8)
-                concentration_pen = float(
-                    -self.lambda_spread * np.sum(w_exec * np.log(w_exec + 1e-8))
-                )
-                second_reward = concentration_pen + first_reward
-                reward = second_reward
+        # # 4b. Concentration term on executed normalized weights.
+        # # action is expected to be the already-normalized execution target w.
+        # concentration_pen = 0.0
+        # if action is not None:
+        #     w_exec = np.asarray(action, dtype=np.float32)
+        #     if w_exec.ndim == 1 and w_exec.size == (self.market_data_cache.num_assets + 1):
+        #         w_exec = np.clip(w_exec, 0.0, 1.0)
+        #         w_exec = w_exec / np.maximum(np.sum(w_exec), 1e-8)
+        #         concentration_pen = float(
+        #             -self.lambda_spread * np.sum(w_exec * np.log(w_exec + 1e-8))
+        #         )
+        #         second_reward = concentration_pen + first_reward
+        #         reward = second_reward
 
         # 4c. Transaction cost penalty (scaled by lambda_cost)
         transaction_cost_level = 0.0001*self.initial_portfolio_value
@@ -2755,9 +2758,9 @@ class TradingEnv(gym.Env):
             third_reward = reward - trans_act_pen
             reward = third_reward
 
-        # 5. Clip and amplify reward
-        gain = float(3.5)
-        reward = float(np.tanh(gain * reward))
+        # # 5. Clip and amplify reward
+        # gain = float(3.5)
+        # reward = float(np.tanh(gain * reward))
 
         # Track Sortino internals for episode-level stats
         if not hasattr(self, "_sortino_mean_hist"):
@@ -2766,89 +2769,71 @@ class TradingEnv(gym.Env):
         self._sortino_down_hist.append(float(self.running_downside_variance_ema))
         self._sortino_raw_hist.append(float(reward))
 
-        # # START OF OLD REWARD CALCULATION LOGIC
-        # # ============================================
-        # # 1. ALPHA CALCULATION (PRIMARY SIGNAL)
-        # # ============================================
+        # START OF OLD REWARD CALCULATION LOGIC: Metrics are needed to fill episode buffer portfolio metrics
+        # ============================================
+        # 1. ALPHA CALCULATION (PRIMARY SIGNAL)
+        # ============================================
 
-        # alpha = (portfolio_return - benchmark_return)  # daily alpha
-        # portfolio_return = portfolio_return - 1.0  # daily portfolio return
+        alpha = (portfolio_return - benchmark_return)  # daily alpha
+        portfolio_return = portfolio_return - 1.0  # daily portfolio return
         
-        # # ============================================
-        # # 2. RISK-ADJUSTED PERFORMANCE METRICS
-        # # ============================================
-        # risk_adjustment = 0.0
+        # ============================================
+        # 2. RISK-ADJUSTED PERFORMANCE METRICS
+        # ============================================
+        risk_adjustment = 0.0
 
-        # # Use episode buffer's efficient methods
-        # sharpe_ratio = self.episode_buffer.calculate_sharpe_ratio(
-        #     window=risk_metric_window
-        # )
+        # Use episode buffer's efficient methods
+        sharpe_ratio = self.episode_buffer.calculate_sharpe_ratio(
+            window=risk_metric_window
+        )
         
-        # # Get recent returns for volatility
-        # recent_returns = self.episode_buffer.get_returns_window(
-        #     window=risk_metric_window
-        # )
-        # volatility = np.std(recent_returns) * np.sqrt(252) if len(recent_returns) > 1 else 0.0  # Annualized
+        # Get recent returns for volatility
+        recent_returns = self.episode_buffer.get_returns_window(
+            window=risk_metric_window
+        )
+        volatility = np.std(recent_returns) * np.sqrt(252) if len(recent_returns) > 1 else 0.0  # Annualized
         
-        # # Risk adjustment components
-        # sharpe_bonus = np.tanh(sharpe_ratio/ 1.5) * 0.01        # Bounded bonus for good Sharpe
-        # drawdown_penalty = max_drawdown * 0.025                  # Penalty for large drawdowns
-        # volatility_penalty = max(0, volatility - 0.25) * 0.025   # Penalty only if vol > 25%
+        # Risk adjustment components
+        sharpe_bonus = np.tanh(sharpe_ratio/ 1.5) * 0.01        # Bounded bonus for good Sharpe
+        drawdown_penalty = max_drawdown * 0.025                  # Penalty for large drawdowns
+        volatility_penalty = max(0, volatility - 0.25) * 0.025   # Penalty only if vol > 25%
         
-        # risk_adjustment = sharpe_bonus - drawdown_penalty - volatility_penalty
+        risk_adjustment = sharpe_bonus - drawdown_penalty - volatility_penalty
         
-        # # ============================================
-        # # 3. TRANSACTION COST PENALTY
-        # # ============================================
-        # cost_penalty = 0.0
-        # if execution_result.transaction_cost > 0:
-        #     raw_cost_ratio = execution_result.transaction_cost / portfolio_before if portfolio_before > 0 else 0.0
-        #     cost_penalty = 2.0 * min(raw_cost_ratio, 0.05) # Cap penalty at 5% cost ratio
+        # ============================================
+        # 3. TRANSACTION COST PENALTY
+        # ============================================
+        cost_penalty = 0.0
+        if execution_result.transaction_cost > 0:
+            raw_cost_ratio = execution_result.transaction_cost / portfolio_before if portfolio_before > 0 else 0.0
+            cost_penalty = 2.0 * min(raw_cost_ratio, 0.05) # Cap penalty at 5% cost ratio
         
-        # # ============================================
-        # # 4. TURNOVER PENALTY (IMPROVED)
-        # # ============================================
-        # current_weights = self.portfolio_state.get_weights()
-        # if self.current_step > 0:
-        #     if self.maybe_provide_sequence:
-        #         prev_w = self.episode_buffer.portfolio_weights[
-        #             self.episode_buffer.lookback_window + self.current_step -1]
-        #     else:
-        #         prev_w = self.episode_buffer.portfolio_weights[
-        #             self.current_step -1]
-        #     turnover = float(np.sum(np.abs(current_weights[1:] - prev_w[1:])))
-        # else:
-        #     turnover = 0.0
-        # turnover_penalty = 0.01 * max(0.0, turnover - 0.2)**2  # quadratic beyond 20%
-        
-        # # ============================================
-        # # 5. POSITION CONCENTRATION PENALTY
-        # # ============================================
-        # # Concentration (Herfindahl index)
-        # asset_w = current_weights[1:]
-        # herfindahl = float(np.sum(asset_w**2))
-        # h_threshold = 1.0 / max(1, len(asset_w)) * 5  # allow up to 5x uniform concentration before penalty
-        # concentration_penalty = 0.4 * max(0.0, herfindahl - h_threshold)
-        # # Cash penalty (to avoid excessive cash holdings) starting linearly at 20% cash holdings
-        # cash_w = current_weights[0]
-        # cash_penalty = 0.9 * max(0.0, cash_w - 0.20)
-        # concentration_penalty += cash_penalty
+        # ============================================
+        # 4. TURNOVER 
+        # ============================================
+        current_weights = self.portfolio_state.get_weights()
+        if self.current_step > 0:
+            if self.maybe_provide_sequence:
+                prev_w = self.episode_buffer.portfolio_weights[self.episode_buffer.lookback_window + self.current_step - 1]
+            else:
+                prev_w = self.episode_buffer.portfolio_weights[self.current_step - 1]
+            # Classic turnover: sum of absolute changes in asset weights (excluding cash)
+            turnover = float(np.sum(np.abs(current_weights[1:] - prev_w[1:]))) / 2.0
+        else:
+            turnover = 0.0
+        # Normalize to [0, 1]: cap at 1.0 (max possible turnover is 2.0, div by 2 gives max 1.0)
+        turnover = float(np.clip(turnover, 0.0, 1.0))
 
-        # # Small survival bonus
-        # # survival_bonus = min(max(0, (0.00005 * (self.current_step - self.episode_length_days/2))), 0.002) # bounded bonus starting at surviving over half the episode length
-        # survival_bonus = 0.0 # test for reducing noise
+        # ============================================
+        # 7. COMBINE ALL COMPONENTS WITH PROPER WEIGHTS
+        # ============================================
+        # factors to scale components
+        alpha_factor = 0.0
+        portfolio_return_factor = 2.0
+        risk_adjustment_factor = 1.0
+        cost_penalty_factor = 0.0
 
-        # # ============================================
-        # # 7. COMBINE ALL COMPONENTS WITH PROPER WEIGHTS
-        # # ============================================
-        # # factors to scale components
-        # alpha_factor = 0.0
-        # portfolio_return_factor = 2.0
-        # risk_adjustment_factor = 1.0
-        # cost_penalty_factor = 0.0
-        # turnover_penalty_factor = 0.0
-        # concentration_penalty_factor = 1.0
-
+        # Old disfunctional reward combination (too noisy, hard to tune, not effective)
         # reward = (
         #     alpha * alpha_factor +                    # Primary objective: alpha generation (scaled up)
         #     portfolio_return * portfolio_return_factor +          # Also reward general portfolio return
@@ -2859,36 +2844,34 @@ class TradingEnv(gym.Env):
         #     + survival_bonus                  # Small survival bonus
         # )
 
-        # If you want to skip detailed sub-component calculations, create minimal parts dict
-        parts = {
-            "alpha_component": 0.0,
-            "risk_component": 0.0,
-            "portfolio_return_component": 0.0,
-            "cost_component": 0.0,
-            "turnover_component": 0.0,
-            "concentration_component": concentration_pen,
-            "survival_component": 0.0,
-            "raw_alpha": 0.0,
-            "raw_portfolio_return": 0.0,
-            "raw_benchmark_return": 0.0,
-            "sharpe_ratio": 0.0,
-            "max_drawdown": 0.0
-        }
-
+        # # If you want to skip detailed sub-component calculations, create minimal parts dict
         # parts = {
-        #     "alpha_component": alpha * alpha_factor,
-        #     "risk_component": risk_adjustment * risk_adjustment_factor,
-        #     "portfolio_return_component": portfolio_return * portfolio_return_factor,
-        #     "cost_component": -cost_penalty * cost_penalty_factor,
-        #     "turnover_component": -turnover_penalty * turnover_penalty_factor,
-        #     "concentration_component": -concentration_penalty * concentration_penalty_factor,
-        #     "survival_component": survival_bonus,
-        #     "raw_alpha": alpha,
-        #     "raw_portfolio_return": portfolio_return,
-        #     "raw_benchmark_return": benchmark_return,
-        #     "sharpe_ratio": sharpe_ratio,
-        #     "max_drawdown": max_drawdown
+        #     "alpha_component": 0.0,
+        #     "risk_component": 0.0,
+        #     "portfolio_return_component": 0.0,
+        #     "cost_component": 0.0,
+        #     "turnover_component": 0.0,
+        #     "concentration_component": concentration_penalty,
+        #     "survival_component": 0.0,
+        #     "raw_alpha": 0.0,
+        #     "raw_portfolio_return": 0.0,
+        #     "raw_benchmark_return": 0.0,
+        #     "sharpe_ratio": 0.0,
+        #     "max_drawdown": 0.0
         # }
+
+        parts = {
+            "alpha_component": alpha * alpha_factor,
+            "risk_component": risk_adjustment * risk_adjustment_factor,
+            "portfolio_return_component": portfolio_return * portfolio_return_factor,
+            "cost_component": -cost_penalty * cost_penalty_factor,
+            "turnover": turnover,
+            "raw_alpha": alpha,
+            "raw_portfolio_return": portfolio_return,
+            "raw_benchmark_return": benchmark_return,
+            "sharpe_ratio": sharpe_ratio,
+            "max_drawdown_delta": max_drawdown_delta
+        }
 
         return float(reward), parts
 
@@ -2907,15 +2890,6 @@ class TradingEnv(gym.Env):
         # 1. Update EMAs
         saa_delta = saa_portfolio_return_absolut - self.saa_running_mean_ema
         self.saa_running_mean_ema += self.sortino_eta * saa_delta
-
-        # downside_sq_ema = portfolio_return_absolut**2 if portfolio_return_absolut < 0 else 0
-        # downside = max(downside_sq_ema, 1e-8)  # avoid zero downside
-        # delta_downside = downside - self.running_downside_variance_ema
-        # self.running_downside_variance_ema += self.sortino_eta * delta_downside
-
-        # # 2. Calc real-time Sortino
-        # epsilon = 1e-8  # small constant to avoid division by zero
-        # current_sortino = self.running_mean_ema / np.sqrt(self.running_downside_variance_ema + epsilon)
 
         # Alternative: use squared downside returns
         saa_downside_sq = (min(saa_portfolio_return_absolut, 0.0))**2
@@ -2953,7 +2927,7 @@ class TradingEnv(gym.Env):
         gain = float(3.5)
         saa_reward = float(np.tanh(gain * reward))
 
-        # NOTE: Not quite sure what this gets used for. Maybe needs actual vals instead of simple 0.0 placeholders?
+        # NOTE: Several values here get used to fill portfolio wide metrics in the episode buffer.
         saa_reward_parts = {
             "alpha_component": 0.0,
             "risk_component": 0.0,

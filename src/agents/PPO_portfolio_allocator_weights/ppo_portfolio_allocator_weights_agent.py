@@ -788,6 +788,11 @@ class AllocatorEvalCallback(BaseCallback):
                     best_model_path = os.path.join(self.best_model_save_path, "best_model")
                     self.model.save(best_model_path)
                     
+                    # Save VecNormalize statistics
+                    if isinstance(self.eval_env, VecNormalize):
+                        vecnorm_path = os.path.join(self.best_model_save_path, "vecnormalize_stats.pkl")
+                        self.eval_env.save(vecnorm_path)
+
                     if self.verbose > 0:
                         print(f"[AllocatorEvalCallback] Saved best model to: {best_model_path}")
         
@@ -1099,7 +1104,7 @@ class SAASignalWrapper(VecEnvWrapper):
     
 
 class AttentionEngine(nn.Module):
-    def __init__(self, feature_dim: int, n_assets: int, d_model: int, n_heads: int, n_layers: int):
+    def __init__(self, feature_dim: int, n_assets: int, d_model: int, n_heads: int, n_layers: int, dim_feedforward: int):
         super().__init__()
         self.n_assets = n_assets
         self.d_model = d_model
@@ -1108,7 +1113,7 @@ class AttentionEngine(nn.Module):
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=n_heads,
-            dim_feedforward=d_model * 4,  # Common choice for feedforward dimension
+            dim_feedforward=dim_feedforward,  # Use provided feedforward dimension
             batch_first=True  # Use batch_first for easier integration with SB3
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
@@ -1154,11 +1159,12 @@ class TransformerAllocatorPolicy(ActorCriticPolicy):
     Custom policy that swaps the default MlpExtractor with AttentionEngine.
     Expects features_dim = (n_assets + 1) * d_model from the tokenizer.
     """
-    def __init__(self, observation_space, action_space, lr_schedule, n_assets, d_model, n_heads, n_layers, **kwargs):
+    def __init__(self, observation_space, action_space, lr_schedule, n_assets, d_model, n_heads, n_layers, dim_feedforward,**kwargs):
         self._n_assets = n_assets
         self._d_model = d_model
         self._n_heads = n_heads
         self._n_layers = n_layers
+        self._dim_feedforward = dim_feedforward
         super().__init__(observation_space, action_space, lr_schedule, **kwargs)
 
     def _build_mlp_extractor(self) -> None:
@@ -1168,7 +1174,8 @@ class TransformerAllocatorPolicy(ActorCriticPolicy):
             n_assets=self._n_assets,
             d_model=self._d_model,
             n_heads=self._n_heads,
-            n_layers=self._n_layers
+            n_layers=self._n_layers,
+            dim_feedforward=self._dim_feedforward
         )
 
 
@@ -1364,6 +1371,9 @@ def build_allocator_model(
     # --- Extract agent configuration section ---
     agent_cfg = config.get("portfolio_allocator_agent", {})
     transformer_cfg = config.get("allocator_transformer", {})
+    pi_mpl_hidden_dims = transformer_cfg.get("pi_mpl_hidden_dims", [128, 64])
+    vf_mpl_hidden_dims = transformer_cfg.get("vf_mpl_hidden_dims", [128, 64])
+    log_std_init = agent_cfg.get("log_std_init", -3.0)  # Initial log std for action distribution (tune for exploration)
     
     # --- Learning Rate Schedule ---
     # Extract LR schedule parameters
@@ -1415,7 +1425,8 @@ def build_allocator_model(
             asset_feature_idx=paa_asset_token_idx,
             portfolio_time_idx=paa_portfolio_token_idx
         ),
-        net_arch=dict(pi=[], vf=[])  # No additional MLP layers after attention; all processing in attention engine! Vital!           
+        net_arch=dict(pi=pi_mpl_hidden_dims, vf=vf_mpl_hidden_dims),  # No additional MLP layers after attention; all processing in attention engine! Vital!           
+        log_std_init=log_std_init # Initial log std for action distribution (can be tuned for exploration)
     )
 
     # # Environment wrapper to handle stateful SAA signal injection
@@ -1492,7 +1503,8 @@ def build_allocator_model(
             n_assets=num_assets,
             d_model=transformer_cfg.get("d_model", 128),
             n_heads=transformer_cfg.get("n_heads", 8),
-            n_layers=transformer_cfg.get("n_layers", 4)
+            n_layers=transformer_cfg.get("n_layers", 4),
+            dim_feedforward=transformer_cfg.get("dim_feedforward", 256)
         ),
         
         # Optimization hyperparameters
@@ -1662,15 +1674,12 @@ def run(cache: MarketDataCache, config: Dict[str, Any]) -> Dict[str, Any]:
     seed = int(config.get("training", {}).get("seed", 42))
     np.random.seed(seed)
     torch.manual_seed(seed)
+
     # Extract gamma for VecNormalize reward normalization
     gamma_cfg = config.get("portfolio_allocator_agent", {}).get("gamma", 0.99)
     saa_config = config.get("saa_config", {})
     num_assets = cache.num_assets
     raw_feature_dim = cache.num_features
-    portfolio_features = config.get("portfolio_features", {})
-    if portfolio_features:
-        num_portfolio_features = sum(1 for f, on in portfolio_features.items() if on)
-
     
     # Load frozen SAA once
     saa_model, saa_vecnorm, saa_device = _load_saa_from_config(saa_config)
@@ -1684,9 +1693,39 @@ def run(cache: MarketDataCache, config: Dict[str, Any]) -> Dict[str, Any]:
             mode=mode
         )
     
-    # Create vectorized environments for training and evaluation
-    vec_train = DummyVecEnv([make_env("train")])
-    vec_eval = DummyVecEnv([make_env("validation")])
+    # Create raw (not normalized) vectorized environments for training and evaluation
+    vec_train_raw = DummyVecEnv([make_env("train")])
+    vec_eval_raw = DummyVecEnv([make_env("validation")])
+
+    # Wrap envs with SAA signal injection
+    vec_train_saa = SAASignalWrapper(
+        vec_train_raw, saa_model, saa_vecnorm, num_assets, saa_device, config=config, 
+        feature_to_index=cache.feature_to_index
+        )
+    vec_eval_saa = SAASignalWrapper(
+        vec_eval_raw, saa_model, saa_vecnorm, num_assets, saa_device, config=config, 
+        feature_to_index=cache.feature_to_index
+        )
+    
+    # Normalize allocator (PAA) envs after SAA augmentation
+    vec_train = VecNormalize(
+        vec_train_saa,
+        norm_obs=True,
+        norm_reward=True,
+        clip_obs=10.0,
+        clip_reward=np.inf,
+        gamma=gamma_cfg,
+        training=True,
+    )
+    vec_eval = VecNormalize(
+        vec_eval_saa,
+        norm_obs=True,
+        norm_reward=False,
+        clip_obs=10.0,
+        clip_reward=np.inf,
+        gamma=gamma_cfg,
+        training=False,  # freeze stats for eval
+    )
 
     # Create and validate feature index lists for SAA signal and PAA token construction
     saa_idx = [cache.feature_to_index[f] for f, on in config["saa_features"].items() if on]
@@ -1714,15 +1753,6 @@ def run(cache: MarketDataCache, config: Dict[str, Any]) -> Dict[str, Any]:
             f"Cannot infer per-asset dim: obs_len={obs_len}, num_assets={num_assets}, portfolio_dim={portfolio_dim}"
         )
 
-    # Wrap envs with SAA signal injection
-    vec_train = SAASignalWrapper(
-        vec_train, saa_model, saa_vecnorm, num_assets, saa_device, config=config, 
-        feature_to_index=cache.feature_to_index
-        )
-    vec_eval = SAASignalWrapper(
-        vec_eval, saa_model, saa_vecnorm, num_assets, saa_device, config=config, 
-        feature_to_index=cache.feature_to_index
-        )
     print("[run] Environments built successfully")
 
 

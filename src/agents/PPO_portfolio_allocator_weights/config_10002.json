@@ -8,12 +8,14 @@
     },
 
   "allocator_transformer": {
-        "d_model": 128,
+        "d_model": 64,
+        "dim_forward": 64,
         "n_heads": 4,
         "n_layers": 2,
-        "dim_feedforward": 256,
         "dropout": 0.1,
-        "activation": "relu"
+        "activation": "relu",
+        "pi_mpl_hidden_dims": [64],
+        "vf_mpl_hidden_dims": [64]
   },
 
   "allocator_tokenizer": {
@@ -110,9 +112,9 @@
         "percentage_of_cash_only_starts": 0.10,
 
         "execution_min_share_threshold": 1,
-        "execution_min_trade_value_threshold": 50.0,
-        "execution_min_days_between_trades": 2,
-        "execution_weight_change_threshold": 0.01,
+        "execution_min_trade_value_threshold": 100.0,
+        "execution_min_days_between_trades": 1,
+        "execution_weight_change_threshold": 0.02,
         "allow_short": false,
         "price_source": "current_close",
         "quantity_type": "shares",
@@ -128,23 +130,24 @@
     "portfolio_allocator_agent":{
         "device": "auto",
         "verbose": 1,
-        "n_epochs": 3,
+        "n_epochs": 2,
         "n_steps": 4032,
         "batch_size": 2016,
         "gamma": 0.998,
         "gae_lambda": 0.98,
         "vf_coef": 0.5,
         "max_grad_norm": 0.5,
-        "target_kl": 0.08,
-        "normalize_advantage": true, 
+        "target_kl": 0.4,
+        "normalize_advantage": true,
+        "log_std_init": -1.4,
         
-        "clip_range_start": 0.4,
-        "clip_range_end": 0.1,
+        "clip_range_start": 0.1,
+        "clip_range_end": 0.05,
         "clip_schedule_warmup_pct": 0.3,
         "clip_schedule_ramping_pct": 0.6,
 
-        "learning_rate_start":  2.0e-4,
-        "learning_rate_end": 5.0e-5,
+        "learning_rate_start":  5.0e-6,
+        "learning_rate_end": 1.0e-6,
         "lr_schedule_type": "linear",
         "lr_schedule_warmup_pct": 0.3,
         "lr_schedule_ramping_pct": 0.6,
@@ -152,7 +155,7 @@
         "ent_coef_start": 0.005,
         "ent_coef_end": 0.0001,
         "ent_coef_schedule_type": "linear",
-        "ent_coef_schedule_warmup_pct": 0.35,
+        "ent_coef_schedule_warmup_pct": 0.3,
         "ent_coef_schedule_ramping_pct": 0.6,
 
         "action_limiting_factor_start": 0.06,
