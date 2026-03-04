@@ -1,9 +1,8 @@
-### pytrade-two
-
 Python Multi-Asset Trading DRL Experiment. As part of a University project on on-policy hierarchical agents this project sets out to explore trainability in chaotic, low-signal-to-noise, partially observable environments like OHLCV-data.
 
 
 ## Idea
+Train a much smaller recurrent agent (SAA) on single assets first, then use its output(s) in inference mode on portfolio level when training larger portfolio allocator (PAA).
 
 - SAA (Single asset agent) is trained using sb-contrib Recurrent PPO algorithm on randomly assigned assets. Its output (1,) between -1 to 1 is the desired change in position size of the assigned asset. It is intended to learn general sequence dependent patterns to find buy and sell signals.
 
@@ -14,10 +13,10 @@ Python Multi-Asset Trading DRL Experiment. As part of a University project on on
 
 - `src/agents/`  
   DRL agents live here.  
-  Includes SAA (single-asset) and PAA (portfolio allocator).
+  Includes SAA (single-asset) and PAA (portfolio allocator). Also includes simpler agent which were used to validate environment functionality.
 
 - `src/environment/`  
-  Trading environment code and market data cache. Note: Name of env is misleading. is actually used for all agents.
+  Trading environment code and market data cache. Note: Name of env is misleading. Is actually used for all agents.
 
 - `src/config/`  
   JSON configuration files for features, training, and model settings.
@@ -65,6 +64,7 @@ Python Multi-Asset Trading DRL Experiment. As part of a University project on on
 
 ## Data flow of SAA to reduce domain shift when running and loading inside PAA
 
+```text
 ┌─────────────────────────────────────────────────────┐
 │ Episode Reset (SINGLE_ASSET_TARGET_POS)             │
 ├─────────────────────────────────────────────────────┤
@@ -143,10 +143,11 @@ Python Multi-Asset Trading DRL Experiment. As part of a University project on on
         │ Cash decay       │
         │ Weights shift    │
         └──────────────────┘
-
+```
 
 ## Data flow of PAA
 
+```text
 ┌──────────────────────────────────────────────────────────────┐
 │ Episode Reset (TradingEnv, portfolio execution mode)         │
 ├──────────────────────────────────────────────────────────────┤
@@ -211,3 +212,4 @@ Python Multi-Asset Trading DRL Experiment. As part of a University project on on
                     │ • Run validation    │
                     │ • Save best model   │
                     └─────────────────────┘
+```
