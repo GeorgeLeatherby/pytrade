@@ -213,3 +213,12 @@ Train a much smaller recurrent agent (SAA) on single assets first, then use its 
                     │ • Save best model   │
                     └─────────────────────┘
 ```
+
+
+## License
+
+This project is licensed under the **PolyForm Noncommercial 1.0.0** license.  
+You may use, copy, modify, and distribute this software for **noncommercial purposes only**.  
+Commercial use is not allowed without a separate written commercial license from the copyright holder.  
+See [LICENSE](./LICENSE) for full terms.  
+For commercial licensing, contact: simonhansen230(at)gmail.com
