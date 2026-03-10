@@ -1373,7 +1373,8 @@ def build_allocator_model(
     transformer_cfg = config.get("allocator_transformer", {})
     pi_mpl_hidden_dims = transformer_cfg.get("pi_mpl_hidden_dims", [128, 64])
     vf_mpl_hidden_dims = transformer_cfg.get("vf_mpl_hidden_dims", [128, 64])
-    log_std_init = agent_cfg.get("log_std_init", -3.0)  # Initial log std for action distribution (tune for exploration)
+    log_std_init = agent_cfg.get("log_std_init", -1.0)  # Initial log std for action distribution (tune for exploration)
+    clip_range_vf = agent_cfg.get("clip_range_vf", None)  # Optional separate clip range for value function
     
     # --- Learning Rate Schedule ---
     # Extract LR schedule parameters
@@ -1508,6 +1509,7 @@ def build_allocator_model(
         ),
         
         # Optimization hyperparameters
+        clip_range_vf=clip_range_vf,  # Optional separate clip range for value function
         learning_rate=lr_schedule,  # Scheduled learning rate
         n_steps=n_steps,  # Rollout buffer size
         batch_size=batch_size,  # Minibatch size

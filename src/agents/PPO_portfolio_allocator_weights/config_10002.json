@@ -140,6 +140,7 @@
         "target_kl": 0.4,
         "normalize_advantage": true,
         "log_std_init": -1.4,
+        "clip_range_vf": 0.2,
         
         "clip_range_start": 0.1,
         "clip_range_end": 0.05,
