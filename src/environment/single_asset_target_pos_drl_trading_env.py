@@ -2103,26 +2103,8 @@ class TradingEnv(gym.Env):
                 raise ValueError("Raw action input contains NaN values")
 
             raw_action = np.asarray(action, dtype=np.float32)
-            if len(raw_action) != self.market_data_cache.num_assets + 1:
-                raise ValueError(f"Action length must be {self.market_data_cache.num_assets + 1}, got {len(raw_action)}")
-
-            # # Environment-side normalization (requested architecture):
-            # # w = a_raw / sum(a_raw), with epsilon handling.
-            # # We clip to [0, 1] for numerical safety if exploration noise drifts.
-            # a_raw = np.clip(raw_action, 0.0, 1.0)
-            # raw_sum = float(np.sum(a_raw))
-            # eps = 1e-8
-            # if raw_sum <= eps:
-            #     # Fallback when policy emits near-zero vector: stay fully in cash.
-            #     w = np.zeros_like(a_raw, dtype=np.float32)
-            #     w[0] = 1.0
-            # else:
-            #     w = (a_raw / (raw_sum + eps)).astype(np.float32)
-
-            # # Keep exact simplex numerically stable for execution engine.
-            # w = np.clip(w, 0.0, 1.0)
-            # w = w / np.maximum(np.sum(w), eps)
-
+            if len(raw_action) != self.market_data_cache.num_assets:
+                raise ValueError(f"Action length must be {self.market_data_cache.num_assets}, got {len(raw_action)}")
 
             # Softmax logits directly from raw action for stable simplex projection and more stable gradients.
             asset_logits = np.asarray(action, dtype=np.float32)
