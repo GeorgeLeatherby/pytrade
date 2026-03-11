@@ -1514,7 +1514,7 @@ class TradingEnv(gym.Env):
         elif self.execution_mode == EXECUTION_PORTFOLIO_WEIGHTS:
             # ------ Action space: Continuous weights for each asset + cash (sum to 1) ------
             self.action_space = spaces.Box(
-                low=-10.0, high=10.0, shape=(num_assets + 1,), dtype=np.float32
+                low=-10.0, high=10.0, shape=(num_assets,), dtype=np.float32
             )
         else:
             # Simple/Tranche modes: action is a list of instructions; Gym does not have a list space.
@@ -2125,10 +2125,12 @@ class TradingEnv(gym.Env):
 
 
             # Softmax logits directly from raw action for stable simplex projection and more stable gradients.
-            logits = np.asarray(action, dtype=np.float32)
-            # single softmax to obtain valid weights (cash + assets sum to 1)
-            exp_logits = np.exp(logits - np.max(logits))
-            weights = exp_logits / np.sum(exp_logits)
+            asset_logits = np.asarray(action, dtype=np.float32)
+            exp_asset_logits = np.exp(asset_logits - np.max(asset_logits))
+            asset_weights = exp_asset_logits / (1.0 + np.sum(exp_asset_logits))
+            # cash is inferred as residual to ensure exact simplex constraint; this also provides more stable gradients for the policy
+            cash_weight = 1.0 - np.sum(asset_weights)
+            weights = np.concatenate([[cash_weight], asset_weights]).astype(np.float32)
 
             # legacy, dont know exactly, didnt bother
             weight_change_target = weights
