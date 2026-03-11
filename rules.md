@@ -20,6 +20,11 @@ Prefer sb3 and PyTorch onboard methods and functions.
 
 Search for documentation of used packages. Often these will have onboard solutions for problems.
 
+## Conventions
+Cashweight is first element in vectors
+
+In any Observations or Token creations the Asset Infor/Token comes first and the Portfolioinfo/Token comes Last (N+1 element)
+
 ## Project specific setup:
 DRL hierarchical on-policy agent(s) working with a custom Trading Environment to find portfolio allocation strategies. Step size is daily. Data is from 25 years of real markets of 11 assets. The data is loaded up into a cache object inside main.py and handed over to subsequent functions. The SAA is trained first, then used in inference mode (frozen). SAA is trained generally on all 11 assets rotating randomly. When using SAA in inference mode we need N copies of the SAA agent, each perceiving its specified observation for its assigned asset, due to the SAA being stateful. We then take the N outputs (actions) of the SAA and enrich each asset token of the PAA with their information. The PAA receives N asset tokens and 1 Portfolio Token. The PAA performes asset/portfolio self-attention. In Portfolio_weights execution mode it outputs N+1 weights which are interpreted by the TradingEnv as requested cash_weight + N asset_weights. Softmax Normalisation of PAA actions is performed inside the Environment.
 

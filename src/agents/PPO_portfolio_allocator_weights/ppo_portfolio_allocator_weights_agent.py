@@ -9,7 +9,7 @@ Architecture:
 - Input: 
     1. Per-asset tokens: raw market features, the injected SAA signal, and per-asset weight
     2. Global portfolio token
-- Embedding: Linear projection + asset ID embeddings → d_model dimensions
+- Embedding: Linear projection → d_model dimensions
 - Transformer Encoder: Self-attention across N+1 tokens (N assets tokens + 1 portfolio token)
 - Output Heads: Per-asset raw allocation logits + cash logit → sigmoid output in [0, 1]
     (Environment applies post-policy normalization to valid portfolio weights)
@@ -1291,11 +1291,11 @@ class SAATokenizer(BaseFeaturesExtractor):
             raise ValueError("Portfolio token dim mismatch")
         portfolio_token = self.portfolio_embedding(portfolio_token_input).unsqueeze(1)  # (B,1,d_model)
 
-        # Stitch tokens: [portfolio_token, asset_tokens]
-        full_sequence = torch.cat([portfolio_token, asset_tokens], dim=1)  # (B, N+1, d_model)
+        # Stitch tokens: [asset_tokens, portfolio_token]. Expected in this order by attention engine!
+        full_sequence = torch.cat([asset_tokens, portfolio_token], dim=1)  # (B, N+1, d_model)
         return full_sequence.flatten(start_dim=1)     
 
-
+    
 # Utility function to load SAA model and VecNormalize stats from config
 def _load_saa_from_config(saa_config: Dict[str, Any]) -> Tuple[Any, Optional[VecNormalize], torch.device]:
     """
