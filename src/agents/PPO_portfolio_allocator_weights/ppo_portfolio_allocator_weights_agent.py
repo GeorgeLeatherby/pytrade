@@ -967,19 +967,37 @@ class SAASignalWrapper(VecEnvWrapper):
         self.config = config
         self.feature_to_index = feature_to_index
 
-        # Infer per-asset feature dim from the env observation space
-        obs_len = self.observation_space.shape[0]
-        portfolio_dim = self.num_assets + 7  # weights (N+1) + 6 metrics = 18
-        asset_block = obs_len - portfolio_dim
-        if asset_block <= 0 or asset_block % self.num_assets != 0:
+        # Infer dimensions from selected market features and env observation shape.
+        # The raw env emits: N * raw_feat_dim + portfolio_dim (before SAA signal injection).
+        obs_len = int(self.observation_space.shape[0])
+        self.raw_feat_dim = int(len(self.feature_to_index))
+        if self.raw_feat_dim <= 0:
             raise ValueError(
-                f"Cannot infer per-asset dim: obs_len={obs_len}, num_assets={self.num_assets}, portfolio_dim={portfolio_dim}"
+                "Cannot infer raw feature dimension from feature_to_index. "
+                f"len(feature_to_index)={self.raw_feat_dim}"
             )
 
-        self.raw_feat_dim = asset_block // self.num_assets
-        if self.raw_feat_dim != 30:
+        asset_block = self.num_assets * self.raw_feat_dim
+        self.portfolio_dim = obs_len - asset_block
+        if self.portfolio_dim <= 0:
             raise ValueError(
-                f"Inferred raw_feat_dim={self.raw_feat_dim} does not match expected 30. Check env observation space."
+                "Invalid observation layout for SAASignalWrapper. "
+                f"obs_len={obs_len}, num_assets={self.num_assets}, "
+                f"raw_feat_dim={self.raw_feat_dim}, portfolio_dim={self.portfolio_dim}"
+            )
+
+        # Cache SAA feature indices once (used every step).
+        self.saa_idx = np.array(
+            [self.feature_to_index[f] for f, on in self.config["saa_features"].items() if on],
+            dtype=int,
+        )
+        if self.saa_idx.size == 0:
+            raise ValueError("No enabled SAA features found in config['saa_features'].")
+        if np.min(self.saa_idx) < 0 or np.max(self.saa_idx) >= self.raw_feat_dim:
+            raise ValueError(
+                "SAA feature indices out of range for raw feature block. "
+                f"raw_feat_dim={self.raw_feat_dim}, min_idx={int(np.min(self.saa_idx))}, "
+                f"max_idx={int(np.max(self.saa_idx))}"
             )
 
         # Create N distinct SAA models (deep copies) and keep their own recurrent states
@@ -1048,11 +1066,10 @@ class SAASignalWrapper(VecEnvWrapper):
         asset_block = self.num_assets * self.raw_feat_dim
         asset_flat = obs[:, :asset_block]           # (B, N*F)
         portfolio_part = obs[:, asset_block:]       # (B, P)
-        asset_feats = asset_flat.reshape(B, self.num_assets, self.raw_feat_dim)  # (B, N, 30)
+        asset_feats = asset_flat.reshape(B, self.num_assets, self.raw_feat_dim)  # (B, N, F)
 
-        # Indices of the 29 SAA features from config (assumed available on the wrapper)
-        saa_idx = np.array([self.feature_to_index[f] for f, on in self.config["saa_features"].items() if on], dtype=int)
-        saa_market_feats = asset_feats[:, :, saa_idx]  # (B, N, 29)
+        # Select the configured SAA market features.
+        saa_market_feats = asset_feats[:, :, self.saa_idx]
 
         # Portfolio-derived pieces
         cash_w = portfolio_part[:, 0:1]                                # (B, 1)
@@ -1061,8 +1078,8 @@ class SAASignalWrapper(VecEnvWrapper):
         asset_w_exp = asset_w[:, :, None]                              # (B, N, 1)
         third_component = np.zeros_like(asset_w_exp, dtype=np.float32) # (B, N, 1)
 
-        # Final per-asset SAA obs: 29 market feats + 3 portfolio feats = 32
-        saa_obs = np.concatenate([saa_market_feats, cash_w_exp, asset_w_exp, third_component], axis=-1)  # (B, N, 32)
+        # Final per-asset SAA obs: selected SAA market feats + 3 portfolio feats.
+        saa_obs = np.concatenate([saa_market_feats, cash_w_exp, asset_w_exp, third_component], axis=-1)
 
         # Collect SAA signals per asset using distinct models/states
         signals = []
@@ -1206,7 +1223,7 @@ class SAATokenizer(BaseFeaturesExtractor):
             => size: len(portfolio_time_idx) + portfolio_dim
         """
         self.n_assets = num_assets
-        self.raw_feat_dim = raw_feat_dim                      # 30 (without SAA signal)
+        self.raw_feat_dim = raw_feat_dim                      # Raw market features per asset (without SAA signal)
         self.d_model = d_model
         self.asset_feature_idx = list(asset_feature_idx)      # expected length 24
         self.portfolio_time_idx = list(portfolio_time_idx)    # expected length 6
@@ -1216,7 +1233,7 @@ class SAATokenizer(BaseFeaturesExtractor):
         asset_block = self.n_assets * (self.raw_feat_dim + 1)  # +1 for SAA signal
         if obs_len <= asset_block:
             raise ValueError(f"Observation too small. obs_len={obs_len}, asset_block={asset_block}")
-        self.portfolio_dim = obs_len - asset_block             # expected 18
+        self.portfolio_dim = obs_len - asset_block
 
         # Validate target sizes
         asset_token_in_dim = len(self.asset_feature_idx) + 2   # + SAA signal + asset_weight
@@ -1234,17 +1251,17 @@ class SAATokenizer(BaseFeaturesExtractor):
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         """
-        observations: (B, n_assets*(raw_feat_dim+1) + portfolio_dim)  == (B, 359)
+        observations: (B, n_assets*(raw_feat_dim+1) + portfolio_dim)
         Returns: flattened tokens (B, (n_assets+1)*d_model)
         """
         B = observations.shape[0]
         asset_block = self.n_assets * (self.raw_feat_dim + 1)
         portfolio_block = observations[:, asset_block:]                    # (B, portfolio_dim)
         asset_flat = observations[:, :asset_block]                         # (B, N*(F+1))
-        asset_feats_full = asset_flat.view(B, self.n_assets, self.raw_feat_dim + 1)  # (B, N, 31)
+        asset_feats_full = asset_flat.view(B, self.n_assets, self.raw_feat_dim + 1)
 
         # Split raw features and SAA signal
-        raw_feats = asset_feats_full[:, :, : self.raw_feat_dim]            # (B, N, 30)
+        raw_feats = asset_feats_full[:, :, : self.raw_feat_dim]
         saa_sig = asset_feats_full[:, :, self.raw_feat_dim : self.raw_feat_dim + 1]  # (B, N, 1)
 
         # Select configured asset features
@@ -1747,13 +1764,21 @@ def run(cache: MarketDataCache, config: Dict[str, Any]) -> Dict[str, Any]:
     
     # Infer per-asset dim from the env observation space (unwrapped)
     sample_space = vec_train.observation_space
-    obs_len = sample_space.shape[0]
-    portfolio_dim = num_assets + 7  # weights (N+1) + 6 metrics
-    asset_block = obs_len - portfolio_dim
-    if asset_block <= 0 or asset_block % num_assets != 0:
+    obs_len = int(sample_space.shape[0])
+    # vec_train is post SAASignalWrapper, so asset block includes the injected +1 SAA signal.
+    expected_asset_block = num_assets * (raw_feature_dim + 1)
+    portfolio_dim = obs_len - expected_asset_block
+    if portfolio_dim <= 0:
         raise ValueError(
-            f"Cannot infer per-asset dim: obs_len={obs_len}, num_assets={num_assets}, portfolio_dim={portfolio_dim}"
+            "Invalid allocator observation layout. "
+            f"obs_len={obs_len}, expected_asset_block={expected_asset_block}, "
+            f"num_assets={num_assets}, raw_feature_dim={raw_feature_dim}, portfolio_dim={portfolio_dim}"
         )
+
+    print(
+        "[run] Inferred observation layout: "
+        f"asset_block={expected_asset_block}, portfolio_dim={portfolio_dim}, total={obs_len}"
+    )
 
     print("[run] Environments built successfully")
 

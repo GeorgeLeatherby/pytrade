@@ -238,6 +238,11 @@ class EpisodeBuffer:
     current_step: int = 0                   # Current step in episode
     num_portfolio_features: int = field(init=False)  # Number of portfolio features for observation
     effective_asset_concentration_norm: np.ndarray = field(init=False)  # [episode_buffer_length_days] - effective asset concentration norm 
+    previous_sortino: np.ndarray = field(init=False)  # [episode_buffer_length_days] - previous Sortino ratio for reward component
+    current_sortino: np.ndarray = field(init=False)   # [episode_buffer_length_days] - current Sortino ratio for reward component
+    running_mean_ema: np.ndarray = field(init=False)  # [episode_buffer_length_days] - running mean EMA of returns for reward component
+    downside_var_sqrt: np.ndarray = field(init=False)  # [episode_buffer_length_days] - sqrt of downside variance for Sortino ratio
+    previous_max_drawdown: np.ndarray = field(init=False)  # [episode_buffer_length_days] - previous max drawdown for reward component
 
     # weights, alpha, sharpe_ratio, drawdown, volatility, turnover, allocator_rewards
 
@@ -265,7 +270,7 @@ class EpisodeBuffer:
         # If num_features is not available, set to 0
         num_features = getattr(self, "num_features", 0)
         self.current_step = 0
-        self.num_portfolio_features = self.num_assets + 1 + 6  # weights + alpha + sharpe + drawdown + volatility + turnover + allocator_rewards
+        # = self.num_assets + 1 + 11  # weights + 11 portfolio metrics used by get_observation_at_step
         self.action_entropy = np.zeros(self.episode_buffer_length_days, dtype=dtype) 
         # Reward component tracking (per-step)
         self.reward_alpha = np.zeros(self.episode_buffer_length_days, dtype=dtype)
@@ -276,6 +281,11 @@ class EpisodeBuffer:
         self.reward_concentration = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         self.reward_survival = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         self.effective_asset_concentration_norm = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.previous_sortino = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.current_sortino = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.running_mean_ema = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.downside_var_sqrt = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.previous_max_drawdown = np.zeros(self.episode_buffer_length_days, dtype=dtype)
 
     def record_step(self, external_step: int, portfolio_value: float, weights: np.ndarray, portfolio_positions: np.ndarray,
                    daily_return: float, saa_return: float, reward: float, saa_reward: float,action: np.ndarray,
@@ -285,7 +295,8 @@ class EpisodeBuffer:
                    traded_dollar_volume: float = 0.0, traded_shares_total: float = 0.0,
                    action_entropy: float = 0.0, saa_reward_parts: Optional[Dict[str, float]] = None,
                    reward_parts: Optional[Dict[str, float]] = None,
-                   effective_asset_concentration_norm: float = 0.0) -> None:
+                   effective_asset_concentration_norm: float = 0.0, previous_sortino: float = 0.0, current_sortino: float = 0.0,
+                   running_mean_ema: float = 0.0, downside_var_sqrt: float = 0.0, previous_max_drawdown: float = 0.0) -> None:
         
         """
         Record step data efficiently. external_step: 0-based episode day index (first real day = 0)
@@ -318,6 +329,11 @@ class EpisodeBuffer:
         self.traded_shares_total[internal_offset_step] = float(traded_shares_total)
         self.action_entropy[internal_offset_step] = float(action_entropy)
         self.effective_asset_concentration_norm[internal_offset_step] = float(effective_asset_concentration_norm)
+        self.previous_sortino[internal_offset_step] = previous_sortino
+        self.current_sortino[internal_offset_step] = current_sortino
+        self.running_mean_ema[internal_offset_step] = running_mean_ema
+        self.downside_var_sqrt[internal_offset_step] = downside_var_sqrt
+        self.previous_max_drawdown[internal_offset_step] = previous_max_drawdown
         # Reward components
         if reward_parts is not None:
             self.reward_alpha[internal_offset_step] = reward_parts.get("alpha_component", 0.0)
@@ -327,6 +343,7 @@ class EpisodeBuffer:
             self.reward_turnover[internal_offset_step] = reward_parts.get("turnover_component", 0.0)
             self.reward_concentration[internal_offset_step] = reward_parts.get("concentration_component", 0.0)
             self.reward_survival[internal_offset_step] = reward_parts.get("survival_component", 0.0)
+        
 
         # Update current step and episode length
         self.current_step = external_step
@@ -539,12 +556,19 @@ class EpisodeBuffer:
         drawdown = self.drawdown[internal_step]
         volatility = self.volatility[internal_step]
         turnover = self.turnover[internal_step]
+        previous_sortino = self.previous_sortino[internal_step]
+        current_sortino = self.current_sortino[internal_step]
+        running_mean_ema = self.running_mean_ema[internal_step]
+        downside_var_sqrt = self.downside_var_sqrt[internal_step]
+        previous_max_drawdown = self.previous_max_drawdown[internal_step]
+
         # rewards = self.allocator_rewards[internal_step] # Why feed reward.
         effective_asset_concentration_norm = self.effective_asset_concentration_norm[internal_step]
 
         observation = np.concatenate([
             weights,
-            [alpha, sharpe, drawdown, volatility, turnover, effective_asset_concentration_norm]
+            [alpha, sharpe, drawdown, volatility, turnover, effective_asset_concentration_norm, previous_sortino, 
+            current_sortino, running_mean_ema, downside_var_sqrt, previous_max_drawdown]
         ]).astype(np.float32)
 
         return observation
@@ -1387,6 +1411,7 @@ class TradingEnv(gym.Env):
 
         self.previous_max_drawdown = None
         self.saa_previous_max_drawdown = None
+        self.trans_act_pen = None  # Initialize transaction action penalty variable
 
         # Store references
         self.market_data_cache = market_data_cache
@@ -1651,6 +1676,7 @@ class TradingEnv(gym.Env):
 
         self.previous_max_drawdown = float(0.0)
         self.saa_previous_max_drawdown = float(0.0)
+        self.trans_act_pen = float(0.0)
 
         # Episode accumulators for diagnostics
         self._ep_turnover_notional = 0.0
@@ -2350,7 +2376,12 @@ class TradingEnv(gym.Env):
             saa_reward_parts={k: float(v) for k, v in saa_reward_parts.items()},
             benchmark_portfolio_value=float(benchmark_portfolio_value_after),
             comparison_portfolio_value=float(comparison_portfolio_value_after),
-            effective_asset_concentration_norm=float(effective_asset_concentration_norm)
+            effective_asset_concentration_norm=float(effective_asset_concentration_norm),
+            previous_sortino=reward_parts.get("previous_sortino", None),
+            current_sortino=reward_parts.get("current_sortino", None),
+            running_mean_ema=reward_parts.get("running_mean_ema", None),
+            downside_var_sqrt=reward_parts.get("downside_var_sqrt", None),
+            previous_max_drawdown=reward_parts.get("previous_max_drawdown", None)
         )
 
         # Check termination conditions -----------------------------------
@@ -2754,9 +2785,11 @@ class TradingEnv(gym.Env):
         # 4c. Transaction cost penalty (scaled by lambda_cost)
         transaction_cost_level = 0.0001*self.initial_portfolio_value
         if execution_result.transaction_cost > transaction_cost_level:
-            trans_act_pen = self.lambda_transaction_cost * (execution_result.transaction_cost - transaction_cost_level)
-            third_reward = reward - trans_act_pen
+            self.trans_act_pen = self.lambda_transaction_cost * (execution_result.transaction_cost - transaction_cost_level)
+            third_reward = reward - self.trans_act_pen
             reward = third_reward
+        else: 
+            self.trans_act_pen = 0.0
 
         # # 5. Clip and amplify reward
         # gain = float(3.5)
@@ -2870,7 +2903,13 @@ class TradingEnv(gym.Env):
             "raw_portfolio_return": portfolio_return,
             "raw_benchmark_return": benchmark_return,
             "sharpe_ratio": sharpe_ratio,
-            "max_drawdown_delta": max_drawdown_delta
+            "max_drawdown_delta": max_drawdown_delta,
+            "previous_sortino": self.previous_sortino,
+            "current_sortino": current_sortino,
+            "running_mean_ema": self.running_mean_ema,
+            "downside_var_sqrt": np.sqrt(downside_var),
+            "previous_max_drawdown": self.previous_max_drawdown
+
         }
 
         return float(reward), parts
