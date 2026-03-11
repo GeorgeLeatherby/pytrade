@@ -270,7 +270,7 @@ class EpisodeBuffer:
         # If num_features is not available, set to 0
         num_features = getattr(self, "num_features", 0)
         self.current_step = 0
-        # = self.num_assets + 1 + 11  # weights + 11 portfolio metrics used by get_observation_at_step
+        self.num_portfolio_features = self.num_assets + 1 + 11  # weights + 11 portfolio metrics used by get_observation_at_step
         self.action_entropy = np.zeros(self.episode_buffer_length_days, dtype=dtype) 
         # Reward component tracking (per-step)
         self.reward_alpha = np.zeros(self.episode_buffer_length_days, dtype=dtype)
@@ -513,7 +513,7 @@ class EpisodeBuffer:
         actual_window = end_idx - start_idx + 1
 
         # Pre-allocate output array
-        num_portfolio_features = 6 + self.portfolio_weights.shape[1]  # weights + alpha + sharpe + drawdown + volatility + turnover + allocator_rewards
+        num_portfolio_features = self.num_portfolio_features # 6 + self.portfolio_weights.shape[1]  # weights + alpha + sharpe + drawdown + volatility + turnover + allocator_rewards
         obs = np.zeros((self.lookback_window, num_portfolio_features), dtype=np.float32)
 
         # Gather sequences
