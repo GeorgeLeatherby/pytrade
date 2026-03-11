@@ -1220,9 +1220,9 @@ class SAATokenizer(BaseFeaturesExtractor):
 
         # Validate target sizes
         asset_token_in_dim = len(self.asset_feature_idx) + 2   # + SAA signal + asset_weight
-        if asset_token_in_dim != 26:
-            raise ValueError(f"Asset token dim mismatch: got {asset_token_in_dim}, expected 26 "
-                             f"(len(asset_feature_idx)={len(self.asset_feature_idx)})")
+        # if asset_token_in_dim != 26:
+        #     raise ValueError(f"Asset token dim mismatch: got {asset_token_in_dim}, expected 26 "
+        #                      f"(len(asset_feature_idx)={len(self.asset_feature_idx)})")
         portfolio_token_in_dim = len(self.portfolio_time_idx) + self.portfolio_dim
         # Total features out = (N assets + 1 portfolio) * d_model
         total_features_dim = (self.n_assets + 1) * d_model
@@ -1259,8 +1259,8 @@ class SAATokenizer(BaseFeaturesExtractor):
 
         # Build asset tokens: selected feats + SAA signal + asset_weight
         asset_token_inputs = torch.cat([asset_feats_sel, saa_sig, asset_weights], dim=-1)  # (B, N, 26)
-        if asset_token_inputs.shape[-1] != 26:
-            raise ValueError(f"Asset token final dim mismatch: {asset_token_inputs.shape}")
+        # if asset_token_inputs.shape[-1] != 26:
+        #     raise ValueError(f"Asset token final dim mismatch: {asset_token_inputs.shape}")
 
         asset_tokens = self.asset_embedding(asset_token_inputs)            # (B, N, d_model)
 

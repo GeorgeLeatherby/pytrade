@@ -1,0 +1,169 @@
+{
+    "saa_config":{
+        "saa_run_id": "00076",
+        "saa_base_dir":"src/agents/RecurrPPO_target_position_agent/saved_models",
+        "saa_config_id": "00010",
+        "saa_run_date": "26_02_28",
+        "device": "cpu"
+    },
+
+  "allocator_transformer": {
+        "d_model": 32,
+        "dim_forward": 32,
+        "n_heads": 2,
+        "n_layers": 1,
+        "dropout": 0.1,
+        "activation": "relu",
+        "pi_mpl_hidden_dims": [32],
+        "vf_mpl_hidden_dims": [32]
+  },
+
+  "allocator_tokenizer": {
+        "portfolio_feature_dim": 8
+  },
+
+    "saa_features": {
+        "dow_sin": true,
+        "dow_cos": true,
+        "dom_sin": true,
+        "dom_cos": true,
+        "moy_sin": true,
+        "moy_cos": true,
+        "return_1d": true,
+        "return_5d": true,
+        "return_20d": true,
+        "return_40d": true,
+        "volume_change_1d": true,
+        "volume_change_5d": true,
+        "volume_change_20d": true,
+        "volume_change_40d": true,
+        "volume_percentile_20d": true,
+        "volume_percentile_40d": true,
+        "daily_range_pct": true,
+        "rsi_14": true,
+        "macd": true,
+        "bb_position": true,
+        "bb_width": true,
+        "volatility_5d": true,
+        "volatility_20d": true,
+        "market_beta": true,
+        "avg_correlation": true,
+        "composite_risk_score": true,
+        "return_kurtosis": true,
+        "trend_strength_20d": true,
+        "drawdown_adjusted_return_30d": true
+    },
+
+    "paa_asset_token_features": {
+        "relative_performance_20d": true,
+        "return_1d": true,
+        "return_20d": true,
+        "volume_change_1d": true,
+        "volume_change_20d": true,
+        "volume_percentile_20d": true,
+        "daily_range_pct": true,
+        "rsi_14": true,
+        "macd": true,
+        "bb_position": true,
+        "bb_width": true
+    },
+
+    "paa_portfolio_token_features": {
+        "dow_sin": true,
+        "dow_cos": true,
+        "dom_sin": true,
+        "dom_cos": true,
+        "moy_sin": true,
+        "moy_cos": true
+    },
+
+    "environment": {
+        "assets": ["SPY", "EWG", "EWH", "EWJ", "EWQ", "EWS", "EWT", "EWU", "EWY", "Crude", "Gold"],
+        "execution_mode": "portfolio_weights",
+        "initial_portfolio_value": 10000,
+        "episode_length_days": 252,
+        "lookback_window": 0,
+        "early_stopping_threshold": 0.2,
+        "cash_drag_rate_pa": 0.015,
+        "seed": 42,
+        "maybe_provide_sequence": false,
+        "block_buffer_multiplier": 1.2,
+        "test_val_split_ratio": 0.15,
+
+        "sortino_eta": 0.018,
+        "lambda_drawdown": 0.005,
+        "sortino_net_reward_mix": 0.4,
+        "lambda_spread": 0.0025,
+        "lambda_transaction_cost": 0.0025,
+
+        "percentage_of_cash_only_starts": 0.10,
+
+        "execution_min_share_threshold": 1,
+        "execution_min_trade_value_threshold": 100.0,
+        "execution_min_days_between_trades": 1,
+        "execution_weight_change_threshold": 0.02,
+        "allow_short": false,
+        "price_source": "current_close",
+        "quantity_type": "shares",
+
+        "fixed_fee_per_order": 0.0,
+        "commission_bps": 0.0002,
+        "half_spread_bps": 0.0015,
+        "impact_coeff": 0.125,
+        "adv_window": 21,
+        "portfolio_features": false
+  },
+
+    "portfolio_allocator_agent":{
+        "device": "auto",
+        "verbose": 1,
+        "n_epochs": 2,
+        "n_steps": 8064,
+        "batch_size": 4032,
+        "gamma": 0.998,
+        "gae_lambda": 0.98,
+        "vf_coef": 0.5,
+        "max_grad_norm": 0.5,
+        "target_kl": 0.2,
+        "normalize_advantage": true,
+        "log_std_init": -1.4,
+        "clip_range_vf": 0.2,
+        
+        "clip_range_start": 0.1,
+        "clip_range_end": 0.05,
+        "clip_schedule_warmup_pct": 0.3,
+        "clip_schedule_ramping_pct": 0.6,
+
+        "learning_rate_start":  3.0e-6,
+        "learning_rate_end": 1.0e-6,
+        "lr_schedule_type": "linear",
+        "lr_schedule_warmup_pct": 0.3,
+        "lr_schedule_ramping_pct": 0.6,
+
+        "ent_coef_start": 0.005,
+        "ent_coef_end": 0.0001,
+        "ent_coef_schedule_type": "linear",
+        "ent_coef_schedule_warmup_pct": 0.3,
+        "ent_coef_schedule_ramping_pct": 0.6,
+
+        "action_limiting_factor_start": 0.06,
+        "action_limiting_factor_end": 0.09,
+        "action_limiting_factor_schedule_type": "linear",
+        "action_limiting_factor_schedule_warmup_pct": 0.3,
+        "action_limiting_factor_schedule_ramping_pct": 0.6
+
+    },
+
+    "training": {
+        "seed": 42,
+        "total_timesteps": 20000000,
+        "train_log_freq": 10,
+        "eval_freq": 200000,
+        "n_eval_episodes": 100,
+        "eval_deterministic": false,
+        "progress_bar": true,
+        "config_id": 10003,
+        "tensorboard_log": "src/agents/PPO_portfolio_allocator_weights/tb_logs"
+    }
+
+}
