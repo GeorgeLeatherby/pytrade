@@ -8,14 +8,14 @@
     },
 
   "allocator_transformer": {
-        "d_model": 32,
-        "dim_forward": 32,
-        "n_heads": 2,
-        "n_layers": 1,
-        "dropout": 0.1,
-        "activation": "relu",
-        "pi_mpl_hidden_dims": [32],
-        "vf_mpl_hidden_dims": [32]
+        "d_model": 64,
+        "dim_forward": 64,
+        "n_heads": 4,
+        "n_layers": 2,
+        "transformer_encoder_dropout": 0.1,
+        "transformer_activation_fn": "relu",
+        "pi_mpl_hidden_dims": [64],
+        "vf_mpl_hidden_dims": [64]
   },
 
   "allocator_tokenizer": {
@@ -124,13 +124,13 @@
         "gae_lambda": 0.98,
         "vf_coef": 0.5,
         "max_grad_norm": 0.5,
-        "target_kl": 0.2,
+        "target_kl": 0.03,
         "normalize_advantage": true,
         "log_std_init": -1.4,
         "clip_range_vf": 0.1,
         
-        "clip_range_start": 0.1,
-        "clip_range_end": 0.05,
+        "clip_range_start": 0.2,
+        "clip_range_end": 0.1,
         "clip_schedule_warmup_pct": 0.3,
         "clip_schedule_ramping_pct": 0.6,
 

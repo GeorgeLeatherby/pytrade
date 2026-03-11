@@ -1121,7 +1121,8 @@ class SAASignalWrapper(VecEnvWrapper):
     
 
 class AttentionEngine(nn.Module):
-    def __init__(self, feature_dim: int, n_assets: int, d_model: int, n_heads: int, n_layers: int, dim_feedforward: int):
+    def __init__(self, feature_dim: int, n_assets: int, d_model: int, n_heads: int, n_layers: int, dim_feedforward: int,
+                 transformer_encoder_dropout: float, transformer_activation_fn: str = "relu"):
         super().__init__()
         self.n_assets = n_assets
         self.d_model = d_model
@@ -1131,7 +1132,10 @@ class AttentionEngine(nn.Module):
             d_model=d_model,
             nhead=n_heads,
             dim_feedforward=dim_feedforward,  # Use provided feedforward dimension
-            batch_first=True  # Use batch_first for easier integration with SB3
+            batch_first=True,  # Use batch_first for easier integration with SB3
+            dropout=transformer_encoder_dropout,
+            activation=transformer_activation_fn
+
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
@@ -1176,12 +1180,16 @@ class TransformerAllocatorPolicy(ActorCriticPolicy):
     Custom policy that swaps the default MlpExtractor with AttentionEngine.
     Expects features_dim = (n_assets + 1) * d_model from the tokenizer.
     """
-    def __init__(self, observation_space, action_space, lr_schedule, n_assets, d_model, n_heads, n_layers, dim_feedforward,**kwargs):
+    def __init__(self, observation_space, action_space, lr_schedule, n_assets, d_model, n_heads, n_layers, dim_feedforward, transformer_encoder_dropout,
+                 transformer_activation_fn, **kwargs):
+        
         self._n_assets = n_assets
         self._d_model = d_model
         self._n_heads = n_heads
         self._n_layers = n_layers
         self._dim_feedforward = dim_feedforward
+        self.transformer_encoder_dropout = transformer_encoder_dropout
+        self.transformer_activation_fn = transformer_activation_fn
         super().__init__(observation_space, action_space, lr_schedule, **kwargs)
 
     def _build_mlp_extractor(self) -> None:
@@ -1192,7 +1200,9 @@ class TransformerAllocatorPolicy(ActorCriticPolicy):
             d_model=self._d_model,
             n_heads=self._n_heads,
             n_layers=self._n_layers,
-            dim_feedforward=self._dim_feedforward
+            dim_feedforward=self._dim_feedforward,
+            transformer_encoder_dropout=self.transformer_encoder_dropout,
+            transformer_activation_fn=self.transformer_activation_fn
         )
 
 
@@ -1522,7 +1532,9 @@ def build_allocator_model(
             d_model=transformer_cfg.get("d_model", 128),
             n_heads=transformer_cfg.get("n_heads", 8),
             n_layers=transformer_cfg.get("n_layers", 4),
-            dim_feedforward=transformer_cfg.get("dim_feedforward", 256)
+            dim_feedforward=transformer_cfg.get("dim_feedforward", 256),
+            transformer_encoder_dropout=transformer_cfg.get("transformer_encoder_dropout", 0.1),
+            transformer_activation_fn=transformer_cfg.get("transformer_activation_fn", "relu")
         ),
         
         # Optimization hyperparameters
