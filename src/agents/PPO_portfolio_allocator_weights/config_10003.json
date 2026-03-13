@@ -9,17 +9,13 @@
 
   "allocator_transformer": {
         "d_model": 64,
-        "dim_forward": 128,
+        "dim_feedforward": 128,
         "n_heads": 4,
         "n_layers": 2,
         "transformer_encoder_dropout": 0.1,
         "transformer_activation_fn": "relu",
         "pi_mpl_hidden_dims": [64],
         "vf_mpl_hidden_dims": [64]
-  },
-
-  "allocator_tokenizer": {
-        "portfolio_feature_dim": 8
   },
 
     "saa_features": {
@@ -90,18 +86,23 @@
         "block_buffer_multiplier": 1.2,
         "test_val_split_ratio": 0.15,
 
-        "sortino_eta": 0.018,
-        "lambda_drawdown": 0.005,
-        "sortino_net_reward_mix": 0.4,
-        "lambda_spread": 0.0025,
-        "lambda_transaction_cost": 0.0025,
+        "sortino_eta": 0.015,
+        "lambda_drawdown": 0.001,
+        "sortino_net_reward_mix": 0.3,
+        "lambda_spread": 0.0,
+        "lambda_transaction_cost": 0.001,
 
         "percentage_of_cash_only_starts": 0.10,
 
-        "execution_min_share_threshold": 1,
-        "execution_min_trade_value_threshold": 100.0,
-        "execution_min_days_between_trades": 1,
-        "execution_weight_change_threshold": 0.02,
+        "execution_min_share_threshold": 0.1,
+        "execution_min_trade_value_threshold": 50.0,
+        "execution_min_days_between_trades": 0,
+        "execution_weight_change_threshold": 0.0,
+        "execution_min_per_asset_weight_change": 0.0,
+
+        "execution_deadband": 0.002,
+        "execution_step_size": 0.30,
+
         "allow_short": false,
         "price_source": "current_close",
         "quantity_type": "shares",
@@ -117,33 +118,33 @@
     "portfolio_allocator_agent":{
         "device": "auto",
         "verbose": 1,
-        "n_epochs": 3,
+        "n_epochs": 2,
         "n_steps": 4032,
         "batch_size": 1008,
         "gamma": 0.998,
         "gae_lambda": 0.98,
         "vf_coef": 0.5,
-        "max_grad_norm": 0.5,
-        "target_kl": 0.03,
+        "max_grad_norm": 0.3,
+        "target_kl": 0.04,
         "normalize_advantage": true,
-        "log_std_init": -1.0,
+        "log_std_init": -1.5,
         "clip_range_vf": 0.2,
         
-        "clip_range_start": 0.15,
-        "clip_range_end": 0.08,
+        "clip_range_start": 0.04,
+        "clip_range_end": 0.01,
         "clip_schedule_warmup_pct": 0.2,
         "clip_schedule_ramping_pct": 0.6,
 
-        "learning_rate_start":  3.0e-5,
-        "learning_rate_end": 5.0e-6,
+        "learning_rate_start":  1.0e-5,
+        "learning_rate_end": 2.0e-6,
         "lr_schedule_type": "linear",
         "lr_schedule_warmup_pct": 0.3,
         "lr_schedule_ramping_pct": 0.6,
 
-        "ent_coef_start": 0.005,
-        "ent_coef_end": 0.0001,
+        "ent_coef_start": 0.0015,
+        "ent_coef_end": 0.00005,
         "ent_coef_schedule_type": "linear",
-        "ent_coef_schedule_warmup_pct": 0.3,
+        "ent_coef_schedule_warmup_pct": 0.2,
         "ent_coef_schedule_ramping_pct": 0.6,
 
         "action_limiting_factor_start": 0.06,
@@ -158,7 +159,7 @@
         "seed": 42,
         "total_timesteps": 20000000,
         "train_log_freq": 10,
-        "eval_freq": 200000,
+        "eval_freq": 250000,
         "n_eval_episodes": 100,
         "eval_deterministic": false,
         "progress_bar": true,

@@ -2098,22 +2098,46 @@ class TradingEnv(gym.Env):
 
         # ----- Portfolio mode: action is target weights vector -----
         elif self.execution_mode == EXECUTION_PORTFOLIO_WEIGHTS:
-            # Validate action input ------------------------------------
+            # Get and Validate action input ------------------------------------
+            raw_action = np.asarray(action, dtype=np.float32)
             if np.any(np.isnan(action)):
                 raise ValueError("Raw action input contains NaN values")
-
-            raw_action = np.asarray(action, dtype=np.float32)
+            if raw_action.ndim != 1:
+                raise ValueError(f"Action must be 1D, got shape {raw_action.shape}")
             if len(raw_action) != self.market_data_cache.num_assets:
                 raise ValueError(f"Action length must be {self.market_data_cache.num_assets}, got {len(raw_action)}")
+            # Explicit fixed anchor: cash logit is always 0
+            cash_logit = 0.0
 
-            # Softmax logits directly from raw action for stable simplex projection and more stable gradients.
-            asset_logits = np.asarray(action, dtype=np.float32)
-            exp_asset_logits = np.exp(asset_logits - np.max(asset_logits))
-            asset_weights = exp_asset_logits / (1.0 + np.sum(exp_asset_logits))
-            # cash is inferred as residual to ensure exact simplex constraint; this also provides more stable gradients for the policy
-            cash_weight = 1.0 - np.sum(asset_weights)
-            weights = np.concatenate([[cash_weight], asset_weights]).astype(np.float32)
+            # If policy output is non-finite, HOLD current weights (safer than forced all-cash jump)
+            if not np.all(np.isfinite(raw_action)):
+                weights = self.portfolio_state.get_weights().astype(np.float32)
+                print("Warning: Non-finite action output detected; defaulting to HOLD (current weights).")
+            else:
+                # Build full logits [cash, assets...]
+                full_logits = np.empty(raw_action.size + 1, dtype=np.float64)
+                full_logits[0] = cash_logit
+                full_logits[1:] = raw_action
 
+                # Stable softmax shift (equivalent to max(0, max(asset_logits)))
+                full_logits -= np.max(full_logits)
+
+                exp_logits = np.exp(full_logits)
+                den = np.sum(exp_logits)
+
+                # Defensive fallback if denominator is pathological
+                if (not np.isfinite(den)) or (den <= 0.0):
+                    weights = self.portfolio_state.get_weights().astype(np.float32)
+                else:
+                    weights = (exp_logits / den).astype(np.float32)
+
+            # Final numerical hygiene only
+            sum_w = float(np.sum(weights, dtype=np.float64))
+            if (not np.isfinite(sum_w)) or (sum_w <= 0.0):
+                weights = self.portfolio_state.get_weights().astype(np.float32)
+            else:
+                weights /= sum_w
+                
             # legacy, dont know exactly, didnt bother
             weight_change_target = weights
 
@@ -3147,21 +3171,31 @@ class TradingEnv(gym.Env):
         num_assets = self.market_data_cache.num_assets
         current_prices = portfolio_state.prices.copy()
 
-        should_execute, adjusted_target_weights = self._check_execution_thresholds(target_weights, portfolio_state)
-        if not should_execute:
-            return ExecutionResult(
-                current_step=self.current_step,
-                trades_executed=np.zeros(num_assets, dtype=np.float32),
-                executed_prices=current_prices,
-                transaction_cost=0.0,
-                success=False,
-                traded_dollar_value=0.0,
-                traded_shares_total=0.0,
-                traded_notional_per_asset=np.zeros(num_assets, dtype=np.float32)
-            )
+        # Threshold gating disabled to check for instability reasons
+        # should_execute, adjusted_target_weights = self._check_execution_thresholds(target_weights, portfolio_state)
+        # if not should_execute:
+        #     return ExecutionResult(
+        #         current_step=self.current_step,
+        #         trades_executed=np.zeros(num_assets, dtype=np.float32),
+        #         executed_prices=current_prices,
+        #         transaction_cost=0.0,
+        #         success=False,
+        #         traded_dollar_value=0.0,
+        #         traded_shares_total=0.0,
+        #         traded_notional_per_asset=np.zeros(num_assets, dtype=np.float32)
+        #     )
 
         current_weights = portfolio_state.get_weights()
         total_value = portfolio_state.get_total_value()
+
+        # --- Intro of smooth exec ---
+        current_weights = portfolio_state.get_weights()
+        adjusted_target_weights = self._apply_soft_execution(
+            target_weights=target_weights,
+            current_weights=current_weights,
+            portfolio_state=portfolio_state
+        )
+
 
         desired_allocations = adjusted_target_weights * total_value
         current_allocations = current_weights * total_value
@@ -3270,6 +3304,58 @@ class TradingEnv(gym.Env):
             traded_shares_total=traded_shares_total,
             traded_notional_per_asset=traded_notional_per_asset
         )
+
+    def _apply_soft_execution(
+        self, 
+        target_weights: np.ndarray, 
+        current_weights: np.ndarray,
+        portfolio_state: PortfolioState
+    ) -> np.ndarray:
+        """
+        Apply smooth partial rebalance with deadband.
+        
+        Instead of hard all-or-nothing gate, apply a soft step toward target.
+        Maps continuous policy output → continuous weight changes.
+        
+        Args:
+            target_weights: Desired weights from policy softmax
+            current_weights: Current portfolio weights
+            portfolio_state: Current portfolio state (for metrics)
+        
+        Returns:
+            adjusted_target_weights: Executed weights (partial step toward target)
+        """
+        # Deadband: ignore changes smaller than this
+        deadband = float(self.config['environment'].get('execution_deadband', 0.002))
+        
+        # Step size: how much of the desired change to actually execute (0.0–1.0)
+        # 0.25–0.35 typical; smaller = more conservative, larger = more aggressive
+        step_size = float(self.config['environment'].get('execution_step_size', 0.30))
+        
+        # Compute desired change
+        weight_delta = target_weights - current_weights  # shape (num_assets,)
+        
+        # Apply deadband: set small changes to zero
+        deadband_mask = np.abs(weight_delta) < deadband
+        weight_delta_filtered = weight_delta.copy()
+        weight_delta_filtered[deadband_mask] = 0.0
+        
+        # Apply soft step: move partway toward target
+        executed_delta = step_size * weight_delta_filtered
+        
+        # Compute executed weights
+        executed_weights = current_weights + executed_delta
+        
+        # Normalize (enforce w_i >= 0, sum(w) = 1)
+        executed_weights = np.clip(executed_weights, 0.0, None)
+        total = np.sum(executed_weights)
+        if total > 1e-8:
+            executed_weights = executed_weights / total
+        else:
+            # Fallback: if all weights vanish, stay put
+            executed_weights = current_weights.copy()
+        
+        return executed_weights.astype(np.float32)
 
     def execute_instructions(self, instructions: List[TradeInstruction]) -> Tuple[ExecutionResult, List[Dict[str, Any]]]:
         """

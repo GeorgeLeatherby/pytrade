@@ -1738,22 +1738,22 @@ def run(cache: MarketDataCache, config: Dict[str, Any]) -> Dict[str, Any]:
         feature_to_index=cache.feature_to_index
         )
     
-    # Normalize allocator (PAA) envs after SAA augmentation
+    # Normalize allocator (PAA) obs and/or reward after SAA augmentation
     vec_train = VecNormalize(
         vec_train_saa,
         norm_obs=True,
         norm_reward=True,
         clip_obs=10.0,
-        clip_reward=np.inf,
+        clip_reward=10.0,
         gamma=gamma_cfg,
         training=True,
     )
     vec_eval = VecNormalize(
         vec_eval_saa,
         norm_obs=True,
-        norm_reward=False,
+        norm_reward=False, # Do not norm rewards in eval
         clip_obs=10.0,
-        clip_reward=np.inf,
+        clip_reward=10.0,
         gamma=gamma_cfg,
         training=False,  # freeze stats for eval
     )
