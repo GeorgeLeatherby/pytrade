@@ -39,7 +39,9 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.policies import ActorCriticPolicy
 # from stable_baselines3.common.distributions import Normal
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv, VecEnvWrapper, VecEnv
+from stable_baselines3.common.vec_env import (
+    VecNormalize, DummyVecEnv, VecEnvWrapper, VecEnv, sync_envs_normalization
+)
 from stable_baselines3.common.evaluation import evaluate_policy
 
 import gymnasium as gym
@@ -1121,8 +1123,9 @@ class SAASignalWrapper(VecEnvWrapper):
     
 
 class AttentionEngine(nn.Module):
-    def __init__(self, feature_dim: int, n_assets: int, d_model: int, n_heads: int, n_layers: int, dim_feedforward: int,
-                 transformer_encoder_dropout: float, transformer_activation_fn: str = "relu"):
+    def __init__(self, feature_dim: int, n_assets: int, d_model: int, n_heads: int, 
+                n_layers: int, dim_feedforward: int, transformer_encoder_dropout: float, 
+                transformer_activation_fn: str = "relu"):
         super().__init__()
         self.n_assets = n_assets
         self.d_model = d_model
@@ -1134,14 +1137,19 @@ class AttentionEngine(nn.Module):
             dim_feedforward=dim_feedforward,  # Use provided feedforward dimension
             batch_first=True,  # Use batch_first for easier integration with SB3
             dropout=transformer_encoder_dropout,
-            activation=transformer_activation_fn
+            activation=transformer_activation_fn,
+            norm_first=True  # Pre-LN often stabilizes training in RL contexts
 
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
         # 2. SB3 Dimension Requirements
-        # Actor (pi) will see all asset tokens flattened
-        self.latent_dim_pi = n_assets * d_model 
+        # # Old implementation
+        # # Actor (pi) will see all asset tokens flattened
+        # self.latent_dim_pi = n_assets * d_model 
+
+        # Actor (pi) reads from portfolio token as well
+        self.latent_dim_pi = d_model
         # Critic (vf) will see ONLY the portfolio [CLS] token
         self.latent_dim_vf = d_model 
 
@@ -1157,8 +1165,11 @@ class AttentionEngine(nn.Module):
         attended = self.transformer(x)  
 
         # 3. Extract Actor and Critic Latent Representations
-        # latent pi: Tokens 0 to N-1 (assets)
-        latent_pi = attended[:, :self.n_assets, :].reshape(batch_size, -1)
+        # # Old latent pi: Tokens 0 to N-1 (assets)
+        # latent_pi = attended[:, :self.n_assets, :].reshape(batch_size, -1)
+
+        # New latent pi: Token N (portfolio) only
+        latent_pi = attended[:, -1, :]  # (B, d_model)
 
         # latent vf: Token N (portfolio [CLS])
         latent_vf = attended[:, -1, :]
@@ -1676,6 +1687,216 @@ def build_allocator_eval_callback(
     
     return eval_callback
 
+# --- Pretraining Critic / Value Function (Optional) ---
+def _sample_random_vec_action(vec_env: VecEnv) -> np.ndarray:
+    # shape: [n_envs, action_dim]
+    acts = [vec_env.action_space.sample() for _ in range(vec_env.num_envs)]
+    return np.asarray(acts, dtype=np.float32)
+
+
+def _warmup_vecnormalize_obs_stats(vec_env: VecNormalize, warmup_steps: int) -> None:
+    if warmup_steps <= 0:
+        return
+
+    old_training = bool(vec_env.training)
+    old_norm_reward = bool(vec_env.norm_reward)
+
+    # Update obs_rms only
+    vec_env.training = True
+    vec_env.norm_reward = False
+
+    obs = vec_env.reset()  # shape: [1, obs_dim]
+    assert obs.ndim == 2 and obs.shape[0] == vec_env.num_envs
+
+    for _ in range(warmup_steps):
+        action = _sample_random_vec_action(vec_env)  # shape: [1, action_dim]
+        obs, _, dones, _ = vec_env.step(action)
+        if np.any(dones):
+            obs = vec_env.reset()
+
+    vec_env.training = old_training
+    vec_env.norm_reward = old_norm_reward
+
+
+def _collect_mc_dataset_random_policy(
+    vec_env: VecNormalize,
+    n_episodes: int,
+    gamma: float
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Collect offline dataset from random actions.
+    Returns:
+    - obs_all: [N, obs_dim]
+    - rtg_all: [N]
+    """
+    assert vec_env.num_envs == 1, "Project rule: single env only"
+
+    old_training = bool(vec_env.training)
+    old_norm_reward = bool(vec_env.norm_reward)
+
+    # Freeze normalization stats and use raw reward targets
+    vec_env.training = False
+    vec_env.norm_reward = False
+
+    all_obs: List[np.ndarray] = []
+    all_targets: List[np.ndarray] = []
+
+    for _ in range(n_episodes):
+        obs = vec_env.reset()  # [1, obs_dim]
+        done = False
+        ep_obs: List[np.ndarray] = []
+        ep_rewards: List[float] = []
+
+        while not done:
+            ep_obs.append(obs[0].astype(np.float32, copy=True))  # [obs_dim]
+            action = _sample_random_vec_action(vec_env)          # [1, action_dim]
+            obs, rewards, dones, _ = vec_env.step(action)
+            ep_rewards.append(float(rewards[0]))
+            done = bool(dones[0])
+
+        r = np.asarray(ep_rewards, dtype=np.float32)             # [T]
+        y = np.zeros_like(r, dtype=np.float32)                   # [T]
+        running = np.float32(0.0)
+        for t in range(r.shape[0] - 1, -1, -1):
+            running = r[t] + np.float32(gamma) * running
+            y[t] = running
+
+        ep_obs_np = np.asarray(ep_obs, dtype=np.float32)         # [T, obs_dim]
+        assert ep_obs_np.shape[0] == y.shape[0]
+        all_obs.append(ep_obs_np)
+        all_targets.append(y)
+
+    vec_env.training = old_training
+    vec_env.norm_reward = old_norm_reward
+
+    obs_all = np.concatenate(all_obs, axis=0).astype(np.float32)      # [N, obs_dim]
+    rtg_all = np.concatenate(all_targets, axis=0).astype(np.float32)  # [N]
+    assert obs_all.shape[0] == rtg_all.shape[0]
+    return obs_all, rtg_all
+
+
+def _pretrain_allocator_critic(
+    model: PPO,
+    train_obs: np.ndarray,
+    train_targets: np.ndarray,
+    val_obs: np.ndarray,
+    val_targets: np.ndarray,
+    critic_cfg: Dict[str, Any],
+) -> Dict[str, float]:
+    """
+    Supervised value pretraining with MSE.
+    Uses policy.predict_values(obs) so only critic path receives gradients from loss.
+    """
+    device = model.device
+    batch_size = int(critic_cfg.get("batch_size", 1024))
+    learning_rate = float(critic_cfg.get("learning_rate", 1e-4))
+    max_epochs = int(critic_cfg.get("max_epochs", 30))
+    patience = int(critic_cfg.get("early_stopping_patience", 6))
+    min_delta = float(critic_cfg.get("early_stopping_min_delta", 1e-5))
+    max_grad_norm = float(critic_cfg.get("max_grad_norm", 1.0))
+
+    verbose = int(critic_cfg.get("verbose", 1))
+    log_every_n_epochs = int(critic_cfg.get("log_every_n_epochs", 5))
+
+    x_train = torch.as_tensor(train_obs, dtype=torch.float32, device=device)   # [N, obs_dim]
+    y_train = torch.as_tensor(train_targets, dtype=torch.float32, device=device)  # [N]
+    x_val = torch.as_tensor(val_obs, dtype=torch.float32, device=device)       # [M, obs_dim]
+    y_val = torch.as_tensor(val_targets, dtype=torch.float32, device=device)   # [M]
+
+    assert x_train.ndim == 2 and x_val.ndim == 2
+    assert y_train.ndim == 1 and y_val.ndim == 1
+    assert x_train.shape[0] == y_train.shape[0]
+    assert x_val.shape[0] == y_val.shape[0]
+
+    loss_fn = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.policy.parameters(), lr=learning_rate)
+
+    best_state = copy.deepcopy(model.policy.state_dict())
+    best_val = float("inf")
+    best_epoch = -1
+    bad_epochs = 0
+
+    model.policy.train()
+    n = x_train.shape[0]
+
+    for epoch in range(max_epochs):
+        perm = torch.randperm(n, device=device)
+        train_loss_sum = 0.0
+        n_batches = 0
+
+        for start in range(0, n, batch_size):
+            idx = perm[start:start + batch_size]
+            xb = x_train[idx]                                  # [B, obs_dim]
+            yb = y_train[idx]                                  # [B]
+            pred = model.policy.predict_values(xb).squeeze(-1) # [B]
+
+            loss = loss_fn(pred, yb)
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.policy.parameters(), max_grad_norm)
+            optimizer.step()
+
+            train_loss_sum += float(loss.item())
+            n_batches += 1
+
+        train_loss = train_loss_sum / max(1, n_batches)
+
+        model.policy.eval()
+        with torch.no_grad():
+            val_pred = model.policy.predict_values(x_val).squeeze(-1)  # [M]
+            val_loss = float(loss_fn(val_pred, y_val).item())
+
+        model.policy.train()
+
+        if verbose > 0 and (
+            epoch == 0
+            or (epoch + 1) % log_every_n_epochs == 0
+            or bad_epochs + 1 >= patience
+            or epoch + 1 == max_epochs
+        ):
+            print(
+                f"[critic_pretraining] "
+                f"epoch={epoch + 1}/{max_epochs} "
+                f"train_mse={train_loss:.6f} "
+                f"val_mse={val_loss:.6f} "
+                f"best_val_mse={best_val:.6f} "
+                f"bad_epochs={bad_epochs}"
+            )
+
+        if val_loss < (best_val - min_delta):
+            best_val = val_loss
+            best_epoch = epoch
+            best_state = copy.deepcopy(model.policy.state_dict())
+            bad_epochs = 0
+        else:
+            bad_epochs += 1
+            if bad_epochs >= patience:
+                break
+
+    model.policy.load_state_dict(best_state)
+
+    return {
+        "best_val_mse": best_val,
+        "best_epoch": best_epoch,
+        "train_samples": int(x_train.shape[0]),
+        "val_samples": int(x_val.shape[0]),
+    }
+
+
+def _reset_ppo_optimizer_after_pretraining(model: PPO) -> None:
+    # Reinitialize optimizer/schedule state before PPO learning phase
+    optimizer_class = getattr(model.policy, "optimizer_class", torch.optim.Adam)
+    optimizer_kwargs = getattr(model.policy, "optimizer_kwargs", {})
+    lr0 = float(model.lr_schedule(1.0))
+
+    model.policy.optimizer = optimizer_class(
+        model.policy.parameters(),
+        lr=lr0,
+        **optimizer_kwargs
+    )
+    model._current_progress_remaining = 1.0
+    model._n_updates = 0
 
 # ================================
 # Entry Point
@@ -1706,11 +1927,14 @@ def run(cache: MarketDataCache, config: Dict[str, Any]) -> Dict[str, Any]:
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    # Extract gamma for VecNormalize reward normalization
+    # Extract config info like gamma for VecNormalize reward normalization
     gamma_cfg = config.get("portfolio_allocator_agent", {}).get("gamma", 0.99)
     saa_config = config.get("saa_config", {})
     num_assets = cache.num_assets
     raw_feature_dim = cache.num_features
+    
+    critic_cfg = config.get("critic_pretraining", {})
+    do_pretrain = bool(critic_cfg.get("enabled", False))
     
     # Load frozen SAA once
     saa_model, saa_vecnorm, saa_device = _load_saa_from_config(saa_config)
@@ -1810,6 +2034,59 @@ def run(cache: MarketDataCache, config: Dict[str, Any]) -> Dict[str, Any]:
 
     print("[run] PPO allocator model built successfully")
     
+    # Pretraining the critic with offline Monte Carlo targets can provide a better starting point for PPO training, especially in complex environments where learning a good value function from scratch is difficult. This section performs the following steps if critic pretraining is enabled in the config:
+    if do_pretrain:
+        print("[run] Starting pretraining phase for critic")
+        gamma = float(config.get("portfolio_allocator_agent", {}).get("gamma", 0.99))  # same gamma as PPO
+        warmup_steps = int(critic_cfg.get("warmup_steps", 20000))
+        train_episodes = int(critic_cfg.get("train_episodes", 500))
+        val_episodes = int(critic_cfg.get("validation_episodes", 100))
+
+        # 1) warmup obs normalization stats on train env
+        _warmup_vecnormalize_obs_stats(vec_train, warmup_steps)
+
+        # 2) copy obs stats to validation env (train/val split remains env-mode based)
+        sync_envs_normalization(vec_train, vec_eval)
+
+        # 3) collect offline MC datasets (random actions)
+        train_obs, train_targets = _collect_mc_dataset_random_policy(
+            vec_env=vec_train,
+            n_episodes=train_episodes,
+            gamma=gamma
+        )
+        val_obs, val_targets = _collect_mc_dataset_random_policy(
+            vec_env=vec_eval,
+            n_episodes=val_episodes,
+            gamma=gamma
+        )
+
+        # handshake checks
+        obs_dim = int(vec_train.observation_space.shape[0])
+        assert train_obs.shape[1] == obs_dim and val_obs.shape[1] == obs_dim
+        assert train_obs.shape[0] == train_targets.shape[0]
+        assert val_obs.shape[0] == val_targets.shape[0]
+
+        # 4) supervised critic pretraining
+        pt_stats = _pretrain_allocator_critic(
+            model=model,
+            train_obs=train_obs,
+            train_targets=train_targets,
+            val_obs=val_obs,
+            val_targets=val_targets,
+            critic_cfg=critic_cfg,
+        )
+        print("[critic_pretraining] summary:", pt_stats)
+
+        # 5) handoff to PPO phase: fresh optimizer/schedule state
+        _reset_ppo_optimizer_after_pretraining(model)
+
+        # ensure RL flags for normal PPO phase
+        vec_train.training = True
+        vec_train.norm_reward = True
+        vec_eval.training = False
+        vec_eval.norm_reward = False
+
+    else: print("[run] Critic pretraining disabled by config, skipping directly to PPO training")
 
     # --- Setup Logging Directories ---
     # Get agent directory (same folder as this module)
