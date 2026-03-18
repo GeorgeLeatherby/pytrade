@@ -11,9 +11,9 @@
         "d_model": 128,
         "dim_feedforward": 512,
         "n_heads": 4,
-        "n_layers": 4,
+        "n_layers": 2,
         "transformer_encoder_dropout": 0.1,
-        "transformer_activation_fn": "relu",
+        "transformer_activation_fn": "gelu",
         "pi_mpl_hidden_dims": [64],
         "vf_mpl_hidden_dims": [64]
   },
@@ -116,13 +116,13 @@
     },
 
     "critic_pretraining": {
-        "enabled": false,
-        "warmup_steps": 200000,
-        "train_episodes": 500,
-        "validation_episodes": 100,
+        "enabled": true,
+        "warmup_steps": 1000,
+        "train_episodes": 40,
+        "validation_episodes": 33,
         "batch_size": 2048,
         "learning_rate": 1e-4,
-        "max_epochs": 30,
+        "max_epochs": 40,
         "early_stopping_patience": 6,
         "early_stopping_min_delta": 1e-5,
         "max_grad_norm": 0.8,
@@ -131,7 +131,7 @@
     },
 
     "portfolio_allocator_agent":{
-        "device": "auto",
+        "device": "cpu",
         "verbose": 1,
         "n_epochs": 2,
         "n_steps": 4096,
@@ -145,8 +145,8 @@
         "log_std_init": -1.0,
         "clip_range_vf": 0.2,
         
-        "clip_range_start": 0.08,
-        "clip_range_end": 0.03,
+        "clip_range_start": 0.12,
+        "clip_range_end": 0.06,
         "clip_schedule_warmup_pct": 0.2,
         "clip_schedule_ramping_pct": 0.6,
 

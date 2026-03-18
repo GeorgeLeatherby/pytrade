@@ -11,7 +11,7 @@ Architecture:
     2. Global portfolio token
 - Embedding: Linear projection → d_model dimensions
 - Transformer Encoder: Self-attention across N+1 tokens (N assets tokens + 1 portfolio token)
-- Output Heads: Per-asset N raw allocation logits → sigmoid output in [0, 1]
+- Output Heads: Per-asset N raw allocation logits, also derived from portfolio token
     Environment houses fixed cash logit (=0) & applies post-policy normalization to valid portfolio weights)
 - Value Head: Portfolio token → scalar value estimate
 - PPO Training: Standard (non-recurrent) PPO
@@ -22,6 +22,7 @@ Environment is EXECUTION_PORTFOLIO mode (full multi-asset rebalancing at each st
 Config-driven: All hyperparameters loaded from JSON (transformer architecture, PPO settings, rewards).
 """
 
+import math
 import os
 import time
 import json
@@ -1126,11 +1127,13 @@ class AttentionEngine(nn.Module):
     def __init__(self, feature_dim: int, n_assets: int, d_model: int, n_heads: int, 
                 n_layers: int, dim_feedforward: int, transformer_encoder_dropout: float, 
                 transformer_activation_fn: str = "relu"):
+        
         super().__init__()
         self.n_assets = n_assets
         self.d_model = d_model
+        self.n_layers = int(n_layers)
 
-        # 1. Transformer Encoder: Using batch_first = True simplifies shapes
+        # 1. Shared Transformer Encoder (N layers): builds cross-asset context for both heads.
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=n_heads,
@@ -1139,19 +1142,56 @@ class AttentionEngine(nn.Module):
             dropout=transformer_encoder_dropout,
             activation=transformer_activation_fn,
             norm_first=True  # Pre-LN often stabilizes training in RL contexts
-
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
-        # 2. SB3 Dimension Requirements
-        # # Old implementation
-        # # Actor (pi) will see all asset tokens flattened
-        # self.latent_dim_pi = n_assets * d_model 
+        # 2. Private final layers (one per head).
+        #    Each head owns one TransformerEncoderLayer that only ever receives
+        #    gradients from its own loss, absorbing diverging actor/critic gradient
+        #    signals before they reach the shared base.
+        #    Actor layer : processes asset tokens [0..N-1] then mean-pools → latent_pi
+        #    Critic layer: processes portfolio token [-1] only          → latent_vf
+        def _make_head_layer() -> nn.TransformerEncoderLayer:
+            return nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=n_heads,
+                dim_feedforward=dim_feedforward,
+                batch_first=True,
+                dropout=transformer_encoder_dropout,
+                activation=transformer_activation_fn,
+                norm_first=True,
+            )
+        self.actor_final_layer = _make_head_layer()
+        self.critic_final_layer = _make_head_layer()
 
-        # Actor (pi) reads from portfolio token as well
-        self.latent_dim_pi = d_model
-        # Critic (vf) will see ONLY the portfolio [CLS] token
-        self.latent_dim_vf = d_model 
+        self._init_transformer_weights()
+
+        # 3. SB3 Dimension Requirements
+        self.latent_dim_pi = d_model  # actor: mean-pooled asset tokens → d_model
+        self.latent_dim_vf = d_model  # critic: portfolio [CLS] token   → d_model
+
+    def _init_transformer_weights(self) -> None:
+        residual_gain = 1.0 / math.sqrt(2.0 * max(1, self.n_layers))
+
+        # Xavier init + zero biases for all three modules.
+        # Private head layers use standard Xavier (single layer, no residual scaling needed).
+        for mod in [self.transformer, self.actor_final_layer, self.critic_final_layer]:
+            for module in mod.modules():
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+            # MultiheadAttention QKV packed projections are raw Parameters, not nn.Linear.
+            for name, param in mod.named_parameters():
+                if "in_proj_weight" in name:
+                    nn.init.xavier_uniform_(param)
+                elif "in_proj_bias" in name:
+                    nn.init.zeros_(param)
+
+        # GPT-2 style residual branch scaling for the deep shared stack only.
+        for name, param in self.transformer.named_parameters():
+            if param.ndim >= 2 and ("out_proj.weight" in name or "linear2.weight" in name):
+                nn.init.xavier_uniform_(param, gain=residual_gain)
 
     def forward(self, features: torch.Tensor):
         batch_size = features.shape[0]
@@ -1160,22 +1200,23 @@ class AttentionEngine(nn.Module):
         # Sequence length = N_assets + 1 (portfolio token)
         x = features.view(batch_size, self.n_assets + 1, self.d_model)
 
-        # 2. Cross-Asset Attention Pass
-        # Assets attend to each other and the portfolio token
-        attended = self.transformer(x)  
+        # 2. Shared cross-asset attention pass (all tokens attend to each other)
+        attended = self.transformer(x)
 
-        # 3. Extract Actor and Critic Latent Representations
-        # # Old latent pi: Tokens 0 to N-1 (assets)
-        # latent_pi = attended[:, :self.n_assets, :].reshape(batch_size, -1)
+        # 3. Private actor path: asset tokens [0..N-1] → actor_final_layer → mean-pool
+        #    Gradient from L_policy enters the shared base through asset token positions.
+        asset_tokens = attended[:, :self.n_assets, :]            # (B, N, d_model)
+        actor_out = self.actor_final_layer(asset_tokens)          # (B, N, d_model)
+        latent_pi = actor_out.mean(dim=1)                         # (B, d_model)
 
-        # New latent pi: Token N (portfolio) only
-        latent_pi = attended[:, -1, :]  # (B, d_model)
-
-        # latent vf: Token N (portfolio [CLS])
-        latent_vf = attended[:, -1, :]
+        # 4. Private critic path: portfolio token [-1] → critic_final_layer → squeeze
+        #    Gradient from L_value enters the shared base through portfolio token position.
+        portfolio_token = attended[:, -1:, :]                     # (B, 1, d_model)
+        critic_out = self.critic_final_layer(portfolio_token)     # (B, 1, d_model)
+        latent_vf = critic_out.squeeze(1)                         # (B, d_model)
 
         return latent_pi, latent_vf
-    
+
     # SB3 expects these helpers (mirrors MlpExtractor API)
     def forward_actor(self, features: torch.Tensor) -> torch.Tensor:
         latent_pi, _ = self.forward(features)
@@ -1270,6 +1311,33 @@ class SAATokenizer(BaseFeaturesExtractor):
         self.asset_embedding = nn.Linear(asset_token_in_dim, d_model)
         self.portfolio_embedding = nn.Linear(portfolio_token_in_dim, d_model)
 
+        # Learned asset identity embeddings
+        self.asset_id_embedding = nn.Embedding(self.n_assets, d_model)
+
+        # Stability helpers: small gated contribution + normalization after addition
+        self.asset_id_scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
+        self.asset_token_norm = nn.LayerNorm(d_model)
+
+        # Reusable asset index buffer (moves with module device)
+        self.register_buffer(
+            "asset_ids",
+            torch.arange(self.n_assets, dtype=torch.long),
+            persistent=False,
+        )
+
+        # Initialize tokenizer projection layers with Xavier uniform and zero biases
+        nn.init.xavier_uniform_(self.asset_embedding.weight)
+        if self.asset_embedding.bias is not None:
+            nn.init.zeros_(self.asset_embedding.bias)
+
+        nn.init.xavier_uniform_(self.portfolio_embedding.weight)
+        if self.portfolio_embedding.bias is not None:
+            nn.init.zeros_(self.portfolio_embedding.bias)
+
+        # Keep small init for identity embeddings
+        nn.init.normal_(self.asset_id_embedding.weight, mean=0.0, std=0.02)
+
+
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         """
         observations: (B, n_assets*(raw_feat_dim+1) + portfolio_dim)
@@ -1302,6 +1370,13 @@ class SAATokenizer(BaseFeaturesExtractor):
 
         asset_tokens = self.asset_embedding(asset_token_inputs)            # (B, N, d_model)
 
+        # Inject learned asset identity
+        asset_id_idx = self.asset_ids.unsqueeze(0).expand(B, -1)           # (B, N)
+        asset_id_tokens = self.asset_id_embedding(asset_id_idx)            # (B, N, d_model)
+        asset_tokens = self.asset_token_norm(
+            asset_tokens + self.asset_id_scale * asset_id_tokens
+        )
+
         # Portfolio token: time features (from asset 0 raw feats) + full portfolio block
         time_feats = raw_feats[:, 0, self.portfolio_time_idx]              # (B, len(portfolio_time_idx))
         if time_feats.shape[-1] != len(self.portfolio_time_idx):
@@ -1328,7 +1403,7 @@ def _load_saa_from_config(saa_config: Dict[str, Any]) -> Tuple[Any, Optional[Vec
     if missing:
         raise ValueError(f"Missing required SAA config keys: {missing}")
 
-    device = torch.device(saa_config.get("device", "cpu"))
+    device = torch.device(saa_config.get("device", "auto"))
     run_id = str(saa_config["saa_run_id"])
     base_dir = saa_config["saa_base_dir"]
     config_id = str(saa_config["saa_config_id"])
@@ -1464,7 +1539,7 @@ def build_allocator_model(
             asset_feature_idx=paa_asset_token_idx,
             portfolio_time_idx=paa_portfolio_token_idx
         ),
-        net_arch=dict(pi=pi_mpl_hidden_dims, vf=vf_mpl_hidden_dims),  # No additional MLP layers after attention; all processing in attention engine! Vital!           
+        net_arch=dict(pi=pi_mpl_hidden_dims, vf=vf_mpl_hidden_dims),            
         log_std_init=log_std_init # Initial log std for action distribution (can be tuned for exploration)
     )
 

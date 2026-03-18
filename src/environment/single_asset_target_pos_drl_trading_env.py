@@ -340,7 +340,7 @@ class EpisodeBuffer:
             self.reward_risk[internal_offset_step] = reward_parts.get("risk_component", 0.0)
             self.reward_portfolio_return[internal_offset_step] = reward_parts.get("portfolio_return_component", 0.0)
             self.reward_cost[internal_offset_step] = reward_parts.get("cost_component", 0.0)
-            self.reward_turnover[internal_offset_step] = reward_parts.get("turnover_component", 0.0)
+            self.reward_turnover[internal_offset_step] = reward_parts.get("turnover", 0.0)
             self.reward_concentration[internal_offset_step] = reward_parts.get("concentration_component", 0.0)
             self.reward_survival[internal_offset_step] = reward_parts.get("survival_component", 0.0)
         
@@ -1514,7 +1514,7 @@ class TradingEnv(gym.Env):
         elif self.execution_mode == EXECUTION_PORTFOLIO_WEIGHTS:
             # ------ Action space: Continuous weights for each asset + cash (sum to 1) ------
             self.action_space = spaces.Box(
-                low=-10.0, high=10.0, shape=(num_assets,), dtype=np.float32
+                low=-2.0, high=2.0, shape=(num_assets,), dtype=np.float32
             )
         else:
             # Simple/Tranche modes: action is a list of instructions; Gym does not have a list space.
@@ -2008,7 +2008,8 @@ class TradingEnv(gym.Env):
         MODES:
             Single_asset_target_pos mode:
                 Action is target position for selected asset only; execute trade to reach target
-                Only the given asset is tradable; other assets remain at 0 position!
+                Only the given asset is tradable; other assets are held but not traded. This allows 
+                for focused learning on single-asset dynamics and clearer attribution of rewards to actions.
             
             Portfolio mode:
                 Function represents a single day in the trading simulation where:
@@ -2734,7 +2735,7 @@ class TradingEnv(gym.Env):
             benchmark_return = (benchmark_after / benchmark_before)
         else:
             benchmark_return = 0.0
-
+        
         # ---------- Differential Sortino ratio components ----------
         # Get simple returns
         portfolio_return_absolut = portfolio_return - 1.0
@@ -2771,10 +2772,21 @@ class TradingEnv(gym.Env):
         max_drawdown_penalty = float(self.lambda_drawdown * max_drawdown_delta)
 
         # 4. Mix in raw return & windowed drawdown level penalty
+        # first_reward = (self.sortino_net_reward_mix * sortino_reward + 
+        #           (1 - self.sortino_net_reward_mix) * portfolio_return_absolut) - max_drawdown_penalty
+        # reward = first_reward
 
-        first_reward = (self.sortino_net_reward_mix * sortino_reward + 
-                  (1 - self.sortino_net_reward_mix) * portfolio_return_absolut) - max_drawdown_penalty
-        reward = first_reward
+        """ New reward try """
+        # TODO: Consider reintroducing mix with diff sortino but based on the comparison log diff returns!
+        # Core objective: outperform static comparison portfolio from same random init
+        eps = 1e-12
+        port_log_ret = np.log(max(float(portfolio_after), eps)) - np.log(max(float(portfolio_before), eps))
+        comp_log_ret = np.log(max(float(comparison_after), eps)) - np.log(max(float(comparison_before), eps))
+        excess_log_ret = port_log_ret - comp_log_ret
+
+        # Risk control: penalize worsening drawdown (incremental only)
+        reward = float(excess_log_ret - self.lambda_drawdown * max_drawdown_delta)
+
 
         # # 4b. Concentration term on executed normalized weights.
         # # action is expected to be the already-normalized execution target w.
@@ -2790,14 +2802,14 @@ class TradingEnv(gym.Env):
         #         second_reward = concentration_pen + first_reward
         #         reward = second_reward
 
-        # 4c. Transaction cost penalty (scaled by lambda_cost)
-        transaction_cost_level = 0.0001*self.initial_portfolio_value
-        if execution_result.transaction_cost > transaction_cost_level:
-            self.trans_act_pen = self.lambda_transaction_cost * (execution_result.transaction_cost - transaction_cost_level)
-            third_reward = reward - self.trans_act_pen
-            reward = third_reward
-        else: 
-            self.trans_act_pen = 0.0
+        # # 4c. Transaction cost penalty (scaled by lambda_cost)
+        # transaction_cost_level = 0.0001*self.initial_portfolio_value
+        # if execution_result.transaction_cost > transaction_cost_level:
+        #     self.trans_act_pen = self.lambda_transaction_cost * (execution_result.transaction_cost - transaction_cost_level)
+        #     third_reward = reward - self.trans_act_pen
+        #     reward = third_reward
+        # else: 
+        #     self.trans_act_pen = 0.0
 
         # # 5. Clip and amplify reward
         # gain = float(3.5)
