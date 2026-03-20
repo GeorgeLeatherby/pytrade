@@ -80,7 +80,7 @@
         "episode_length_days": 252,
         "lookback_window": 0,
         "early_stopping_threshold": 0.2,
-        "cash_drag_rate_pa": 0.015,
+        "cash_drag_rate_pa": 0.018,
         "seed": 42,
         "maybe_provide_sequence": false,
         "block_buffer_multiplier": 1.2,
@@ -117,41 +117,41 @@
 
     "critic_pretraining": {
         "enabled": true,
-        "warmup_steps": 1000,
-        "train_episodes": 40,
+        "warmup_steps": 20000,
+        "train_episodes": 100,
         "validation_episodes": 33,
         "batch_size": 2048,
         "learning_rate": 1e-4,
-        "max_epochs": 40,
+        "max_epochs": 100,
         "early_stopping_patience": 6,
         "early_stopping_min_delta": 1e-5,
-        "max_grad_norm": 0.8,
+        "max_grad_norm": 0.9,
         "verbose": 1,
-        "log_every_n_epochs": 5
+        "log_every_n_epochs": 10
     },
 
     "portfolio_allocator_agent":{
         "device": "cpu",
         "verbose": 1,
-        "n_epochs": 2,
+        "n_epochs": 3,
         "n_steps": 4096,
         "batch_size": 2048,
         "gamma": 0.995,
         "gae_lambda": 0.98,
         "vf_coef": 0.4,
-        "max_grad_norm": 0.25,
+        "max_grad_norm": 0.4,
         "target_kl": 0.04,
         "normalize_advantage": true,
         "log_std_init": -1.0,
         "clip_range_vf": 0.2,
         
-        "clip_range_start": 0.12,
-        "clip_range_end": 0.06,
+        "clip_range_start": 0.2,
+        "clip_range_end": 0.05,
         "clip_schedule_warmup_pct": 0.2,
         "clip_schedule_ramping_pct": 0.6,
 
-        "learning_rate_start":  1.0e-5,
-        "learning_rate_end": 2.0e-6,
+        "learning_rate_start":  1.0e-4,
+        "learning_rate_end": 1.0e-5,
         "lr_schedule_type": "linear",
         "lr_schedule_warmup_pct": 0.3,
         "lr_schedule_ramping_pct": 0.6,
@@ -178,7 +178,7 @@
         "n_eval_episodes": 100,
         "eval_deterministic": false,
         "progress_bar": true,
-        "config_id": 10003,
+        "config_id": 10004,
         "tensorboard_log": "src/agents/PPO_portfolio_allocator_weights/tb_logs"
     }
 

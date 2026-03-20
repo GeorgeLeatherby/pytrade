@@ -4,7 +4,12 @@ The agent is really only learning something, if the return difference after init
 
 If still nothing learned in PAA:
 Verify that loaded inference SAA LSTM produce actionable output in setup. Load them in same manner as for PAA and assign XEUR to each asset and then follow the outputs given the training parameters!
+# TODO: Actually check this next also for verification purposes!
 
-Implement proper initialisation with Xavier uniform for embeddings, FFN linears, Transformer QKV, asset id scale.
 
 Tweak reward function further. Make it easier, make it more complex, see what works. Write each component of the reward into a tb_metric, so you can verify magnitudes, changes etc.
+
+# Make sure to still comply with (PO)MDP premises!
+Add as many as possible metrics to portfolio obs which are used to calculate the reward.
+
+Enhance tb metrics. Show min/max/mean/median of action logits.
