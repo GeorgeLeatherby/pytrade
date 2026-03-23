@@ -1718,7 +1718,7 @@ def build_allocator_eval_callback(
     # True = no exploration noise (pure exploitation)
     # False = sample from policy distribution (mirrors training behavior)
     # Default: False (to see realistic performance with exploration)
-    deterministic = bool(train_cfg.get("eval_deterministic", False))
+    eval_deterministic = bool(train_cfg.get("eval_deterministic", False))
     
     # Verbosity level for logging
     # 0 = silent, 1 = info, 2 = debug
@@ -1747,7 +1747,7 @@ def build_allocator_eval_callback(
         log_path=log_dir,                     # Directory for evaluations.npz logs
         eval_freq=eval_freq,                  # Steps between evaluations
         n_eval_episodes=n_eval_episodes,      # Episodes per evaluation run
-        deterministic=deterministic,          # Policy sampling mode
+        deterministic=eval_deterministic,          # Policy sampling mode
         eval_step_callback=val_metrics_cb,    # Nested callback for metrics accumulation
         verbose=verbose                       # Logging verbosity
     )
@@ -1757,7 +1757,7 @@ def build_allocator_eval_callback(
         print(f"[build_allocator_eval_callback] Configured evaluation:")
         print(f"  eval_freq: {eval_freq} steps")
         print(f"  n_eval_episodes: {n_eval_episodes}")
-        print(f"  deterministic: {deterministic}")
+        print(f"  deterministic: {eval_deterministic}")
         print(f"  log_dir: {log_dir}")
     
     return eval_callback
