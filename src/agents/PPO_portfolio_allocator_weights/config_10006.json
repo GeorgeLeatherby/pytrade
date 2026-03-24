@@ -150,8 +150,8 @@
         "clip_schedule_warmup_pct": 0.2,
         "clip_schedule_ramping_pct": 0.6,
 
-        "learning_rate_start":  1.0e-4,
-        "learning_rate_end": 1.0e-5,
+        "learning_rate_start":  5.0e-5,
+        "learning_rate_end": 1.0e-6,
         "lr_schedule_type": "linear",
         "lr_schedule_warmup_pct": 0.3,
         "lr_schedule_ramping_pct": 0.6,
@@ -172,13 +172,16 @@
 
     "training": {
         "seed": 42,
-        "total_timesteps": 20000000,
+        "total_timesteps": 10000000,
         "train_log_freq": 10,
-        "eval_freq": 100000,
-        "n_eval_episodes": 20,
+        "eval_freq": 50000,
+        "n_eval_episodes": 30,
+        "patience": 7,
+        "min_delta_reward": 0.0,
+        "min_delta_sharpe": 0.0,
         "eval_deterministic": true,
         "progress_bar": true,
-        "config_id": 10005,
+        "config_id": 10006,
         "tensorboard_log": "src/agents/PPO_portfolio_allocator_weights/tb_logs"
     }
 

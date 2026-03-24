@@ -409,6 +409,7 @@ class AllocatorValidationCallback(BaseCallback):
         self.volatility_buffer = []   # Portfolio volatility
         self.turnover_buffer = []     # Trading turnover
         self.cost_buffer = []         # Transaction costs
+        self.last_mean_sharpe: float = -np.inf
 
     def _on_step(self) -> bool:
         """
@@ -542,6 +543,7 @@ class AllocatorValidationCallback(BaseCallback):
         if self.sharpe_buffer:
             mean_sharpe = float(np.mean(self.sharpe_buffer))
             std_sharpe = float(np.std(self.sharpe_buffer))
+            self.last_mean_sharpe = mean_sharpe # Store for potential use in early stopping or model selection
             self.model.logger.record(f"{self.tag_prefix}/episode_sharpe_mean", mean_sharpe, exclude=("stdout",))
             self.model.logger.record(f"{self.tag_prefix}/episode_sharpe_std", std_sharpe, exclude=("stdout",))
         
@@ -631,6 +633,9 @@ class AllocatorEvalCallback(BaseCallback):
         n_eval_episodes: int,
         deterministic: bool = False,
         eval_step_callback: Optional[BaseCallback] = None,
+        patience: int = 7,
+        min_delta_reward: float = 0.0,
+        min_delta_sharpe: float = 0.0,
         verbose: int = 0
     ):
         """
@@ -658,8 +663,16 @@ class AllocatorEvalCallback(BaseCallback):
         self.deterministic = deterministic
         self.eval_step_callback = eval_step_callback
         
-        # Track best performance for checkpoint saving
+        # Track dual best performance for checkpoint saving & early stopping
         self.best_mean_reward = -np.inf
+        self.best_mean_sharpe = -np.inf
+
+        # Early stopping
+        self.patience = patience
+        self.min_delta_reward = min_delta_reward
+        self.min_delta_sharpe = min_delta_sharpe
+        self.no_improve_reward = 0  # consecutive eval calls without reward improvement
+        self.no_improve_sharpe = 0  # consecutive eval calls without sharpe improvement
         
         # Count evaluation runs (for logging frequency)
         self.n_eval_calls = 0
@@ -738,10 +751,14 @@ class AllocatorEvalCallback(BaseCallback):
             # Compute mean and std of episode rewards
             mean_reward = float(np.mean(episode_rewards))
             std_reward = float(np.std(episode_rewards))
+            min_reward = float(np.min(episode_rewards))
+            max_reward = float(np.max(episode_rewards))
             mean_ep_length = float(np.mean(episode_lengths))
             
             # Log to TensorBoard
             self.model.logger.record("eval/mean_reward", mean_reward)
+            self.model.logger.record("eval/min_reward", min_reward)
+            self.model.logger.record("eval/max_reward", max_reward)
             self.model.logger.record("eval/std_reward", std_reward)
             self.model.logger.record("eval/mean_ep_length", mean_ep_length)
             
@@ -799,6 +816,61 @@ class AllocatorEvalCallback(BaseCallback):
                     if self.verbose > 0:
                         print(f"[AllocatorEvalCallback] Saved best model to: {best_model_path}")
         
+            # --- Early Stopping (dual-condition) ---
+
+            # Read sharpe exposed by AllocatorValidationCallback after flush
+            mean_sharpe = (
+                self.eval_step_callback.last_mean_sharpe
+                if self.eval_step_callback is not None
+                else -np.inf
+            )
+
+            # Track reward improvement
+            if mean_reward > self.best_mean_reward + self.min_delta_reward:
+                self.no_improve_reward = 0
+                # (best_mean_reward already updated above in the model-save block)
+            else:
+                self.no_improve_reward += 1
+                print(
+                    f"[AllocatorEvalCallback] Reward has not improved for "
+                    f"{self.no_improve_reward}/{self.patience} eval calls "
+                    f"(current={mean_reward:.4f}, best={self.best_mean_reward:.4f})"
+                )
+
+            # Track sharpe improvement
+            if mean_sharpe > self.best_mean_sharpe + self.min_delta_sharpe:
+                self.best_mean_sharpe = mean_sharpe
+                self.no_improve_sharpe = 0
+            else:
+                self.no_improve_sharpe += 1
+                if mean_sharpe == -np.inf:
+                    print(
+                        "[AllocatorEvalCallback] WARNING: Sharpe buffer was empty this eval — "
+                        "env may not be emitting Sharpe in info dict. "
+                        "Sharpe early stopping condition is inactive."
+                    )
+                else:
+                    print(
+                        f"[AllocatorEvalCallback] Sharpe has not improved for "
+                        f"{self.no_improve_sharpe}/{self.patience} eval calls "
+                        f"(current={mean_sharpe:.4f}, best={self.best_mean_sharpe:.4f})"
+                    )
+
+            # Stop only if BOTH reward AND sharpe have stagnated for full patience period
+            sharpe_available = mean_sharpe > -np.inf
+            if (
+                self.no_improve_reward >= self.patience
+                and self.no_improve_sharpe >= self.patience
+                and sharpe_available
+            ):
+                print(
+                    f"[AllocatorEvalCallback] Early stopping triggered: "
+                    f"neither mean reward ({mean_reward:.4f}) nor mean Sharpe ({mean_sharpe:.4f}) "
+                    f"have improved for {self.patience} consecutive eval calls. "
+                    f"Best reward={self.best_mean_reward:.4f}, best Sharpe={self.best_mean_sharpe:.4f}."
+                )
+                return False
+
         # Continue training
         return True
 
@@ -1708,6 +1780,9 @@ def build_allocator_eval_callback(
     # Evaluation frequency: how often to run validation (in total timesteps)
     # Default: evaluate every 10,000 steps
     eval_freq = int(train_cfg.get("eval_freq", 10_000))
+    patience = int(train_cfg.get("patience", 10))
+    min_delta_reward = float(train_cfg.get("min_delta_reward", 0.0))
+    min_delta_sharpe = float(train_cfg.get("min_delta_sharpe", 0.0))
     
     # Number of episodes to run per evaluation
     # More episodes = more stable statistics but slower evaluation
@@ -1749,6 +1824,9 @@ def build_allocator_eval_callback(
         n_eval_episodes=n_eval_episodes,      # Episodes per evaluation run
         deterministic=eval_deterministic,          # Policy sampling mode
         eval_step_callback=val_metrics_cb,    # Nested callback for metrics accumulation
+        patience=patience, 
+        min_delta_reward=min_delta_reward, 
+        min_delta_sharpe=min_delta_sharpe,   
         verbose=verbose                       # Logging verbosity
     )
     

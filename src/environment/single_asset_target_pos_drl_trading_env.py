@@ -1635,6 +1635,8 @@ class TradingEnv(gym.Env):
         self.saa_running_mean_ema = 1e-4
         self.saa_running_downside_variance_ema = 2.5e-5
 
+        # Init & reset episode accumulators for sortino diagnostics
+        self._sortino_mean_hist, self._sortino_down_hist, self._sortino_raw_hist = [], [], []
 
         
         if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
@@ -2816,8 +2818,6 @@ class TradingEnv(gym.Env):
         # reward = float(np.tanh(gain * reward))
 
         # Track Sortino internals for episode-level stats
-        if not hasattr(self, "_sortino_mean_hist"):
-            self._sortino_mean_hist, self._sortino_down_hist, self._sortino_raw_hist = [], [], []
         self._sortino_mean_hist.append(float(self.running_mean_ema))
         self._sortino_down_hist.append(float(self.running_downside_variance_ema))
         self._sortino_raw_hist.append(float(reward))
