@@ -16,4 +16,7 @@ Enhance tb metrics. Show min/max/mean/median of action logits.
 
 
 # Use proper purging with walkforward method
-- Step1: elimante too large normalizatin windows from data calculation. Define a max length for all calculated features and use it everywhere. E.g. 60.
+    Step1: elimante too large normalization windows from data calculation. Define a max length for all calculated features and use it everywhere. (E.g. purge_length=60)
+    Step2: Only allow feature lookbacks up to purge_length!
+
+Retrain the SAA LSTM on refit data!
