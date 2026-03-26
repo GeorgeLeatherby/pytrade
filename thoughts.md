@@ -13,3 +13,7 @@ Tweak reward function further. Make it easier, make it more complex, see what wo
 Add as many as possible metrics to portfolio obs which are used to calculate the reward.
 
 Enhance tb metrics. Show min/max/mean/median of action logits.
+
+
+# Use proper purging with walkforward method
+- Step1: elimante too large normalizatin windows from data calculation. Define a max length for all calculated features and use it everywhere. E.g. 60.
