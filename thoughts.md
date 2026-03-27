@@ -15,8 +15,11 @@ Add as many as possible metrics to portfolio obs which are used to calculate the
 Enhance tb metrics. Show min/max/mean/median of action logits.
 
 
-# Use proper purging with walkforward method
+# Use proper purging (purge_length) with walkforward method & (normalization_length)
     Step1: elimante too large normalization windows from data calculation. Define a max length for all calculated features and use it everywhere. (E.g. purge_length=60)
     Step2: Only allow feature lookbacks up to purge_length!
+    Step3: Make sure that normalization windows do not change because of warmup phases. Data normalized with stats below (normalization_length)
+
+    Fragen für Normalisierung: Wenn jedes asset einzelnd normalisiert wird, geht information zwischen den assets verloren. Wie groß der jeweilige Preisschritt bei jedem asset ist müssten die agents durch den reward herausfinden. 
 
 Retrain the SAA LSTM on refit data!

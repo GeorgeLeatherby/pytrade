@@ -24,13 +24,21 @@ class DataEnricher:
         # Save output in src/data
         self.output_dir = os.path.dirname(__file__)
 
+        # Verbosity level for debugging
+        self.verbose = 0
+
         # read raw data files
         self.raw_indices_data = pd.read_csv(self.input_raw_indices_filepath)
-        self.raw_fx_data = pd.read_csv(self.input_raw_fx_filepath)
+        if self.input_raw_fx_filepath is not None:
+            self.raw_fx_data = pd.read_csv(self.input_raw_fx_filepath)
+            self.raw_fx_data['Date'] = pd.to_datetime(self.raw_fx_data['Date']) # convert
+        else: print("\nNo FX data file provided. Currency conversion will be skipped.")
+
+        # Define max data horizon for normalization
+        self.max_norm_horizon = int(252 / 7) # 36 trading days (approx.  1.5 months) for rolling normalization of returns, volume changes etc.
 
         # Convert 'Date' columns to datetime objects immediately after loading
         self.raw_indices_data['Date'] = pd.to_datetime(self.raw_indices_data['Date'])
-        self.raw_fx_data['Date'] = pd.to_datetime(self.raw_fx_data['Date'])
 
         # Asset configuration
         self.assets = sorted(self.raw_indices_data['Symbol'].dropna().unique().tolist())  # list all symbols to use here
@@ -64,13 +72,14 @@ class DataEnricher:
         self.technical_indicators()
         self.NaN_counting()
         # 3. Risk metrics
-        self.pre_trading_risk_metrics()
+        #self.pre_trading_risk_metrics()
         self.NaN_counting()
-        self.enhanced_risk_adjusted_metrics()
+        #self.enhanced_risk_adjusted_metrics()
         self.NaN_counting()
         # 4. Currency features
         # 5. Cross-asset relationships
         self.cross_asset_relationships()
+        self.add_cross_asset_features()
         self.NaN_counting()
         # COUNT NaNs per columns
         self.NaN_detection()
@@ -78,8 +87,44 @@ class DataEnricher:
         self.Inf_detection()
         # 6. Save calculated data
         self.save_calculated_data()
-        
+
+
     def trigonometric_date_encoding(self):
+            """
+            Improved cyclic encoding:
+            - Prevents drift by using actual calendar components.
+            - Maintains periodicity across weekends.
+            - Normalized to exact calendar bounds.
+            """
+            df = self.enriched_data.copy()
+            dates = pd.to_datetime(df['Date'])
+            
+            two_pi = 2 * np.pi
+
+            # 1. Day of Week (0=Mon, 4=Fri)
+            # Periodic across 5 trading days
+            dow = dates.dt.dayofweek
+            df['dow_sin'] = np.sin(two_pi * dow / 5)
+            df['dow_cos'] = np.cos(two_pi * dow / 5)
+
+            # 2. Day of Month (Relative position in month)
+            # (day - 1) / (days_in_month - 1)
+            # This aligns '1.0' perfectly with the last day of ANY month.
+            dom = dates.dt.day
+            dim = dates.dt.days_in_month
+            df['dom_sin'] = np.sin(two_pi * (dom - 1) / (dim - 1))
+            df['dom_cos'] = np.cos(two_pi * (dom - 1) / (dim - 1))
+
+            # 3. Month of Year (1-12)
+            # Aligns perfectly with seasonality (tax season, Santa rally, etc.)
+            moy = dates.dt.month
+            df['moy_sin'] = np.sin(two_pi * (moy - 1) / 12)
+            df['moy_cos'] = np.cos(two_pi * (moy - 1) / 12)
+
+            self.enriched_data = df
+
+        
+    def trigonometric_date_encoding_legacy(self):
         """
         Continuous cyclic encodings without weekend jumps:
         - dow_sin/dow_cos: business-day index mod 5
@@ -282,59 +327,149 @@ class DataEnricher:
         # ------------------------------------------------------------------
         # 11. Report summary statistics for verification
         # ------------------------------------------------------------------
-        print("Price conversion completed. Sample rows after conversion:")
-        print(self.raw_indices_data.head(10))
-        
-        # Show a quick sanity check for one non-USD asset
-        sample_non_usd = next((s for s,c in self.currency_map.items() if c != 'USD'), None)
-        if sample_non_usd:
-            sample_df = self.raw_indices_data[self.raw_indices_data['Symbol'] == sample_non_usd].head(3)
-            if not sample_df.empty:
-                print(f"\nSanity check ({sample_non_usd}) local vs USD prices:")
-                for _, r in sample_df.iterrows():
-                    print(
-                        f"Date={r['Date'].date()} FX={r['fx_rate_local_per_usd']:.5f} "
-                        f"Local Close={r['Close_local']:.3f} USD Close={r['Close']:.3f}"
-                    )
-        print("All prices now expressed in USD.")
+        print("Price conversion completed. ")
+        if self.verbose > 0:
+            print("Sample rows after conversion:")
+            print(self.raw_indices_data.head(10))
+            
+            # Show a quick sanity check for one non-USD asset
+            sample_non_usd = next((s for s,c in self.currency_map.items() if c != 'USD'), None)
+            if sample_non_usd:
+                sample_df = self.raw_indices_data[self.raw_indices_data['Symbol'] == sample_non_usd].head(3)
+                if not sample_df.empty:
+                    print(f"\nSanity check ({sample_non_usd}) local vs USD prices:")
+                    for _, r in sample_df.iterrows():
+                        print(
+                            f"Date={r['Date'].date()} FX={r['fx_rate_local_per_usd']:.5f} "
+                            f"Local Close={r['Close_local']:.3f} USD Close={r['Close']:.3f}"
+                        )
+            print("All prices now expressed in USD.")
 
     def compare_date_ranges(self):
-        # TODO: Write actual comparison logic
-        # Challenge: fx data gets defined for whole month on first day of month
-
-        # start is 2001-01-04, end is 2025-09-30 in yyyy-mm-dd format as string
-        self.starting_date = "2001-01-04"
-        self.ending_date = "2025-09-30"
-
-        print(f"\nUsable date range is: {self.starting_date} to {self.ending_date}")
-        return self.starting_date, self.ending_date
+        """
+        Determine usable date range from actual data bounds.
+        NOTE: No comparison needed
+        """
+        min_date = self.raw_indices_data['Date'].min()
+        max_date = self.raw_indices_data['Date'].max()
+        
+        print(f"\nData availability:")
+        print(f"  Raw data range: {min_date} to {max_date}")
+        
+        # Use actual data bounds, but ensure we have enough history for features
+        # Add buffer: we need at least max_norm_horizon before using features
+        buffer_days = self.max_norm_horizon + 10  # Safety margin
+        
+        # Use first date that gives us enough history
+        self.starting_date = min_date + pd.Timedelta(days=buffer_days)
+        self.ending_date = max_date
+        
+        print(f"  Feature calculation range: {self.starting_date} to {self.ending_date}")
+        print(f"  (First {buffer_days} days excluded for rolling window initialization)")
+        
+        return str(self.starting_date.date()), str(self.ending_date.date())
 
     def convert_raw_to_stationary_data(self):
         """
-        Convert raw prices to percentage returns for agent learning.
-        Convert volume
-        Most critical transformation for making data stationary and comparable.
+        Convert raw data into useful signals for RL agent learning.
         """
-
         print("\nConverting raw data to stationary format (vectorized)...")
 
-        # Copy and filter the raw data to the specified date range
+        # Copy and filter the raw data
         df = self.raw_indices_data.copy()
         df = df[(df['Date'] >= self.starting_date) & (df['Date'] <= self.ending_date)].sort_values(['Symbol', 'Date'])
         
         # --- 1. Return Calculations (Vectorized) ---
-        print("Calculating returns...")
-        return_periods = [1, 3, 5, 10, 20, 40]
+        print("Calculating returns and stationary features...")
+        return_periods = [1, 3, 5, 10, 20, 21, 40] 
+
         for period in return_periods:
+            # A. Legacy Pct Change (remain unchanged)
             df[f'return_{period}d'] = df.groupby('Symbol')['Close'].transform(lambda x: x.pct_change(periods=period))
             df[f'open_return_{period}d'] = df.groupby('Symbol')['Open'].transform(lambda x: x.pct_change(periods=period))
             df[f'high_return_{period}d'] = df.groupby('Symbol')['High'].transform(lambda x: x.pct_change(periods=period))
             df[f'low_return_{period}d'] = df.groupby('Symbol')['Low'].transform(lambda x: x.pct_change(periods=period))
 
+            # B. Log Returns for OHLC (Stationary Base)
+            # We use transform + log(x/x.shift) for vectorized speed
+            for col in ['Open', 'High', 'Low', 'Close']:
+                df[f'log_{col.lower()}_return_{period}d'] = df.groupby('Symbol')[col].transform(
+                    lambda x: np.log(x / x.shift(period))
+                )
+
+            # C. Relative Log Returns to SPY (Market-Relative Context)
+            # Create a Series of SPY returns for this specific period mapped to Date
+            spy_returns = df[df['Symbol'] == 'SPY'].set_index('Date')[f'log_close_return_{period}d']
+            
+            # Subtract SPY return from each asset return for the same period
+            # map(spy_returns) aligns the dates correctly across all symbols
+            df[f'rel_log_close_{period}d'] = df[f'log_close_return_{period}d'] - df['Date'].map(spy_returns)
+
+            # D. Vol-of-vol feature for relative returns (rolling std of relative returns)
+            group_rel = df.groupby('Symbol')[f'rel_log_close_{period}d']
+            max_horizon_rolling_std = group_rel.transform(lambda x: x.rolling(window=self.max_norm_horizon).std())
+            max_horizon_rolling_mean = group_rel.transform(lambda x: x.rolling(window=self.max_norm_horizon).mean())
+            short_term_rolling_std = group_rel.transform(lambda x: x.rolling(window=5).std())  # Short-term volatility for regime detection
+
+            # E. Calculate Vol-of-Vol (Regime Indicator) ---
+            # 1. Log-scale the volatility to keep it stationary and compress outliers
+            # We add a tiny epsilon to avoid log(0)
+            df[f'log_vol_{period}d'] = np.log(max_horizon_rolling_std + 1e-8)
+            df[f'log_vol_short_{period}d'] = np.log(short_term_rolling_std + 1e-8)
+            
+            # 2. Z-score the log-volatility (Vol-of-Vol)
+            # This tells the agent: "Is the CURRENT volatility high relative to RECENT volatility?"
+            # A value > 2.0 here means we are entering a Black Swan/Crash regime.
+            group_vol = df.groupby('Symbol')[f'log_vol_{period}d']
+            df[f'z_vol_of_vol_{period}d'] = group_vol.transform(
+                lambda x: (x - x.rolling(window=self.max_norm_horizon).mean()) / (x.rolling(window=self.max_norm_horizon).std() + 1e-8)
+            )
+            # Volatility breakout based on short-term volatility compared to long-term volatility
+            df[f'z_vol_breakout_{period}d'] = (df[f'log_vol_short_{period}d'] - max_horizon_rolling_mean) / (max_horizon_rolling_std + 1e-8)
+            # Clip to avoid overwhelming network during Black Swans
+            df[f'z_vol_breakout_{period}d'] = df[f'z_vol_breakout_{period}d'].clip(-4, 4)
+
+            # --- F. Final Z-Score for Relative Returns (with clipping for Black Swans) ---
+            # We clip at 4.0 standard deviations to prevent gradient explosion
+            raw_z = (df[f'rel_log_close_{period}d'] - max_horizon_rolling_mean) / (max_horizon_rolling_std + 1e-8)
+            df[f'z_rel_log_close_{period}d'] = raw_z.clip(-4, 4)
+
+
         # --- 2. Volume Change and Percentile Calculations (Vectorized) ---
         print("Calculating volume changes and percentiles...")
-        volume_periods = [1, 3, 5, 10, 20, 40]
+        volume_periods = [1, 3, 5, 10, 20, 21, 40]
+
+        # Pre-calculate SPY volume log-intensity for the relative feature
+        # We use a log-ratio of SPY volume to its own moving average
+        spy_vol = df[df['Symbol'] == 'SPY'].set_index('Date')['Volume']
+        spy_vol_ma = spy_vol.rolling(window=self.max_norm_horizon).mean()
+        spy_vol_intensity = np.log(spy_vol / (spy_vol_ma + 1e-8)).clip(lower=1e-8)
+
         for period in volume_periods:
+
+            # A. Log Volume Intensity (Today vs Moving Average)
+            # This is much more stable than pct_change for volume
+            v_ma = df.groupby('Symbol')['Volume'].transform(lambda x: x.rolling(window=self.max_norm_horizon).mean())
+            df[f'log_volume_intensity_{period}d'] = np.log(df['Volume'] / (v_ma + 1e-8))
+
+            # B. Market-Relative Volume Intensity
+            # Subtracting the SPY volume intensity from the Asset volume intensity
+            df[f'rel_volume_intensity_{period}d'] = df[f'log_volume_intensity_{period}d'] - df['Date'].map(spy_vol_intensity)
+
+            # C. Normalized Volume Feature (Z-Score + Tanh)
+            # We normalize the intensity using the max_norm_horizon
+            group_v = df.groupby('Symbol')[f'rel_volume_intensity_{period}d']
+            v_mean = group_v.transform(lambda x: x.rolling(window=self.max_norm_horizon).mean())
+            v_std = group_v.transform(lambda x: x.rolling(window=self.max_norm_horizon).std())
+            
+            z_vol = (df[f'rel_volume_intensity_{period}d'] - v_mean) / (v_std + 1e-8)
+            
+            # Apply tanh to squash values into [-1, 1] range
+            # This is excellent for RL agents as it preserves the sign but limits the impact of outliers
+            df[f'norm_volume_feature_{period}d'] = np.tanh(z_vol)
+
+
+            # ------------ LEGACY Volume Change (remain unchanged) -------------------
             # Volume Percentile
             df[f'volume_percentile_{period}d'] = df.groupby('Symbol')['Volume'].transform(
                 lambda x: x.rolling(window=period, min_periods=1).rank(pct=True)
@@ -364,28 +499,19 @@ class DataEnricher:
         # Correctly calculate the previous day's close within each symbol group
         prev_close = df.groupby('Symbol')['Close'].shift(1)
         df['overnight_gap'] = (df['Open'] - prev_close) / (prev_close + 1e-8)
-        
-        # Consecutive Up/Down Days
-        grouped_returns = df.groupby('Symbol')['return_1d']
-        df['consecutive_up_days'] = grouped_returns.transform(lambda x: (x > 0).groupby((x <= 0).cumsum()).cumsum())
-        df['consecutive_down_days'] = grouped_returns.transform(lambda x: (x < 0).groupby((x >= 0).cumsum()).cumsum())
-        
-        # Normalize consecutive days by the max observed for that symbol
-        df['consecutive_up_days'] /= df.groupby('Symbol')['consecutive_up_days'].transform('max')
-        df['consecutive_down_days'] /= df.groupby('Symbol')['consecutive_down_days'].transform('max')
 
         # --- 4. Final Assignment ---
         self.enriched_data = df
 
-        print("\nEnriched data after converting to stationary format:")
-        print(f"Shape of enriched data: {self.enriched_data.shape}")
-        print(self.enriched_data.head(300))
+        if self.verbose > 0:
+            print("\nEnriched data after converting to stationary format:")
+            print(f"Shape of enriched data: {self.enriched_data.shape}")
+            print(self.enriched_data.head(300))
 
     def technical_indicators(self):
         """
         Calculate technical indicators for the enriched data. Add them to proper data and symbol
         position within enriched_data
-        1. Momentum - based for trend identification
         """
         # Copy enriched_data
         technical_indicators = self.enriched_data.copy()
@@ -402,10 +528,11 @@ class DataEnricher:
         for col in momentum_columns:
             technical_indicators[col] = np.nan
         
+        print()
         for symbol in technical_indicators['Symbol'].unique():
             symbol_data = technical_indicators[technical_indicators['Symbol'] == symbol].sort_values('Date').copy()
 
-            print(f"\nCalculating technical indicators for {symbol}...")
+            print(f"Calculating technical indicators for {symbol}...")
 
             # Momentum
             symbol_data['momentum_10'] = symbol_data['Close'].pct_change(periods=10)
@@ -425,9 +552,10 @@ class DataEnricher:
                     col
                 ] = symbol_data[col]
 
-            print(f"    Max momentum val: {symbol_data[['momentum_10', 'momentum_20']].max().max()}")
-            print(f"    Min momentum val: {symbol_data[['momentum_10', 'momentum_20']].min().min()}")
-            print(f"    Mean momentum val: {symbol_data[['momentum_10', 'momentum_20']].mean().mean()}")
+            if self.verbose > 0:
+                print(f"    Max momentum val: {symbol_data[['momentum_10', 'momentum_20']].max().max()}")
+                print(f"    Min momentum val: {symbol_data[['momentum_10', 'momentum_20']].min().min()}")
+                print(f"    Mean momentum val: {symbol_data[['momentum_10', 'momentum_20']].mean().mean()}")
 
             # RSI - Relative strength index 14 and 30 days
             for period in [14, 30]:
@@ -445,9 +573,10 @@ class DataEnricher:
                     f'rsi_{period}'
                 ] = symbol_data[f'rsi_{period}']
 
-            print(f"    Max RSI val: {symbol_data[['rsi_14', 'rsi_30']].max().max()}")
-            print(f"    Min RSI val: {symbol_data[['rsi_14', 'rsi_30']].min().min()}")
-            print(f"    Mean RSI val: {symbol_data[['rsi_14', 'rsi_30']].mean().mean()}")
+            if self.verbose > 0:
+                print(f"    Max RSI val: {symbol_data[['rsi_14', 'rsi_30']].max().max()}")
+                print(f"    Min RSI val: {symbol_data[['rsi_14', 'rsi_30']].min().min()}")
+                print(f"    Mean RSI val: {symbol_data[['rsi_14', 'rsi_30']].mean().mean()}")
 
             # MACD - Moving Average Convergence Divergence
             """MACD is calculated by subtracting the 26-period Exponential Moving Average (EMA) from the 12-period EMA.
@@ -493,21 +622,21 @@ class DataEnricher:
                 'macd_histogram'
             ] = symbol_data['macd_histogram']
 
-            # Print MACD stats
-            print(f"    Max MACD val: {symbol_data['macd'].max()}")
-            print(f"    Min MACD val: {symbol_data['macd'].min()}")
-            print(f"    Mean MACD val: {symbol_data['macd'].mean()}")
-            print(f"    Max MACD signal val: {symbol_data['macd_signal'].max()}")
-            print(f"    Min MACD signal val: {symbol_data['macd_signal'].min()}")
-            print(f"    Mean MACD signal val: {symbol_data['macd_signal'].mean()}")
-            print(f"    Max MACD histogram val: {symbol_data['macd_histogram'].max()}")
-            print(f"    Min MACD histogram val: {symbol_data['macd_histogram'].min()}")
-            print(f"    Mean MACD histogram val: {symbol_data['macd_histogram'].mean()}")
+            if self.verbose > 0:
+                # Print MACD stats
+                print(f"    Max MACD val: {symbol_data['macd'].max()}")
+                print(f"    Min MACD val: {symbol_data['macd'].min()}")
+                print(f"    Mean MACD val: {symbol_data['macd'].mean()}")
+                print(f"    Max MACD signal val: {symbol_data['macd_signal'].max()}")
+                print(f"    Min MACD signal val: {symbol_data['macd_signal'].min()}")
+                print(f"    Mean MACD signal val: {symbol_data['macd_signal'].mean()}")
+                print(f"    Max MACD histogram val: {symbol_data['macd_histogram'].max()}")
+                print(f"    Min MACD histogram val: {symbol_data['macd_histogram'].min()}")
+                print(f"    Mean MACD histogram val: {symbol_data['macd_histogram'].mean()}")
 
             # Bollinger Bands
-            bb_period = 20
-            rolling_mean = symbol_data['Close'].rolling(window=bb_period).mean()
-            rolling_std = symbol_data['Close'].rolling(window=bb_period).std()
+            rolling_mean = symbol_data['Close'].rolling(window=self.max_norm_horizon).mean()
+            rolling_std = symbol_data['Close'].rolling(window=self.max_norm_horizon).std()
             # Position within bands normalized to [-1, 1]
             bb_position = (symbol_data['Close'] - rolling_mean) / (rolling_std + 1e-8)
             symbol_data['bb_position'] = np.tanh(bb_position/2)  # Apply tanh to limit range to [-1, 1]
@@ -519,27 +648,42 @@ class DataEnricher:
                 'bb_position'
             ] = symbol_data['bb_position']
 
-            print(f"    Max Bollinger position val: {symbol_data['bb_position'].max()}")
-            print(f"    Min Bollinger position val: {symbol_data['bb_position'].min()}")
-            print(f"    Mean Bollinger position val: {symbol_data['bb_position'].mean()}")
+            if self.verbose > 0:
+                print(f"    Max Bollinger position val: {symbol_data['bb_position'].max()}")
+                print(f"    Min Bollinger position val: {symbol_data['bb_position'].min()}")
+                print(f"    Mean Bollinger position val: {symbol_data['bb_position'].mean()}")
 
             # Bollinger Band width
+            symbol_data['bb_width_reworked'] = ((rolling_mean + rolling_std * 2) - (rolling_mean - rolling_std * 2)) / (rolling_mean + 1e-8)  # Width as percentage of price
+
+            # Apply Z-score normalization to Bollinger Band width and clip to avoid extreme values
+            bb_width_mean = symbol_data['bb_width_reworked'].rolling(window=self.max_norm_horizon).mean()
+            bb_width_std = symbol_data['bb_width_reworked'].rolling(window=self.max_norm_horizon).std()
+            symbol_data['bb_width_reworked'] = ((symbol_data['bb_width_reworked'] - bb_width_mean) / (bb_width_std + 1e-8)).clip(-3, 3)
+
+            # LEGACY
             symbol_data['bb_width'] = (rolling_std * 2) / (rolling_mean + 1e-8)
             bb_width_mean = symbol_data['bb_width'].rolling(80).mean()
             bb_width_std = symbol_data['bb_width'].rolling(80).std()
             # Normalize Bollinger Band width with rolling std
             symbol_data['bb_width'] = ((symbol_data['bb_width'] - bb_width_mean) / (bb_width_std + 1e-8)).clip(-3, 3)
 
-            # Add Bollinger Bands width to correct symbol and date in enriched_data
+            # Add Current and LEGACY Bollinger Bands width to correct symbol and date in enriched_data
             self.enriched_data.loc[
                 (self.enriched_data['Symbol'] == symbol) &
                 (self.enriched_data['Date'].isin(symbol_data['Date'])),
                 'bb_width'
             ] = symbol_data['bb_width']
+            self.enriched_data.loc[
+                (self.enriched_data['Symbol'] == symbol) &
+                (self.enriched_data['Date'].isin(symbol_data['Date'])),
+                'bb_width_reworked'
+            ] = symbol_data['bb_width_reworked']
 
-            print(f"    Max Bollinger width val: {symbol_data['bb_width'].max()}")
-            print(f"    Min Bollinger width val: {symbol_data['bb_width'].min()}")
-            print(f"    Mean Bollinger width val: {symbol_data['bb_width'].mean()}")
+            if self.verbose > 0:
+                print(f"    Max Bollinger width val: {symbol_data['bb_width'].max()}")
+                print(f"    Min Bollinger width val: {symbol_data['bb_width'].min()}")
+                print(f"    Mean Bollinger width val: {symbol_data['bb_width'].mean()}")
 
             # Stochastic %K and %D
             low_14 = symbol_data['Low'].rolling(14).min()
@@ -558,12 +702,14 @@ class DataEnricher:
                     (self.enriched_data['Date'].isin(symbol_data['Date'])),
                     col
                 ] = symbol_data[col]
-            print(f"    Max Stochastic %K val: {symbol_data['stoch_k'].max()}")
-            print(f"    Min Stochastic %K val: {symbol_data['stoch_k'].min()}")
-            print(f"    Mean Stochastic %K val: {symbol_data['stoch_k'].mean()}")
-            print(f"    Max Stochastic %D val: {symbol_data['stoch_d'].max()}")
-            print(f"    Min Stochastic %D val: {symbol_data['stoch_d'].min()}")
-            print(f"    Mean Stochastic %D val: {symbol_data['stoch_d'].mean()}")
+
+            if self.verbose > 0:
+                print(f"    Max Stochastic %K val: {symbol_data['stoch_k'].max()}")
+                print(f"    Min Stochastic %K val: {symbol_data['stoch_k'].min()}")
+                print(f"    Mean Stochastic %K val: {symbol_data['stoch_k'].mean()}")
+                print(f"    Max Stochastic %D val: {symbol_data['stoch_d'].max()}")
+                print(f"    Min Stochastic %D val: {symbol_data['stoch_d'].min()}")
+                print(f"    Mean Stochastic %D val: {symbol_data['stoch_d'].mean()}")
 
             # ATR for volatility assessment
             """ATR (Average True Range) is a technical analysis indicator that measures market volatility by calculating the 
@@ -573,7 +719,11 @@ class DataEnricher:
             high_close = np.abs(symbol_data['High'] - symbol_data['Close'].shift(1))
             low_close = np.abs(symbol_data['Low'] - symbol_data['Close'].shift(1))
             true_range = np.maximum(high_low, np.maximum(high_close, low_close))
-            atr = true_range.rolling(14).mean()
+            atr = true_range.rolling(window=self.max_norm_horizon).mean()
+
+            # Z-score the ATR to normalize it, then clip to avoid extreme values
+            atr_zscore = (atr - atr.rolling(window=self.max_norm_horizon).mean()) / (atr.rolling(window=self.max_norm_horizon).std() + 1e-8)
+            symbol_data['atr_z_norm'] = atr_zscore.clip(-3, 3)
 
             # Normalize ATR as percentage of price
             atr_pct = atr / symbol_data['Close']
@@ -581,16 +731,30 @@ class DataEnricher:
             atr_std = atr_pct.rolling(80, min_periods=30).std()
             symbol_data['atr_norm'] = ((atr_pct - atr_mean) / (atr_std + 1e-8)).clip(-3, 3)
 
-            # Add to enriched_data
+            # Add atr_norm & atr_z_norm to enriched_data
             self.enriched_data.loc[
                 (self.enriched_data['Symbol'] == symbol) &
                 (self.enriched_data['Date'].isin(symbol_data['Date'])),
                 'atr_norm'
             ] = symbol_data['atr_norm']
 
-            print(f"    Max ATR val: {symbol_data['atr_norm'].max()}")
-            print(f"    Min ATR val: {symbol_data['atr_norm'].min()}")
-            print(f"    Mean ATR val: {symbol_data['atr_norm'].mean()}")
+            self.enriched_data.loc[
+                (self.enriched_data['Symbol'] == symbol) &
+                (self.enriched_data['Date'].isin(symbol_data['Date'])),
+                'atr_z_norm'
+            ] = symbol_data['atr_z_norm']
+
+            if self.verbose > 0:
+                print(f"    Max ATR val: {symbol_data['atr_norm'].max()}")
+                print(f"    Min ATR val: {symbol_data['atr_norm'].min()}")
+                print(f"    Mean ATR val: {symbol_data['atr_norm'].mean()}")
+                print(f"    Max ATR Z-Score val: {symbol_data['atr_z_norm'].max()}")
+                print(f"    Min ATR Z-Score val: {symbol_data['atr_z_norm'].min()}")
+                print(f"    Mean ATR Z-Score val: {symbol_data['atr_z_norm'].mean()}")
+
+            # Z distance to mean: Closing price distance to self.max_norm_horizon in ATR units (volatility-adjusted distance to mean)
+            symbol_data['z_distance_to_mean'] = (symbol_data['Close'] - rolling_mean) / (atr + 1e-8)
+            symbol_data['z_distance_to_mean'] = symbol_data['z_distance_to_mean'].clip(-3, 3)  # Clip to avoid extreme values
 
             # VPT (Volume Price Trend) combines price and volume for stronger signals
             symbol_data['vpt'] = (symbol_data['return_1d'] * symbol_data['volume_percentile_20d']).cumsum()
@@ -604,9 +768,10 @@ class DataEnricher:
                 'vpt'
             ] = symbol_data['vpt']
 
-            print(f"    Max VPT val: {symbol_data['vpt'].max()}")
-            print(f"    Min VPT val: {symbol_data['vpt'].min()}")
-            print(f"    Mean VPT val: {symbol_data['vpt'].mean()}")
+            if self.verbose > 0:
+                print(f"    Max VPT val: {symbol_data['vpt'].max()}")
+                print(f"    Min VPT val: {symbol_data['vpt'].min()}")
+                print(f"    Mean VPT val: {symbol_data['vpt'].mean()}")
 
             # MFI - Money Flow Index combines price and volume to identify overbought/oversold conditions
             typical_price = (symbol_data['High'] + symbol_data['Low'] + symbol_data['Close']) / 3
@@ -622,13 +787,16 @@ class DataEnricher:
                 (self.enriched_data['Date'].isin(symbol_data['Date'])),
                 'mfi'
             ] = symbol_data['mfi']
-            print(f"    Max MFI val: {symbol_data['mfi'].max()}")
-            print(f"    Min MFI val: {symbol_data['mfi'].min()}")
-            print(f"    Mean MFI val: {symbol_data['mfi'].mean()}")
 
-        print("\nEnriched data after adding technical indicators:")
-        print(f"Shape of enriched data: {self.enriched_data.shape}")
-        print(self.enriched_data.head(150))
+            if self.verbose > 0:
+                print(f"    Max MFI val: {symbol_data['mfi'].max()}")
+                print(f"    Min MFI val: {symbol_data['mfi'].min()}")
+                print(f"    Mean MFI val: {symbol_data['mfi'].mean()}")
+
+        if self.verbose > 0:
+            print("\nEnriched data after adding technical indicators:")
+            print(f"Shape of enriched data: {self.enriched_data.shape}")
+            print(self.enriched_data.head(150))
 
     def pre_trading_risk_metrics(self):
         """
@@ -656,9 +824,11 @@ class DataEnricher:
                     (self.enriched_data['Date'].isin(symbol_data['Date'])),
                     f'volatility_{period}d'
                 ] = symbol_data[f'volatility_{period}d']
-            print(f"    Max volatility val: {symbol_data[[f'volatility_{p}d' for p in volatility_periods]].max().max()}")
-            print(f"    Min volatility val: {symbol_data[[f'volatility_{p}d' for p in volatility_periods]].min().min()}")
-            print(f"    Mean volatility val: {symbol_data[[f'volatility_{p}d' for p in volatility_periods]].mean().mean()}")
+
+            if self.verbose > 0:
+                print(f"    Max volatility val: {symbol_data[[f'volatility_{p}d' for p in volatility_periods]].max().max()}")
+                print(f"    Min volatility val: {symbol_data[[f'volatility_{p}d' for p in volatility_periods]].min().min()}")
+                print(f"    Mean volatility val: {symbol_data[[f'volatility_{p}d' for p in volatility_periods]].mean().mean()}")
 
             # Volatility clustering (GARCH-like effect)
             vol_20d = symbol_data['return_1d'].rolling(20).std()
@@ -671,9 +841,11 @@ class DataEnricher:
                 (self.enriched_data['Date'].isin(symbol_data['Date'])),
                 'vol_clustering'
             ] = symbol_data['vol_clustering']
-            print(f"    Max volatility clustering val: {symbol_data['vol_clustering'].max()}")
-            print(f"    Min volatility clustering val: {symbol_data['vol_clustering'].min()}")
-            print(f"    Mean volatility clustering val: {symbol_data['vol_clustering'].mean()}")
+
+            if self.verbose > 0:
+                print(f"    Max volatility clustering val: {symbol_data['vol_clustering'].max()}")
+                print(f"    Min volatility clustering val: {symbol_data['vol_clustering'].min()}")
+                print(f"    Mean volatility clustering val: {symbol_data['vol_clustering'].mean()}")
 
             # 2. TAIL RISK FROM RETURN DISTRIBUTION
             # Rolling VaR approximation using quantiles
@@ -689,9 +861,11 @@ class DataEnricher:
                     (self.enriched_data['Date'].isin(symbol_data['Date'])),
                     f'tail_risk_{int(confidence*100)}pct'
                 ] = symbol_data[f'tail_risk_{int(confidence*100)}pct']
-            print(f"    Max tail risk val: {symbol_data[[f'tail_risk_{int(c*100)}pct' for c in [0.05,0.01]]].max().max()}")
-            print(f"    Min tail risk val: {symbol_data[[f'tail_risk_{int(c*100)}pct' for c in [0.05,0.01]]].min().min()}")
-            print(f"    Mean tail risk val: {symbol_data[[f'tail_risk_{int(c*100)}pct' for c in [0.05,0.01]]].mean().mean()}")
+                
+            if self.verbose > 0:
+                print(f"    Max tail risk val: {symbol_data[[f'tail_risk_{int(c*100)}pct' for c in [0.05,0.01]]].max().max()}")
+                print(f"    Min tail risk val: {symbol_data[[f'tail_risk_{int(c*100)}pct' for c in [0.05,0.01]]].min().min()}")
+                print(f"    Mean tail risk val: {symbol_data[[f'tail_risk_{int(c*100)}pct' for c in [0.05,0.01]]].mean().mean()}")
 
             # Expected shortfall (CVaR) approximation
             def calculate_expected_shortfall(returns, confidence):
@@ -711,9 +885,10 @@ class DataEnricher:
                     f'expected_shortfall_{int(confidence*100)}pct'
                 ] = symbol_data[f'expected_shortfall_{int(confidence*100)}pct']
 
-            print(f"    Max expected shortfall val: {symbol_data[[f'expected_shortfall_{int(c*100)}pct' for c in [0.05,0.01]]].max().max()}")
-            print(f"    Min expected shortfall val: {symbol_data[[f'expected_shortfall_{int(c*100)}pct' for c in [0.05,0.01]]].min().min()}")
-            print(f"    Mean expected shortfall val: {symbol_data[[f'expected_shortfall_{int(c*100)}pct' for c in [0.05,0.01]]].mean().mean()}")
+            if self.verbose > 0:
+                print(f"    Max expected shortfall val: {symbol_data[[f'expected_shortfall_{int(c*100)}pct' for c in [0.05,0.01]]].max().max()}")
+                print(f"    Min expected shortfall val: {symbol_data[[f'expected_shortfall_{int(c*100)}pct' for c in [0.05,0.01]]].min().min()}")
+                print(f"    Mean expected shortfall val: {symbol_data[[f'expected_shortfall_{int(c*100)}pct' for c in [0.05,0.01]]].mean().mean()}")
 
             # Return distribution shape
             rolling_skew = symbol_data['return_1d'].rolling(60, min_periods=30).skew()
@@ -732,12 +907,13 @@ class DataEnricher:
                 (self.enriched_data['Date'].isin(symbol_data['Date'])),
                 'return_kurtosis'
             ] = symbol_data['return_kurtosis']
-            print(f"    Max return skewness val: {symbol_data['return_skewness'].max()}")
-            print(f"    Min return skewness val: {symbol_data['return_skewness'].min()}")
-            print(f"    Mean return skewness val: {symbol_data['return_skewness'].mean()}")
-            print(f"    Max return kurtosis val: {symbol_data['return_kurtosis'].max()}")
-            print(f"    Min return kurtosis val: {symbol_data['return_kurtosis'].min()}")
-            print(f"    Mean return kurtosis val: {symbol_data['return_kurtosis'].mean()}")
+            if self.verbose > 0:
+                print(f"    Max return skewness val: {symbol_data['return_skewness'].max()}")
+                print(f"    Min return skewness val: {symbol_data['return_skewness'].min()}")
+                print(f"    Mean return skewness val: {symbol_data['return_skewness'].mean()}")
+                print(f"    Max return kurtosis val: {symbol_data['return_kurtosis'].max()}")
+                print(f"    Min return kurtosis val: {symbol_data['return_kurtosis'].min()}")
+                print(f"    Mean return kurtosis val: {symbol_data['return_kurtosis'].mean()}")
 
             # 3. TREND PERSISTENCE AND REVERSALS
             # Autocorrelation of returns (momentum vs mean reversion)
@@ -751,9 +927,10 @@ class DataEnricher:
                 (self.enriched_data['Date'].isin(symbol_data['Date'])),
                 'momentum_persistence'
             ] = symbol_data['momentum_persistence']
-            print(f"    Max momentum persistence val: {symbol_data['momentum_persistence'].max()}")
-            print(f"    Min momentum persistence val: {symbol_data['momentum_persistence'].min()}")
-            print(f"    Mean momentum persistence val: {symbol_data['momentum_persistence'].mean()}")
+            if self.verbose > 0:
+                print(f"    Max momentum persistence val: {symbol_data['momentum_persistence'].max()}")
+                print(f"    Min momentum persistence val: {symbol_data['momentum_persistence'].min()}")
+                print(f"    Mean momentum persistence val: {symbol_data['momentum_persistence'].mean()}")
 
             # Trend strength relative to volatility
             for ma_period in [20, 50]:
@@ -766,9 +943,10 @@ class DataEnricher:
                     (self.enriched_data['Date'].isin(symbol_data['Date'])),
                     f'trend_strength_{ma_period}d'
                 ] = symbol_data[f'trend_strength_{ma_period}d']
-            print(f"    Max trend strength val: {symbol_data[[f'trend_strength_{p}d' for p in [20,50]]].max().max()}")
-            print(f"    Min trend strength val: {symbol_data[[f'trend_strength_{p}d' for p in [20,50]]].min().min()}")
-            print(f"    Mean trend strength val: {symbol_data[[f'trend_strength_{p}d' for p in [20,50]]].mean().mean()}")
+            if self.verbose > 0:
+                print(f"    Max trend strength val: {symbol_data[[f'trend_strength_{p}d' for p in [20,50]]].max().max()}")
+                print(f"    Min trend strength val: {symbol_data[[f'trend_strength_{p}d' for p in [20,50]]].min().min()}")
+                print(f"    Mean trend strength val: {symbol_data[[f'trend_strength_{p}d' for p in [20,50]]].mean().mean()}")
 
             # 4. STRESS INDICATORS
             # Distance from recent highs (stress indicator)
@@ -781,9 +959,10 @@ class DataEnricher:
                 (self.enriched_data['Date'].isin(symbol_data['Date'])),
                 'stress_indicator'
             ] = symbol_data['stress_indicator']
-            print(f"    Max stress indicator val: {symbol_data['stress_indicator'].max()}")
-            print(f"    Min stress indicator val: {symbol_data['stress_indicator'].min()}")
-            print(f"    Mean stress indicator val: {symbol_data['stress_indicator'].mean()}")
+            if self.verbose > 0:
+                print(f"    Max stress indicator val: {symbol_data['stress_indicator'].max()}")
+                print(f"    Min stress indicator val: {symbol_data['stress_indicator'].min()}")
+                print(f"    Mean stress indicator val: {symbol_data['stress_indicator'].mean()}")
 
             # Consecutive down days (capitulation indicator)
             down_days = (symbol_data['return_1d'] < 0).astype(int)
@@ -797,9 +976,10 @@ class DataEnricher:
                 (self.enriched_data['Date'].isin(symbol_data['Date'])),
                 'consecutive_stress'
             ] = symbol_data['consecutive_stress']
-            print(f"    Max consecutive stress val: {symbol_data['consecutive_stress'].max()}")
-            print(f"    Min consecutive stress val: {symbol_data['consecutive_stress'].min()}")
-            print(f"    Mean consecutive stress val: {symbol_data['consecutive_stress'].mean()}")
+            if self.verbose > 0:
+                print(f"    Max consecutive stress val: {symbol_data['consecutive_stress'].max()}")
+                print(f"    Min consecutive stress val: {symbol_data['consecutive_stress'].min()}")
+                print(f"    Mean consecutive stress val: {symbol_data['consecutive_stress'].mean()}")
 
             # 5. VOLUME-BASED RISK SIGNALS
             # Volume spike detection (often precedes volatility)
@@ -814,9 +994,10 @@ class DataEnricher:
                 (self.enriched_data['Date'].isin(symbol_data['Date'])),
                 'volume_risk_signal'
             ] = symbol_data['volume_risk_signal']
-            print(f"    Max volume risk signal val: {symbol_data['volume_risk_signal'].max()}")
-            print(f"    Min volume risk signal val: {symbol_data['volume_risk_signal'].min()}")
-            print(f"    Mean volume risk signal val: {symbol_data['volume_risk_signal'].mean()}")
+            if self.verbose > 0:
+                print(f"    Max volume risk signal val: {symbol_data['volume_risk_signal'].max()}")
+                print(f"    Min volume risk signal val: {symbol_data['volume_risk_signal'].min()}")
+                print(f"    Mean volume risk signal val: {symbol_data['volume_risk_signal'].mean()}")
 
             # Volume-price divergence (risk warning)
             price_momentum = symbol_data['return_20d']  # Use existing 20-day return
@@ -833,9 +1014,10 @@ class DataEnricher:
                 (self.enriched_data['Date'].isin(symbol_data['Date'])),
                 'volume_price_divergence'
             ] = symbol_data['volume_price_divergence']
-            print(f"    Max volume-price divergence val: {symbol_data['volume_price_divergence'].max()}")
-            print(f"    Min volume-price divergence val: {symbol_data['volume_price_divergence'].min()}")
-            print(f"    Mean volume-price divergence val: {symbol_data['volume_price_divergence'].mean()}")
+            if self.verbose > 0:
+                print(f"    Max volume-price divergence val: {symbol_data['volume_price_divergence'].max()}")
+                print(f"    Min volume-price divergence val: {symbol_data['volume_price_divergence'].min()}")
+                print(f"    Mean volume-price divergence val: {symbol_data['volume_price_divergence'].mean()}")
 
             # Crisis detection composite
             crisis_df = pd.DataFrame({
@@ -857,9 +1039,10 @@ class DataEnricher:
                 (self.enriched_data['Date'].isin(symbol_data['Date'])),
                 'crisis_detection'
             ] = symbol_data['crisis_detection']
-            print(f"    Max crisis detection val: {symbol_data['crisis_detection'].max()}")
-            print(f"    Min crisis detection val: {symbol_data['crisis_detection'].min()}")
-            print(f"    Mean crisis detection val: {symbol_data['crisis_detection'].mean()}")
+            if self.verbose > 0:
+                print(f"    Max crisis detection val: {symbol_data['crisis_detection'].max()}")
+                print(f"    Min crisis detection val: {symbol_data['crisis_detection'].min()}")
+                print(f"    Mean crisis detection val: {symbol_data['crisis_detection'].mean()}")
 
             # Volatility Regime change detection using rolling correlation shifts
             def detect_regime_change(returns, window=60):
@@ -878,9 +1061,10 @@ class DataEnricher:
                 (self.enriched_data['Date'].isin(symbol_data['Date'])),
                 'regime_change'
             ] = symbol_data['regime_change']
-            print(f"    Max regime change val: {symbol_data['regime_change'].max()}")
-            print(f"    Min regime change val: {symbol_data['regime_change'].min()}")
-            print(f"    Mean regime change val: {symbol_data['regime_change'].mean()}")
+            if self.verbose > 0:
+                print(f"    Max regime change val: {symbol_data['regime_change'].max()}")
+                print(f"    Min regime change val: {symbol_data['regime_change'].min()}")
+                print(f"    Mean regime change val: {symbol_data['regime_change'].mean()}")
 
             # Liquidity risk proxy using volume and price impact
             def calculate_liquidity_risk(returns, volumes):
@@ -905,9 +1089,10 @@ class DataEnricher:
                 (self.enriched_data['Date'].isin(symbol_data['Date'])),
                 'liquidity_risk'
             ] = symbol_data['liquidity_risk']
-            print(f"    Max liquidity risk val: {symbol_data['liquidity_risk'].max()}")
-            print(f"    Min liquidity risk val: {symbol_data['liquidity_risk'].min()}")
-            print(f"    Mean liquidity risk val: {symbol_data['liquidity_risk'].mean()}")
+            if self.verbose > 0:
+                print(f"    Max liquidity risk val: {symbol_data['liquidity_risk'].max()}")
+                print(f"    Min liquidity risk val: {symbol_data['liquidity_risk'].min()}")
+                print(f"    Mean liquidity risk val: {symbol_data['liquidity_risk'].mean()}")
 
             # Add comprehensive momentum quality:
             def calculate_momentum_quality(symbol_data):
@@ -944,13 +1129,15 @@ class DataEnricher:
                 (self.enriched_data['Date'].isin(symbol_data['Date'])),
                 'momentum_quality'
             ] = symbol_data['momentum_quality']
-            print(f"    Max momentum quality val: {symbol_data['momentum_quality'].max()}")
-            print(f"    Min momentum quality val: {symbol_data['momentum_quality'].min()}")
-            print(f"    Mean momentum quality val: {symbol_data['momentum_quality'].mean()}")
+            if self.verbose > 0:
+                print(f"    Max momentum quality val: {symbol_data['momentum_quality'].max()}")
+                print(f"    Min momentum quality val: {symbol_data['momentum_quality'].min()}")
+                print(f"    Mean momentum quality val: {symbol_data['momentum_quality'].mean()}")
 
-        print("\nEnriched dataframe after adding pre-trading risk metrics:")
-        print(f"Shape of pre-trading risk metrics: {self.enriched_data.shape}")
-        print(self.enriched_data.head(700))
+        if self.verbose > 0:
+            print("\nEnriched dataframe after adding pre-trading risk metrics:")
+            print(f"Shape of pre-trading risk metrics: {self.enriched_data.shape}")
+            print(self.enriched_data.head(700))
 
     def enhanced_risk_adjusted_metrics(self):
         """
@@ -1124,20 +1311,21 @@ class DataEnricher:
                         metric
                     ] = symbol_data[metric]
             
-            # Print statistics
-            print(f"    Risk-adjusted return (20d) range: [{symbol_data['risk_adjusted_return_20d'].min():.3f}, {symbol_data['risk_adjusted_return_20d'].max():.3f}] Mean: {symbol_data['risk_adjusted_return_20d'].mean():.3f} Median: {symbol_data['risk_adjusted_return_20d'].median():.3f}")
-            print(f"    Risk-adjusted return (60d) range: [{symbol_data['risk_adjusted_return_60d'].min():.3f}, {symbol_data['risk_adjusted_return_60d'].max():.3f}] Mean: {symbol_data['risk_adjusted_return_60d'].mean():.3f} Median: {symbol_data['risk_adjusted_return_60d'].median():.3f}")
-            print(f"    Drawdown-adjusted return (30d) range: [{symbol_data['drawdown_adjusted_return_30d'].min():.3f}, {symbol_data['drawdown_adjusted_return_30d'].max():.3f}] Mean: {symbol_data['drawdown_adjusted_return_30d'].mean():.3f} Median: {symbol_data['drawdown_adjusted_return_30d'].median():.3f}")
-            print(f"    Drawdown-adjusted return (60d) range: [{symbol_data['drawdown_adjusted_return_60d'].min():.3f}, {symbol_data['drawdown_adjusted_return_60d'].max():.3f}] Mean: {symbol_data['drawdown_adjusted_return_60d'].mean():.3f} Median: {symbol_data['drawdown_adjusted_return_60d'].median():.3f}")
-            print(f"    VAR-adjusted return (20d) range: [{symbol_data['var_adjusted_return_20d'].min():.3f}, {symbol_data['var_adjusted_return_20d'].max():.3f}] Mean: {symbol_data['var_adjusted_return_20d'].mean():.3f} Median: {symbol_data['var_adjusted_return_20d'].median():.3f}")
-            print(f"    VAR-adjusted return (60d) range: [{symbol_data['var_adjusted_return_60d'].min():.3f}, {symbol_data['var_adjusted_return_60d'].max():.3f}] Mean: {symbol_data['var_adjusted_return_60d'].mean():.3f} Median: {symbol_data['var_adjusted_return_60d'].median():.3f}")
-            print(f"    ES-adjusted return (20d) range: [{symbol_data['es_adjusted_return_20d'].min():.3f}, {symbol_data['es_adjusted_return_20d'].max():.3f}] Mean: {symbol_data['es_adjusted_return_20d'].mean():.3f} Median: {symbol_data['es_adjusted_return_20d'].median():.3f}")
-            print(f"    ES-adjusted return (60d) range: [{symbol_data['es_adjusted_return_60d'].min():.3f}, {symbol_data['es_adjusted_return_60d'].max():.3f}] Mean: {symbol_data['es_adjusted_return_60d'].mean():.3f} Median: {symbol_data['es_adjusted_return_60d'].median():.3f}")
-            print(f"    Vol-adjusted momentum (10d) range: [{symbol_data['vol_adjusted_momentum_10d'].min():.3f}, {symbol_data['vol_adjusted_momentum_10d'].max():.3f}] Mean: {symbol_data['vol_adjusted_momentum_10d'].mean():.3f} Median: {symbol_data['vol_adjusted_momentum_10d'].median():.3f}")
-            print(f"    Vol-adjusted momentum (20d) range: [{symbol_data['vol_adjusted_momentum_20d'].min():.3f}, {symbol_data['vol_adjusted_momentum_20d'].max():.3f}] Mean: {symbol_data['vol_adjusted_momentum_20d'].mean():.3f} Median: {symbol_data['vol_adjusted_momentum_20d'].median():.3f}")
-            print(f"    Skewness-adjusted return range: [{symbol_data['skewness_adjusted_return'].min():.3f}, {symbol_data['skewness_adjusted_return'].max():.3f}] Mean: {symbol_data['skewness_adjusted_return'].mean():.3f} Median: {symbol_data['skewness_adjusted_return'].median():.3f}")
-            print(f"    Composite risk score range: [{symbol_data['composite_risk_score'].min():.3f}, {symbol_data['composite_risk_score'].max():.3f}] Mean: {symbol_data['composite_risk_score'].mean():.3f} Median: {symbol_data['composite_risk_score'].median():.3f}")
-            print(f"    Risk-adjusted momentum quality range: [{symbol_data['risk_adjusted_momentum_quality'].min():.3f}, {symbol_data['risk_adjusted_momentum_quality'].max():.3f}] Mean: {symbol_data['risk_adjusted_momentum_quality'].mean():.3f} Median: {symbol_data['risk_adjusted_momentum_quality'].median():.3f}")
+            if self.verbose > 0:
+                # Print statistics
+                print(f"    Risk-adjusted return (20d) range: [{symbol_data['risk_adjusted_return_20d'].min():.3f}, {symbol_data['risk_adjusted_return_20d'].max():.3f}] Mean: {symbol_data['risk_adjusted_return_20d'].mean():.3f} Median: {symbol_data['risk_adjusted_return_20d'].median():.3f}")
+                print(f"    Risk-adjusted return (60d) range: [{symbol_data['risk_adjusted_return_60d'].min():.3f}, {symbol_data['risk_adjusted_return_60d'].max():.3f}] Mean: {symbol_data['risk_adjusted_return_60d'].mean():.3f} Median: {symbol_data['risk_adjusted_return_60d'].median():.3f}")
+                print(f"    Drawdown-adjusted return (30d) range: [{symbol_data['drawdown_adjusted_return_30d'].min():.3f}, {symbol_data['drawdown_adjusted_return_30d'].max():.3f}] Mean: {symbol_data['drawdown_adjusted_return_30d'].mean():.3f} Median: {symbol_data['drawdown_adjusted_return_30d'].median():.3f}")
+                print(f"    Drawdown-adjusted return (60d) range: [{symbol_data['drawdown_adjusted_return_60d'].min():.3f}, {symbol_data['drawdown_adjusted_return_60d'].max():.3f}] Mean: {symbol_data['drawdown_adjusted_return_60d'].mean():.3f} Median: {symbol_data['drawdown_adjusted_return_60d'].median():.3f}")
+                print(f"    VAR-adjusted return (20d) range: [{symbol_data['var_adjusted_return_20d'].min():.3f}, {symbol_data['var_adjusted_return_20d'].max():.3f}] Mean: {symbol_data['var_adjusted_return_20d'].mean():.3f} Median: {symbol_data['var_adjusted_return_20d'].median():.3f}")
+                print(f"    VAR-adjusted return (60d) range: [{symbol_data['var_adjusted_return_60d'].min():.3f}, {symbol_data['var_adjusted_return_60d'].max():.3f}] Mean: {symbol_data['var_adjusted_return_60d'].mean():.3f} Median: {symbol_data['var_adjusted_return_60d'].median():.3f}")
+                print(f"    ES-adjusted return (20d) range: [{symbol_data['es_adjusted_return_20d'].min():.3f}, {symbol_data['es_adjusted_return_20d'].max():.3f}] Mean: {symbol_data['es_adjusted_return_20d'].mean():.3f} Median: {symbol_data['es_adjusted_return_20d'].median():.3f}")
+                print(f"    ES-adjusted return (60d) range: [{symbol_data['es_adjusted_return_60d'].min():.3f}, {symbol_data['es_adjusted_return_60d'].max():.3f}] Mean: {symbol_data['es_adjusted_return_60d'].mean():.3f} Median: {symbol_data['es_adjusted_return_60d'].median():.3f}")
+                print(f"    Vol-adjusted momentum (10d) range: [{symbol_data['vol_adjusted_momentum_10d'].min():.3f}, {symbol_data['vol_adjusted_momentum_10d'].max():.3f}] Mean: {symbol_data['vol_adjusted_momentum_10d'].mean():.3f} Median: {symbol_data['vol_adjusted_momentum_10d'].median():.3f}")
+                print(f"    Vol-adjusted momentum (20d) range: [{symbol_data['vol_adjusted_momentum_20d'].min():.3f}, {symbol_data['vol_adjusted_momentum_20d'].max():.3f}] Mean: {symbol_data['vol_adjusted_momentum_20d'].mean():.3f} Median: {symbol_data['vol_adjusted_momentum_20d'].median():.3f}")
+                print(f"    Skewness-adjusted return range: [{symbol_data['skewness_adjusted_return'].min():.3f}, {symbol_data['skewness_adjusted_return'].max():.3f}] Mean: {symbol_data['skewness_adjusted_return'].mean():.3f} Median: {symbol_data['skewness_adjusted_return'].median():.3f}")
+                print(f"    Composite risk score range: [{symbol_data['composite_risk_score'].min():.3f}, {symbol_data['composite_risk_score'].max():.3f}] Mean: {symbol_data['composite_risk_score'].mean():.3f} Median: {symbol_data['composite_risk_score'].median():.3f}")
+                print(f"    Risk-adjusted momentum quality range: [{symbol_data['risk_adjusted_momentum_quality'].min():.3f}, {symbol_data['risk_adjusted_momentum_quality'].max():.3f}] Mean: {symbol_data['risk_adjusted_momentum_quality'].mean():.3f} Median: {symbol_data['risk_adjusted_momentum_quality'].median():.3f}")
 
         print(f"\nShape of enriched_data: {self.enriched_data.shape}")
 
@@ -1179,6 +1367,89 @@ class DataEnricher:
         print(f"\nCross-asset relationship metrics completed!")
         print(f"Enhanced dataset shape: {self.enriched_data.shape}")
 
+
+    def add_cross_asset_features(self):
+        """
+        Calculates high-level cross-asset signals:
+        - Fisher-Z Correlation with SPY
+        - Cross-sectional Dispersion
+        - Rolling Beta
+        
+        NOTE: Uses date-aligned operations like convert_raw_to_stationary_data!
+
+        """
+        print("Calculating cross-asset correlation features...")
+
+        # Use the enriched_data which already has returns calculated
+        df = self.enriched_data.copy()  # Make explicit copy
+
+        # --- 1. Preparation: Get Benchmark Returns (indexed by Date) ---
+        spy_ret = df[df['Symbol'] == 'SPY'].set_index('Date')['log_close_return_1d']
+        
+        # --- 2. Rolling Correlation & Fisher-Z Transform (FIXED) ---
+        # Use groupby + transform with explicit per-symbol date alignment
+        def calc_fisher_corr(group):
+            """
+            group is a Series with the default integer index from groupby-transform.
+            We need to align it to dates, compute rolling correlation, then return.
+            """
+            # Get the corresponding dates for this symbol's group
+            symbol_dates = df[df['Symbol'] == group.name].set_index('Date').index
+            # Reindex the group by dates (this preserves alignment)
+            group_with_dates = pd.Series(group.values, index=symbol_dates)
+            
+            # Get SPY returns for these dates
+            spy_ret_aligned = spy_ret.reindex(symbol_dates)
+            
+            # Compute rolling correlation
+            corr = group_with_dates.rolling(window=21).corr(spy_ret_aligned)
+            
+            # Fisher Z-Transform: 0.5 * ln((1+r)/(1-r))
+            corr = corr.clip(-0.99, 0.99)
+            fisher_z = 0.5 * np.log((1 + corr) / (1 - corr))
+            
+            # Return aligned to original index positions
+            return fisher_z.values
+        
+        df['z_fisher_corr_spy'] = df.groupby('Symbol')['log_close_return_1d'].transform(calc_fisher_corr)
+
+        # --- 3. Cross-Sectional Dispersion (Market 'Spread') ---
+        # This already works in original code - group by Date, calculate std across symbols
+        dispersion = df.groupby('Date')['log_close_return_1d'].std()
+        df['market_dispersion'] = df['Date'].map(np.log(dispersion + 1e-8))
+        
+        # Z-score the dispersion to make it stationary
+        df['z_market_dispersion'] = (df['market_dispersion'] - df['market_dispersion'].rolling(window=self.max_norm_horizon).mean()) / \
+                                    (df['market_dispersion'].rolling(window=self.max_norm_horizon).std() + 1e-8)
+
+        # --- 4. Rolling Beta (FIXED) ---
+        def calc_beta(group):
+            """
+            Beta = Cov(Asset, Market) / Var(Market)
+            Similar structure to calc_fisher_corr for proper date alignment
+            """
+            symbol_dates = df[df['Symbol'] == group.name].set_index('Date').index
+            group_with_dates = pd.Series(group.values, index=symbol_dates)
+            spy_ret_aligned = spy_ret.reindex(symbol_dates)
+            
+            # Calculate covariance and variance with proper alignment
+            covariance = group_with_dates.rolling(window=self.max_norm_horizon).cov(spy_ret_aligned)
+            market_variance = spy_ret_aligned.rolling(window=self.max_norm_horizon).var()
+            
+            beta = covariance / (market_variance + 1e-8)
+            return beta.values
+        
+        df['beta_spy'] = df.groupby('Symbol')['log_close_return_1d'].transform(calc_beta)
+        
+        # Final Z-score for Beta to normalize across assets
+        df['z_beta_spy'] = df.groupby('Symbol')['beta_spy'].transform(
+            lambda x: (x - x.rolling(window=self.max_norm_horizon).mean()) / (x.rolling(window=self.max_norm_horizon).std() + 1e-8)
+        )
+
+        # Add the new features to enriched_data at correct symbol and time alignment
+        for feature in ['z_fisher_corr_spy', 'z_market_dispersion', 'z_beta_spy']:
+            self.enriched_data[feature] = df[feature]
+
     def calculate_relative_performance_metrics(self):
         """
         Calculate relative performance vs other assets - KEY for asset selection
@@ -1187,7 +1458,7 @@ class DataEnricher:
         
         # Create pivot for multi-timeframe analysis
         pivot_data = {}
-        for period in ['20d', '60d']:
+        for period in ['20d', '40d']:
             pivot_data[period] = self.enriched_data.pivot_table(
                 values=f'return_{period}', index='Date', columns='Symbol'
             )
@@ -1195,7 +1466,7 @@ class DataEnricher:
         relative_performance_features = {}
         
         for symbol in self.assets:
-            for period in ['20d', '60d']:
+            for period in ['20d', '40d']:
                 # Use the pivot table's columns as the source of truth for available assets
                 available_assets_in_pivot = pivot_data[period].columns.tolist()
 
@@ -1229,13 +1500,14 @@ class DataEnricher:
         # Use optimized feature addition
         self.optimized_add_cross_asset_features(relative_performance_features)
         
-        # Print statistics for debugging and clarification
-        print("\nRelative performance features added:")
-        for feature_name in relative_performance_features.keys():
-            symbol = feature_name.split('_')[0]
-            feature_short_name = '_'.join(feature_name.split('_')[1:])
-            feature_data = self.enriched_data[self.enriched_data['Symbol'] == symbol][feature_short_name]
-            print(f"  {feature_name}: min={feature_data.min():.3f}, max={feature_data.max():.3f}, mean={feature_data.mean():.3f}, median={feature_data.median():.3f}")
+        if self.verbose > 0:
+            # Print statistics for debugging and clarification
+            print("\nRelative performance features added:")
+            for feature_name in relative_performance_features.keys():
+                symbol = feature_name.split('_')[0]
+                feature_short_name = '_'.join(feature_name.split('_')[1:])
+                feature_data = self.enriched_data[self.enriched_data['Symbol'] == symbol][feature_short_name]
+                print(f"  {feature_name}: min={feature_data.min():.3f}, max={feature_data.max():.3f}, mean={feature_data.mean():.3f}, median={feature_data.median():.3f}")
         
 
     def calculate_cross_asset_momentum_regimes(self):
@@ -1339,13 +1611,14 @@ class DataEnricher:
         # Add features back into enriched_data with the optimized updater
         self.optimized_add_cross_asset_features(regime_features)
 
-        # Print statistics for debugging and clarification
-        print("\nCross-asset momentum regime features added:")
-        for feature_name in regime_features.keys():
-            symbol = feature_name.split('_')[0]
-            feature_short_name = '_'.join(feature_name.split('_')[1:])
-            feature_data = self.enriched_data[self.enriched_data['Symbol'] == symbol][feature_short_name]
-            print(f"  {feature_name}: min={feature_data.min():.3f}, max={feature_data.max():.3f}, mean={feature_data.mean():.3f}, median={feature_data.median():.3f}")
+        if self.verbose > 0:
+            # Print statistics for debugging and clarification
+            print("\nCross-asset momentum regime features added:")
+            for feature_name in regime_features.keys():
+                symbol = feature_name.split('_')[0]
+                feature_short_name = '_'.join(feature_name.split('_')[1:])
+                feature_data = self.enriched_data[self.enriched_data['Symbol'] == symbol][feature_short_name]
+                print(f"  {feature_name}: min={feature_data.min():.3f}, max={feature_data.max():.3f}, mean={feature_data.mean():.3f}, median={feature_data.median():.3f}")
 
 
     def calculate_volatility_spillovers(self):
@@ -1426,15 +1699,16 @@ class DataEnricher:
         # Use optimized feature addition
         self.optimized_add_cross_asset_features(spillover_features)
 
-        # Print statistics for debugging and clarification
-        print("\nVolatility spillover features added:")
-        for feature_name in spillover_features.keys():
-            if feature_name in self.enriched_data.columns:
-                symbol = feature_name.split('_')[0]
-                feature_short_name = '_'.join(feature_name.split('_')[1:])
-                # Ensure we are looking at the correct column in the final dataframe
-                feature_data = self.enriched_data[self.enriched_data['Symbol'] == symbol][feature_short_name]
-                print(f"  {feature_name}: NaNs={feature_data.isna().sum()}, min={feature_data.min():.3f}, max={feature_data.max():.3f}, mean={feature_data.mean():.3f}")
+        if self.verbose > 0:
+            # Print statistics for debugging and clarification
+            print("\nVolatility spillover features added:")
+            for feature_name in spillover_features.keys():
+                if feature_name in self.enriched_data.columns:
+                    symbol = feature_name.split('_')[0]
+                    feature_short_name = '_'.join(feature_name.split('_')[1:])
+                    # Ensure we are looking at the correct column in the final dataframe
+                    feature_data = self.enriched_data[self.enriched_data['Symbol'] == symbol][feature_short_name]
+                    print(f"  {feature_name}: NaNs={feature_data.isna().sum()}, min={feature_data.min():.3f}, max={feature_data.max():.3f}, mean={feature_data.mean():.3f}")
 
     def calculate_market_leadership_metrics(self):
         """
@@ -1510,13 +1784,14 @@ class DataEnricher:
         # Use optimized feature addition
         self.optimized_add_cross_asset_features(leadership_features)
         
-        # Print statistics for debugging and clarification
-        print("\nMarket leadership features added (using composite market reference):")
-        for feature_name in leadership_features.keys():
-            symbol = feature_name.split('_')[0]
-            feature_short_name = '_'.join(feature_name.split('_')[1:])
-            feature_data = self.enriched_data[self.enriched_data['Symbol'] == symbol][feature_short_name]
-            print(f"  {feature_name}: min={feature_data.min():.3f}, max={feature_data.max():.3f}, mean={feature_data.mean():.3f}, median={feature_data.median():.3f}")
+        if self.verbose > 0:
+            # Print statistics for debugging and clarification
+            print("\nMarket leadership features added (using composite market reference):")
+            for feature_name in leadership_features.keys():
+                symbol = feature_name.split('_')[0]
+                feature_short_name = '_'.join(feature_name.split('_')[1:])
+                feature_data = self.enriched_data[self.enriched_data['Symbol'] == symbol][feature_short_name]
+                print(f"  {feature_name}: min={feature_data.min():.3f}, max={feature_data.max():.3f}, mean={feature_data.mean():.3f}, median={feature_data.median():.3f}")
 
 
     def calculate_cross_asset_correlations(self):
@@ -1563,14 +1838,15 @@ class DataEnricher:
         # Use optimized feature addition
         self.optimized_add_cross_asset_features(correlation_features)
 
-        # Print statistics for debugging and clarification
-        print("\nCross-asset correlation features added:")
-        for feature_name in correlation_features.keys():
-            if feature_name in self.enriched_data.columns:
-                symbol = feature_name.split('_')[0]
-                feature_short_name = '_'.join(feature_name.split('_')[1:])
-                feature_data = self.enriched_data[self.enriched_data['Symbol'] == symbol][feature_short_name]
-                print(f"  {feature_name}: NaNs={feature_data.isna().sum()}, min={feature_data.min():.3f}, max={feature_data.max():.3f}, mean={feature_data.mean():.3f}")
+        if self.verbose > 0:
+            # Print statistics for debugging and clarification
+            print("\nCross-asset correlation features added:")
+            for feature_name in correlation_features.keys():
+                if feature_name in self.enriched_data.columns:
+                    symbol = feature_name.split('_')[0]
+                    feature_short_name = '_'.join(feature_name.split('_')[1:])
+                    feature_data = self.enriched_data[self.enriched_data['Symbol'] == symbol][feature_short_name]
+                    print(f"  {feature_name}: NaNs={feature_data.isna().sum()}, min={feature_data.min():.3f}, max={feature_data.max():.3f}, mean={feature_data.mean():.3f}")
 
     def optimized_add_cross_asset_features(self, features_dict):
         """
@@ -1767,6 +2043,6 @@ class DataEnricher:
 
 # Execution
 data_process_and_enrichment = DataEnricher(
-    input_raw_indices_filepath = r"C:\Users\HansenSimonO\Documents\Coding\PyTradeOne_v01\src\data\processed_multi_index_data.csv",
-    input_raw_fx_filepath = r"C:\Users\HansenSimonO\Documents\Coding\PyTradeOne_v01\src\data\used_data\fx_rates_daily\aggregated_fx_rates_2000_2025.csv"
+    input_raw_indices_filepath = r"C:\dev\pytrade\src\data\processed_multi_index_data.csv",
+    input_raw_fx_filepath = None
 )

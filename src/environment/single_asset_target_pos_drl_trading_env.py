@@ -2224,7 +2224,7 @@ class TradingEnv(gym.Env):
         self._ep_exposure_steps += 1
         # Record raw action output (single-asset mode)
         if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
-            self._ep_action_outputs.append(float(action))
+            self._ep_action_outputs.append(float(np.asarray(action).item()))
         # Shadow (frictionless) portfolio: apply same position changes without costs
         if execution_result.success:
             shadow_pos = self.shadow_portfolio_state.positions.copy()
@@ -2673,11 +2673,11 @@ class TradingEnv(gym.Env):
                 "action_p75": float(np.percentile(self._ep_action_outputs, 75)) if self._ep_action_outputs else 0.0,
                 "action_p95": float(np.percentile(self._ep_action_outputs, 95)) if self._ep_action_outputs else 0.0,
                 # Sortino internals (episode aggregates)
-                "sortino_mean_ema": float(np.mean(self._sortino_mean_hist)) if hasattr(self, "_sortino_mean_hist") else 0.0,
-                "sortino_downside_ema": float(np.mean(self._sortino_down_hist)) if hasattr(self, "_sortino_down_hist") else 0.0,
-                "sortino_reward_raw_mean": float(np.mean(self._sortino_raw_hist)) if hasattr(self, "_sortino_raw_hist") else 0.0,
-                "sortino_reward_raw_p25": float(np.percentile(self._sortino_raw_hist, 25)) if hasattr(self, "_sortino_raw_hist") else 0.0,
-                "sortino_reward_raw_p75": float(np.percentile(self._sortino_raw_hist, 75)) if hasattr(self, "_sortino_raw_hist") else 0.0,
+                "sortino_mean_ema": float(np.mean(self._sortino_mean_hist)) if (hasattr(self, "_sortino_mean_hist") and len(self._sortino_mean_hist) > 0) else 0.0,
+                "sortino_downside_ema": float(np.mean(self._sortino_down_hist)) if (hasattr(self, "_sortino_down_hist") and len(self._sortino_down_hist) > 0) else 0.0,
+                "sortino_reward_raw_mean": float(np.mean(self._sortino_raw_hist)) if (hasattr(self, "_sortino_raw_hist") and len(self._sortino_raw_hist) > 0) else 0.0,
+                "sortino_reward_raw_p25": float(np.percentile(self._sortino_raw_hist, 25)) if (hasattr(self, "_sortino_raw_hist") and len(self._sortino_raw_hist) > 0) else 0.0,
+                "sortino_reward_raw_p75": float(np.percentile(self._sortino_raw_hist, 75)) if (hasattr(self, "_sortino_raw_hist") and len(self._sortino_raw_hist) > 0) else 0.0,
  
             })
 

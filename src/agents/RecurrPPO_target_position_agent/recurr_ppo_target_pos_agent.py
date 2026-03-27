@@ -703,7 +703,7 @@ def build_model(env: gym.Env, config: Dict[str, Any]) -> RecurrentPPO:
         device=device,
         normalize_advantage=normalize_advantage,
         verbose=int(agent_cfg.get("verbose", 1)),
-        tensorboard_log=r"C:\Users\HansenSimonO\Documents\Coding\PyTradeTwo\pytrade-two\src\agents\RecurrPPO_target_position_agent\tb_logs",
+        tensorboard_log=r"src\agents\RecurrPPO_target_position_agent\tb_logs",
         stats_window_size=int(agent_cfg.get("stats_window_size", 100))
     )
     return model
@@ -829,7 +829,7 @@ def run(cache, config: Dict[str, Any]) -> Dict[str, Any]:
     # Extract run_id from json file and increment it
     # run_id = str(config.get("training", {}).get("run_id", "00001")).zfill(5)
     # Load run_id from JSON file
-    run_id_file = r"C:\Users\HansenSimonO\Documents\Coding\PyTradeTwo\pytrade-two\src\data\run_id.json"
+    run_id_file = r"src\data\run_id.json"
     with open(run_id_file, 'r') as f:
         run_id_data = json.load(f)
 
