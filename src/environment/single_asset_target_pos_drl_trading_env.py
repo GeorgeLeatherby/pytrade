@@ -1711,6 +1711,10 @@ class TradingEnv(gym.Env):
                 initial_cash = self.initial_portfolio_value
                 initial_positions[:] = 0.0 # all assets zero
                 total_init_tc = 0.0
+                # Store initial subportfolio values for SAA mode (cash only, no selected asset position)
+                self.saa_initial_cash = initial_cash
+                self.saa_selected_asset_value = 0.0
+                self.saa_initial_subportfolio_value = self.saa_initial_cash + self.saa_selected_asset_value
             else:
                 # Random allocation between cash and assets
                 rand_weights = np.random.dirichlet(np.ones(self.market_data_cache.num_assets + 1))

@@ -14,6 +14,9 @@ Inputs:
 import pandas as pd
 import numpy as np
 import os
+from statsmodels.tsa.stattools import adfuller
+from rich.console import Console
+from rich.table import Table
 
 class DataEnricher:
     def __init__(self, input_raw_indices_filepath, input_raw_fx_filepath):
@@ -84,12 +87,20 @@ class DataEnricher:
 
     def enrich_data(self):
         # Logic of feature calculation and data enrichment
-
         # Raw to stationary Feature engineering
         self.convert_raw_to_stationary_data()
         self.NaN_counting()
 
         self.trigonometric_date_encoding()
+        self.NaN_counting()
+
+        self.technical_indicators()
+        self.NaN_counting()
+
+        self.cross_asset_features()
+        self.NaN_counting()
+
+        self.add_frac_diff_features()
         self.NaN_counting()
 
         # COUNT NaNs per columns
@@ -98,6 +109,7 @@ class DataEnricher:
         self.Inf_detection()
         # 6. Save calculated data
         self.save_calculated_data()
+
 
     def NaN_counting(self):
         # Detect NaN counts per column and overall within enriched_data
@@ -316,6 +328,165 @@ class DataEnricher:
             self.enriched_data = df
 
 
+    def technical_indicators(self):
+        """
+        Calculate technical indicators for the enriched data. Add them to proper data and symbol
+        position within enriched_data
+        """
+        # Copy enriched_data
+        technical_indicators = self.enriched_data.copy()
+
+        # Filter enriched data set to usable range
+        technical_indicators = technical_indicators[
+            (technical_indicators['Date'] >= self.starting_date) &
+            (technical_indicators['Date'] <= self.ending_date)
+        ]
+
+        print(f"Calculating technical indicators...")
+
+        for symbol in technical_indicators['Symbol'].unique():
+            symbol_data = technical_indicators[technical_indicators['Symbol'] == symbol].sort_values('Date').copy()
+            
+            # RSI - Relative strength index 14 and 30 days
+            for period in [14]:
+                delta = symbol_data['Close'].diff()
+                gain = delta.where(delta > 0, 0).rolling(window=period).mean()
+                loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+                rs = gain / (loss + 1e-8)
+                rsi = 100 - (100 / (1 + rs))
+                symbol_data[f'rsi_{period}'] = ((rsi - 50) / 50).rolling(3).mean()  # Normalize to [-1, 1]
+            
+                # Add RSI to correct symbol and date in enriched_data
+                self.enriched_data.loc[
+                    (self.enriched_data['Symbol'] == symbol) &
+                    (self.enriched_data['Date'].isin(symbol_data['Date'])),
+                    f'rsi_{period}'
+                ] = symbol_data[f'rsi_{period}']
+
+
+            # Bollinger Band width
+            rolling_mean = symbol_data['Close'].rolling(window=self.max_norm_horizon).mean()
+            rolling_std = symbol_data['Close'].rolling(window=self.max_norm_horizon).std()
+            symbol_data['bb_width_reworked'] = ((rolling_mean + rolling_std * 2) - (rolling_mean - rolling_std * 2)) / (rolling_mean + 1e-8)  # Width as percentage of price
+            
+            # Apply Z-score normalization to Bollinger Band width and clip to avoid extreme values
+            bb_width_mean = symbol_data['bb_width_reworked'].rolling(window=self.max_norm_horizon).mean()
+            bb_width_std = symbol_data['bb_width_reworked'].rolling(window=self.max_norm_horizon).std()
+            symbol_data['bb_width_reworked'] = ((symbol_data['bb_width_reworked'] - bb_width_mean) / (bb_width_std + 1e-8)).clip(-3, 3)
+
+            # Add Bollinger Band width to correct symbol and date in enriched_data
+            self.enriched_data.loc[
+                (self.enriched_data['Symbol'] == symbol) &
+                (self.enriched_data['Date'].isin(symbol_data['Date'])),
+                'bb_width_reworked'
+            ] = symbol_data['bb_width_reworked']
+
+
+            # ATR for volatility assessment
+            """ATR (Average True Range) is a technical analysis indicator that measures market volatility by calculating the 
+            average range between high and low prices over a specified period.
+            It provides insights into the degree of price fluctuations"""
+            high_low = symbol_data['High'] - symbol_data['Low']
+            high_close = np.abs(symbol_data['High'] - symbol_data['Close'].shift(1))
+            low_close = np.abs(symbol_data['Low'] - symbol_data['Close'].shift(1))
+            true_range = np.maximum(high_low, np.maximum(high_close, low_close))
+            atr = true_range.rolling(window=self.max_norm_horizon).mean()
+
+            # Z-score the ATR to normalize it, then clip to avoid extreme values
+            atr_zscore = (atr - atr.rolling(window=self.max_norm_horizon).mean()) / (atr.rolling(window=self.max_norm_horizon).std() + 1e-8)
+            symbol_data['atr_z_norm'] = atr_zscore.clip(-3, 3)
+
+            # Add ATR to correct symbol and date in enriched_data
+            self.enriched_data.loc[
+                (self.enriched_data['Symbol'] == symbol) &
+                (self.enriched_data['Date'].isin(symbol_data['Date'])),
+                'atr_z_norm'
+            ] = symbol_data['atr_z_norm']
+
+
+    def cross_asset_features(self):
+        """
+        Calculates high-level cross-asset signals:
+        - Fisher-Z Correlation with SPY
+        - Cross-sectional Dispersion
+        - Rolling Beta
+        
+        NOTE: Uses date-aligned operations like convert_raw_to_stationary_data!
+
+        """
+        print("Calculating cross-asset correlation features...")
+
+        # Use the enriched_data which already has returns calculated
+        df = self.enriched_data.copy()  # Make explicit copy
+
+        # --- 1. Preparation: Get Benchmark Returns (indexed by Date) ---
+        spy_ret = df[df['Symbol'] == 'SPY'].set_index('Date')['log_close_return_1d']
+        
+        # --- 2. Rolling Correlation & Fisher-Z Transform (FIXED) ---
+        # Use groupby + transform with explicit per-symbol date alignment
+        def calc_fisher_corr(group):
+            """
+            group is a Series with the default integer index from groupby-transform.
+            We need to align it to dates, compute rolling correlation, then return.
+            """
+            # Get the corresponding dates for this symbol's group
+            symbol_dates = df[df['Symbol'] == group.name].set_index('Date').index
+            # Reindex the group by dates (this preserves alignment)
+            group_with_dates = pd.Series(group.values, index=symbol_dates)
+            
+            # Get SPY returns for these dates
+            spy_ret_aligned = spy_ret.reindex(symbol_dates)
+            
+            # Compute rolling correlation
+            corr = group_with_dates.rolling(window=21).corr(spy_ret_aligned)
+            
+            # Fisher Z-Transform: 0.5 * ln((1+r)/(1-r))
+            corr = corr.clip(-0.99, 0.99)
+            fisher_z = 0.5 * np.log((1 + corr) / (1 - corr))
+            
+            # Return aligned to original index positions
+            return fisher_z.values
+        
+        df['z_fisher_corr_spy'] = df.groupby('Symbol')['log_close_return_1d'].transform(calc_fisher_corr)
+
+        # --- 3. Cross-Sectional Dispersion (Market 'Spread') ---
+        # This already works in original code - group by Date, calculate std across symbols
+        dispersion = df.groupby('Date')['log_close_return_1d'].std()
+        df['market_dispersion'] = df['Date'].map(np.log(dispersion + 1e-8))
+        
+        # Z-score the dispersion to make it stationary
+        df['z_market_dispersion'] = (df['market_dispersion'] - df['market_dispersion'].rolling(window=self.max_norm_horizon).mean()) / \
+                                    (df['market_dispersion'].rolling(window=self.max_norm_horizon).std() + 1e-8)
+
+        # --- 4. Rolling Beta (FIXED) ---
+        def calc_beta(group):
+            """
+            Beta = Cov(Asset, Market) / Var(Market)
+            Similar structure to calc_fisher_corr for proper date alignment
+            """
+            symbol_dates = df[df['Symbol'] == group.name].set_index('Date').index
+            group_with_dates = pd.Series(group.values, index=symbol_dates)
+            spy_ret_aligned = spy_ret.reindex(symbol_dates)
+            
+            # Calculate covariance and variance with proper alignment
+            covariance = group_with_dates.rolling(window=self.max_norm_horizon).cov(spy_ret_aligned)
+            market_variance = spy_ret_aligned.rolling(window=self.max_norm_horizon).var()
+            
+            beta = covariance / (market_variance + 1e-8)
+            return beta.values
+        
+        df['beta_spy'] = df.groupby('Symbol')['log_close_return_1d'].transform(calc_beta)
+        
+        # Final Z-score for Beta to normalize across assets
+        df['z_beta_spy'] = df.groupby('Symbol')['beta_spy'].transform(
+            lambda x: (x - x.rolling(window=self.max_norm_horizon).mean()) / (x.rolling(window=self.max_norm_horizon).std() + 1e-8)
+        )
+
+        # Add the new features to enriched_data at correct symbol and time alignment
+        for feature in ['z_fisher_corr_spy', 'z_market_dispersion','z_beta_spy']:
+            self.enriched_data[feature] = df[feature]
+
+
     def compare_date_ranges(self):
         """
         Determine usable date range from actual data bounds.
@@ -442,6 +613,26 @@ class DataEnricher:
             # This is excellent for RL agents as it preserves the sign but limits the impact of outliers
             df[f'norm_volume_feature_{period}d'] = np.tanh(z_vol)
 
+        # Features for compact intraday information (Open, High, Low)
+        log_intra_vol = np.log(df['High']/(df['Low']))
+        closing_strength = (df['Close'] - df['Low']) / (df['High'] - df['Low'])
+        log_overnight_gap = np.log(df['Open'] / df['Close'].shift(1))
+        shadow_ratio = (df['High'] - np.max(df[['Open', 'Close']], axis=1)) / (df['High'] - df['Low'])
+
+        # Make stationary (z-scoring or MinMax scaling)
+        rolling_mean = log_intra_vol.rolling(window=self.max_norm_horizon).mean()
+        rolling_std = log_intra_vol.rolling(window=self.max_norm_horizon).std()
+        z_log_intra_vol = np.tanh((log_intra_vol - rolling_mean) / (rolling_std + 1e-8))
+
+        rolling_mean_og = log_overnight_gap.rolling(window=self.max_norm_horizon).mean()
+        rolling_std_og = log_overnight_gap.rolling(window=self.max_norm_horizon).std()
+        z_log_overnight_gap = np.tanh((log_overnight_gap - rolling_mean_og) / (rolling_std_og + 1e-8))
+
+        df['z_log_intra_vol'] = z_log_intra_vol
+        df['norm_closing_strength'] = (closing_strength*2) - 1
+        df['z_log_overnight_gap'] = z_log_overnight_gap
+        df['norm_shadow_ratio'] = (shadow_ratio*2) - 1
+
 
         # --- 4. Final Assignment ---
         self.enriched_data = df
@@ -450,6 +641,163 @@ class DataEnricher:
             print("\nEnriched data after converting to stationary format:")
             print(f"Shape of enriched data: {self.enriched_data.shape}")
             print(self.enriched_data.head(300))
+
+
+    def _get_ffd_weights(self, d, threshold, max_len):
+        """Calculates weights for FFD using binomial expansion."""
+        w = [1.0]
+        for k in range(1, max_len):
+            w_k = -w[-1] * (d - k + 1) / k
+            if abs(w_k) < threshold:
+                break
+            w.append(w_k)
+        return np.array(w[::-1]).reshape(-1, 1)
+
+    def _apply_ffd_to_series(self, series, d, threshold=5e-5):
+        """Vectorized application of FFD weights to a single price series."""
+        weights = self._get_ffd_weights(d, threshold, len(series))
+        width = len(weights)
+        # Use convolution for speed over looping
+        # Resulting series is shorter by (width - 1)
+        padded_series = series.values
+        output = np.convolve(padded_series, weights.flatten(), mode='valid')
+        
+        # Return as series with aligned index
+        return pd.Series(output, index=series.index[width-1:])
+
+    def find_multi_asset_golden_d(self, df, start_d=0.4, end_d=0.8, step=0.05):
+        """Iteratively finds the minimum d that achieves stationarity."""
+        print(f"Searching for Golden d in range [{start_d}, {end_d}]...")
+
+        # 1. Use SPY, Gold and Crude as the anchor to find d (avoids re-calculating for every ticker)
+        spy_close = df[df['Symbol'] == 'SPY'].set_index('Date')['Close']
+        gold_close = df[df['Symbol'] == 'Gold'].set_index('Date')['Close']
+        crude_close = df[df['Symbol'] == 'Crude'].set_index('Date')['Close']
+
+        found_ds = []
+
+        for asset_name, close_series in [('SPY', spy_close), ('Gold', gold_close), ('Crude', crude_close)]:
+            d = self.find_golden_d(close_series, start_d, end_d, step)
+            print(f"  -> {asset_name} Golden d: {d:.2f}")
+            found_ds.append(d)
+
+        global_golden_d = max(found_ds)
+
+        if global_golden_d == end_d:
+            raise ValueError(f"Could not find a suitable d that achieves stationarity for any of the anchor assets within the range [{start_d}, {end_d}]. Consider expanding the search range or adjusting the step size.")
+        
+        return global_golden_d
+
+    def find_golden_d(self, sample_series, start_d=0.4, end_d=0.8, step=0.05):
+        """Iteratively finds the minimum d that achieves stationarity."""
+        print(f"Searching for Golden d in range [{start_d}, {end_d}]...")
+        golden_d = end_d
+        
+        for d in np.arange(start_d, end_d + step, step):
+            # Apply FFD to log prices
+            diff_series = self._apply_ffd_to_series(np.log(sample_series), d)
+            
+            # Run Augmented Dickey-Fuller test
+            # Note: autolag='AIC' is standard for financial time series
+            try:
+                res = adfuller(diff_series.dropna(), autolag='AIC')
+                p_val = res[1]
+                if p_val < 0.05:
+                    print(f"  -> d={d:.2f} passed ADF test (p={p_val:.4f}).")
+                    golden_d = d
+                    break
+            except Exception:
+                continue
+                
+        return golden_d
+
+    def add_frac_diff_features(self):
+        """Main entry point to calculate and add FFD features to enriched_data."""
+        print("Calculating stationary memory features (FFD)...")
+        df = self.enriched_data
+            
+        golden_d = self.find_multi_asset_golden_d(df)
+        print(f"Applying Golden d={golden_d:.2f} to all assets.")
+
+        # 2. Apply FFD to each symbol
+        def group_ffd(group):
+            # We work in Log space for price stationarity
+            log_price = np.log(group['Close'])
+            return self._apply_ffd_to_series(log_price, golden_d)
+
+        # Calculate and map back
+        ffd_series = df.groupby('Symbol', group_keys=False).apply(group_ffd)
+        df['ffd_close'] = ffd_series
+        
+        # 3. Final Normalization (Z-Score + Tanh)
+        # This ensures the 'memory' feature is scaled like our returns
+        group_v = df.groupby('Symbol')['ffd_close']
+        v_mean = group_v.transform(lambda x: x.rolling(window=self.max_norm_horizon).mean())
+        v_std = group_v.transform(lambda x: x.rolling(window=self.max_norm_horizon).std())
+        
+        z_ffd = (df['ffd_close'] - v_mean) / (v_std + 1e-8)
+        df['norm_ffd_feature'] = np.tanh(z_ffd)
+        
+        print(f"FFD feature generation complete. d={golden_d:.2f} \
+              Verifying stationarity of all FFD features with ADF test...")
+        
+        passed_afd_test = self.report_stationarity()
+        if not passed_afd_test:
+            raise ValueError("Not all FFD features passed the stationarity test. Consider adjusting the Golden d search range or step size.")
+        else:
+            print("\nProceeding with adding calculated FFD features to enriched_data.")
+            self.enriched_data = df
+
+    def report_stationarity(self):
+        """
+        Generates a terminal report of ADF test results for the FFD features.
+        """
+        console = Console()
+        table = Table(title="FFD Feature Stationarity Report")
+        table.add_column("Symbol", style="cyan")
+        table.add_column("ADF Statistic", justify="right")
+        table.add_column("p-value", justify="right")
+        table.add_column("Status", justify="center")
+
+        symbols = self.enriched_data['Symbol'].unique()
+        feature_col = 'norm_ffd_feature'
+        
+        passed_count = 0
+
+        for symbol in symbols:
+            series = self.enriched_data[self.enriched_data['Symbol'] == symbol][feature_col].dropna()
+            
+            # We need enough data points for a meaningful ADF test
+            if len(series) < 30:
+                continue
+                
+            res = adfuller(series, autolag='AIC')
+            adf_stat = res[0]
+            p_val = res[1]
+            
+            # Determination of status
+            if p_val < 0.01:
+                status = "[green]Highly Stationary[/green]"
+                passed_count += 1
+            elif p_val < 0.05:
+                status = "[yellow]Stationary, passed[/yellow]"
+                passed_count += 1
+            else:
+                status = "[red]Non-Stationary[/red]"
+                
+            table.add_row(symbol, f"{adf_stat:.4f}", f"{p_val:.4f}", status)
+
+        console.print(table)
+        pass_rate = (passed_count / len(symbols)) * 100
+        console.print(f"\n[bold]Overall Pass Rate (p < 0.05): {pass_rate:.2f}%[/bold]")
+
+        if pass_rate == 100:
+            return True
+        else:
+            print("\n[red]Warning: Not all Symbols' FFD features passed the stationarity test. Consider adjusting the Golden d search range or step size.[/red]")
+            return False
+
+        
 
 # Execution
 data_process_and_enrichment = DataEnricher(

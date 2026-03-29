@@ -11,6 +11,6 @@ What to try:    - keep more meaningful data wihtin features
 - atr_z_norm
 - rsi_14
 - bb_width_reworked
-- z_distance_to_mean
 - z_fisher_corr_spy
 - z_market_dispersion
+- z_beta_spy
