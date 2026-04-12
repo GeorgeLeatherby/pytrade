@@ -622,7 +622,7 @@ def build_policy_kwargs(config: Dict[str, Any]) -> Dict[str, Any]:
     - n_lstm_layers: int (e.g., 1)
     - lstm_hidden_size: int (e.g., 128)
     - shared_lstm: bool (e.g., True)
-    - net_arch: {"pi": [128], "vf": [128]} (actor/critic MLP heads sizes)
+    - net_arch: {just examplatory: "pi": [128], "vf": [128]} (actor/critic MLP heads sizes)
 
     Returns:
         dict for MlpLstmPolicy construction.
@@ -751,12 +751,22 @@ class InputMLPFeatures(BaseFeaturesExtractor):
         super().__init__(observation_space, features_dim)
         n_in = observation_space.shape[0]
         self.mlp = nn.Sequential(
+            # --- Block 1 ---
             nn.Linear(n_in, 128),
             nn.LayerNorm(128),
-            nn.SiLU(), # Swish activation: x * sigmoid(x)
-            nn.Linear(128, 128),
             nn.SiLU(),
-            nn.Linear(128, features_dim)
+            nn.Dropout(0.3), 
+
+            # --- Block 2 ---
+            nn.Linear(128, 128),
+            nn.LayerNorm(128), # Added a second LayerNorm for stability
+            nn.SiLU(),
+            nn.Dropout(0.3),
+
+            # --- Output Projection ---
+            # Fix: The input here must be 128 to match the previous layer
+            nn.Linear(128, features_dim), 
+            nn.SiLU()
         )
     def forward(self, x):
         return self.mlp(x)

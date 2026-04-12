@@ -1,0 +1,28 @@
+{
+  "test_agent": {
+    "num_episodes": 5,
+    "device": "cpu",
+    "saa_configs": {
+      "ASSET_1": {
+        "saa_run_id": "00001",
+        "saa_base_dir": "src/agents/RecurrPPO_target_position_agent/saved_models",
+        "saa_config_id": "00001",
+        "saa_run_date": "26_04_10"
+      },
+      "ASSET_2": {
+        "saa_run_id": "00001",
+        "saa_base_dir": "src/agents/RecurrPPO_target_position_agent/saved_models",
+        "saa_config_id": "00001",
+        "saa_run_date": "26_04_10"
+      }
+    }
+  },
+  "training": {
+    "seed": 42
+  },
+  "environment": {
+    "initial_cash": 100000,
+    "max_episode_length": 252,
+    "transaction_cost_bps": 10
+  }
+}

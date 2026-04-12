@@ -22,4 +22,11 @@ Enhance tb metrics. Show min/max/mean/median of action logits.
 
     Fragen für Normalisierung: Wenn jedes asset einzelnd normalisiert wird, geht information zwischen den assets verloren. Wie groß der jeweilige Preisschritt bei jedem asset ist müssten die agents durch den reward herausfinden. 
 
-Retrain the SAA LSTM on refit data!
+## Retrain the SAA LSTM on refit data!
+SAA MLP  size is hardcoded not taken from config. I reduced it from 3 layers 128 to 3 layers 64, whilst also making lstm layer 64 from 128. A test would be to enhance the MLP layer again (not recommended by LLM)
+
+Another approach would be to increase lstm layer size to 2! This might capture temporal patterns better. Literature to check according to LLM:
+- Time Series Forecasting (Lai et al., 2018)
+- Multi-Scale Temporal Processing (Chung et al., 2016)
+- Deep RNNs for Long-Term Dependencies (Pascanu et al., 2013)
+- Hierarchical Temporal Representation (Graves et al., 2013)

@@ -199,9 +199,9 @@ class DataEnricher:
                         # Sort by NaN count descending
                         nan_features.sort(key=lambda x: x[1], reverse=True)
                         num_rows_affected = len(symbol_year_data)
-                        print(f"\n{year} | {symbol} ({num_rows_affected} rows with NaN):")
-                        for feature, count in nan_features:
-                            print(f"  └─ {feature}: {count} NaN values")
+                        # print(f"\n{year} | {symbol} ({num_rows_affected} rows with NaN):")
+                        # for feature, count in nan_features:
+                        #     print(f"  └─ {feature}: {count} NaN values")
                         detailed_nan_info.append({
                             'Year': year,
                             'Symbol': symbol,
@@ -211,7 +211,7 @@ class DataEnricher:
                         })
             
             # Summary table
-            print("\n" + "="*50)
+            print("="*50)
             print("SUMMARY TABLE: Year × Symbol")
             print("="*50)
             summary_df = pd.DataFrame(detailed_nan_info)
@@ -219,12 +219,21 @@ class DataEnricher:
                 for idx, row in summary_df.iterrows():
                     print(f"{row['Year']:4d} | {row['Symbol']:6s} | Rows: {row['RowsWithNaN']:4d} | Top feature: {row['TopFeature']}")
 
-            # Delete the date range within enriched_data that contains NaNs, if user confirms (y/n)
-            user_input = input(f"\nDo you want to delete all {len(nan_rows)} rows with any NaN values from enriched_data? (y/n): ").strip().lower()
+            # Identify all dates that contain any NaN values
+            nan_dates = nan_rows['Date'].unique()
+            num_nan_dates = len(nan_dates)
+            num_rows_to_delete = len(nan_rows)
+            
+            print(f"\nDates with NaN values: {num_nan_dates}")
+            print(f"Total rows to delete: {num_rows_to_delete}")
+            print(f"Date range: {nan_rows['Date'].min()} to {nan_rows['Date'].max()}")
+            
+            # Ask user for confirmation
+            user_input = input(f"\nDelete all {num_rows_to_delete} rows across {num_nan_dates} dates? (y/n): ").strip().lower()
             if user_input == 'y':
                 initial_shape = self.enriched_data.shape
-                self.enriched_data = self.enriched_data.dropna() # dropna deletes all rows with any NaN values
-                print(f"Rows with NaN values deleted. New shape: {self.enriched_data.shape} was {initial_shape}")
+                self.enriched_data = self.enriched_data[~self.enriched_data['Date'].isin(nan_dates)]
+                print(f"Rows deleted. Shape: {self.enriched_data.shape} (was {initial_shape})")
             else:
                 print("No rows deleted. NaN values remain in enriched_data.")
 
@@ -274,11 +283,11 @@ class DataEnricher:
             print("\nInf counts per year:")
             print(inf_counts_per_year)
 
-            # Symbol counts
-            if 'Symbol' in inf_rows.columns:
-                inf_counts_per_symbol = inf_rows.groupby('Symbol').size()
-                print("\nInf counts per symbol:")
-                print(inf_counts_per_symbol)
+            # # Symbol counts
+            # if 'Symbol' in inf_rows.columns:
+            #     inf_counts_per_symbol = inf_rows.groupby('Symbol').size()
+            #     print("\nInf counts per symbol:")
+            #     print(inf_counts_per_symbol)
         
 
     def save_calculated_data(self):
@@ -642,27 +651,37 @@ class DataEnricher:
             print(f"Shape of enriched data: {self.enriched_data.shape}")
             print(self.enriched_data.head(300))
 
-
-    def _get_ffd_weights(self, d, threshold, max_len):
-        """Calculates weights for FFD using binomial expansion."""
+    def _get_global_ffd_weights(self, d, threshold):
+        """Calculates weights until the threshold is strictly met. No max_len."""
         w = [1.0]
-        for k in range(1, max_len):
+        k = 1
+        while True:
             w_k = -w[-1] * (d - k + 1) / k
             if abs(w_k) < threshold:
                 break
             w.append(w_k)
+            k += 1
+            # Safety break to prevent infinite loops in extreme edge cases
+            if k > 10000:
+                print(f"Warning: FFD weight calculation hit 10,000 days at d={d}. Truncating.")
+                break
+                
+        # Return flipped weights for convolution
         return np.array(w[::-1]).reshape(-1, 1)
 
-    def _apply_ffd_to_series(self, series, d, threshold=5e-5):
-        """Vectorized application of FFD weights to a single price series."""
-        weights = self._get_ffd_weights(d, threshold, len(series))
-        width = len(weights)
-        # Use convolution for speed over looping
-        # Resulting series is shorter by (width - 1)
-        padded_series = series.values
-        output = np.convolve(padded_series, weights.flatten(), mode='valid')
+    def _apply_ffd_to_series(self, series, global_weights):
+        """Vectorized application of fixed FFD weights to a price series."""
+        width = len(global_weights)
         
-        # Return as series with aligned index
+        # If the stock hasn't existed long enough to form a single FFD window,
+        # return an array of NaNs to preserve the dataframe shape.
+        if len(series) < width:
+            return pd.Series(np.nan, index=series.index)
+            
+        padded_series = series.values
+        output = np.convolve(padded_series, global_weights.flatten(), mode='valid')
+        
+        # Return as series with aligned index (the first 'width-1' days are dropped)
         return pd.Series(output, index=series.index[width-1:])
 
     def find_multi_asset_golden_d(self, df, start_d=0.4, end_d=0.8, step=0.05):
@@ -688,14 +707,17 @@ class DataEnricher:
         
         return global_golden_d
 
-    def find_golden_d(self, sample_series, start_d=0.4, end_d=0.8, step=0.05):
+    def find_golden_d(self, sample_series, start_d=0.4, end_d=0.8, step=0.05, threshold=5e-5):
         """Iteratively finds the minimum d that achieves stationarity."""
         print(f"Searching for Golden d in range [{start_d}, {end_d}]...")
         golden_d = end_d
         
         for d in np.arange(start_d, end_d + step, step):
-            # Apply FFD to log prices
-            diff_series = self._apply_ffd_to_series(np.log(sample_series), d)
+            # 1. Generate the temporary weights for this specific test 'd'
+            test_weights = self._get_global_ffd_weights(d, threshold)
+            
+            # 2. Apply FFD to log prices using the calculated test_weights
+            diff_series = self._apply_ffd_to_series(np.log(sample_series), test_weights)
             
             # Run Augmented Dickey-Fuller test
             # Note: autolag='AIC' is standard for financial time series
@@ -719,18 +741,23 @@ class DataEnricher:
         golden_d = self.find_multi_asset_golden_d(df)
         print(f"Applying Golden d={golden_d:.2f} to all assets.")
 
-        # 2. Apply FFD to each symbol
+        # 1. Calculate the weights exactly ONCE globally
+        # We use the threshold you defined (e.g., 5e-5)
+        global_weights = self._get_global_ffd_weights(golden_d, threshold=5e-5)
+        window_size = len(global_weights)
+        print(f"Global FFD window size established at {window_size} days.")
+
+        # 2. Apply FFD to each symbol using the FIXED weights
         def group_ffd(group):
-            # We work in Log space for price stationarity
             log_price = np.log(group['Close'])
-            return self._apply_ffd_to_series(log_price, golden_d)
+            return self._apply_ffd_to_series(log_price, global_weights)
 
         # Calculate and map back
+        # Pandas will automatically assign NaNs to the first 'window_size - 1' days of each group
         ffd_series = df.groupby('Symbol', group_keys=False).apply(group_ffd)
         df['ffd_close'] = ffd_series
         
         # 3. Final Normalization (Z-Score + Tanh)
-        # This ensures the 'memory' feature is scaled like our returns
         group_v = df.groupby('Symbol')['ffd_close']
         v_mean = group_v.transform(lambda x: x.rolling(window=self.max_norm_horizon).mean())
         v_std = group_v.transform(lambda x: x.rolling(window=self.max_norm_horizon).std())
@@ -738,12 +765,12 @@ class DataEnricher:
         z_ffd = (df['ffd_close'] - v_mean) / (v_std + 1e-8)
         df['norm_ffd_feature'] = np.tanh(z_ffd)
         
-        print(f"FFD feature generation complete. d={golden_d:.2f} \
-              Verifying stationarity of all FFD features with ADF test...")
+        print(f"FFD feature generation complete. d={golden_d:.2f}")
+        print("Verifying stationarity of all FFD features with ADF test...")
         
         passed_afd_test = self.report_stationarity()
         if not passed_afd_test:
-            raise ValueError("Not all FFD features passed the stationarity test. Consider adjusting the Golden d search range or step size.")
+            raise ValueError("Not all FFD features passed the stationarity test.")
         else:
             print("\nProceeding with adding calculated FFD features to enriched_data.")
             self.enriched_data = df
