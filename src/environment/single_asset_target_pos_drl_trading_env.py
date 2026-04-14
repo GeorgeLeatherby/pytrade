@@ -1525,7 +1525,7 @@ class TradingEnv(gym.Env):
 
         if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
             asset_obs_size = num_features # Single step asset features for selected asset
-            portfolio_obs_size = 3 # rel_cash_weight, rel_asset_weight, day_return
+            portfolio_obs_size = 4 # log cash ratio, log asset ratio, day return just agent relevant, last_action
 
         else:
             if self.maybe_provide_sequence:
@@ -2335,10 +2335,11 @@ class TradingEnv(gym.Env):
             net_asset_dollars = execution_result.traded_notional_per_asset.copy()
             net_asset_dollars[np.isnan(net_asset_dollars)] = 0.0
             net_cash_delta = -float(np.sum(net_asset_dollars))  # costs handled separately in transaction_cost
-            action_vec = target_position_change  # store the scalar target position change for the single asset  
+            action_vec = np.zeros(self.market_data_cache.num_assets + 1, dtype=np.float32)
+            action_vec[selected_asset_index + 1] = np.float32(target_position_change)  
 
         elif self.execution_mode == EXECUTION_PORTFOLIO_WEIGHTS:
-            action_vec = weight_change_target.astype(np.float32)
+            action_vec = weight_change_target.astype(np.float32).copy()
 
         else:
             net_asset_dollars = execution_result.traded_notional_per_asset.copy()
@@ -3956,11 +3957,11 @@ class TradingEnv(gym.Env):
             # Daily return of the full portfolio for this step
             daily_portfolio_return = float(self.episode_buffer.returns[internal_step])
 
-            # Daily log return of just cash change plus selected asset notional change
+            # Daily return of just cash change plus selected asset notional change
             daily_agent_return = float(self.episode_buffer.saa_returns[internal_step])
 
             # Last agents action
-            last_action = float(self.episode_buffer.actions[internal_step])
+            last_action = float(self.episode_buffer.actions[internal_step, asset_index + 1])
             
             # Build minimal portfolio features for single-asset mode
             portfolio_features = np.array([cash_log_value, asset_log_value, daily_agent_return, last_action], dtype=np.float32)
