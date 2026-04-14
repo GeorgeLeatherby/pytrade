@@ -575,26 +575,24 @@ class EpisodeBuffer:
     
     def reset_episode_buffer(self) -> None:
         """
-        Reset buffer for new episode, keeping num_assets and episode_length_days unchanged.
-        Apply data warm-up for lookback_window days (entries)
+        Reset buffer for new episode.
+        By default, reset every numpy array attribute to zero.
+        Preserve only arrays explicitly listed in excluded_arrays.
         """
         self.current_step = 0
+        self.episode_length = 0
 
-        # Reset all arrays to zero except lookback_window, num_assets and episode_length_days
-        arrays_to_reset = [
-            self.portfolio_values, self.portfolio_weights, self.portfolio_positions,
-            self.comparison_portfolio_value,
-            self.benchmark_portfolio_value, self.alpha, self.returns,
-            self.allocator_rewards, self.actions, self.transaction_costs,
-            self.sharpe_ratio, self.drawdown, self.volatility, self.turnover,
-            self.asset_prices, self.traded_dollar_volume, self.traded_shares_total,
-            self.action_entropy, self.reward_alpha, self.reward_risk,
-            self.reward_portfolio_return, self.reward_cost, self.reward_turnover,
-            self.reward_concentration, self.reward_survival
-        ]
+        # Keep this list short and explicit.
+        # Example: {"asset_prices"} if you want to preserve warm-up prices.
+        excluded_arrays = {
+            # "e.g. but not recommended: asset_prices",
+        }
 
-        for array in arrays_to_reset:
-            array.fill(0.0)
+        for name, value in self.__dict__.items():
+            if name in excluded_arrays:
+                continue
+            if isinstance(value, np.ndarray):
+                value.fill(0.0)
 
     def warmup_market_data(self, market_data_cache, episode_start_step: int):
         """
@@ -2224,7 +2222,7 @@ class TradingEnv(gym.Env):
         self._ep_exposure_steps += 1
         # Record raw action output (single-asset mode)
         if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
-            self._ep_action_outputs.append(float(action))
+            self._ep_action_outputs.append(float(target_position_change))
         # Shadow (frictionless) portfolio: apply same position changes without costs
         if execution_result.success:
             shadow_pos = self.shadow_portfolio_state.positions.copy()
@@ -2332,7 +2330,7 @@ class TradingEnv(gym.Env):
             net_asset_dollars = execution_result.traded_notional_per_asset.copy()
             net_asset_dollars[np.isnan(net_asset_dollars)] = 0.0
             net_cash_delta = -float(np.sum(net_asset_dollars))  # costs handled separately in transaction_cost
-            action_vec = np.concatenate([[net_cash_delta], net_asset_dollars]).astype(np.float32)
+            action_vec = target_position_change  # store the scalar target position change for the single asset  
 
         elif self.execution_mode == EXECUTION_PORTFOLIO_WEIGHTS:
             action_vec = weight_change_target.astype(np.float32)
