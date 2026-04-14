@@ -223,7 +223,7 @@ class EpisodeBuffer:
     alpha: np.ndarray = field(init=False)                       # [episode_buffer_length_days] - excess returns over benchmark
     returns: np.ndarray = field(init=False)                     # [episode_buffer_length_days] - daily returns
     saa_returns: np.ndarray = field(init=False)                 # [episode_buffer_length_days] - daily returns of single-asset-agent (cash + selected asset)
-    allocator_rewards: np.ndarray = field(init=False)           # [episode_buffer_length_days] - RL allocator rewards
+    rewards: np.ndarray = field(init=False)           # [episode_buffer_length_days] - RL allocator rewards
     actions: np.ndarray = field(init=False)                     # [episode_buffer_length_days, num_assets+1] - agent actions
     transaction_costs: np.ndarray = field(init=False)           # [episode_buffer_length_days] - costs per step
     sharpe_ratio: np.ndarray = field(init=False)                # [episode_buffer_length_days] - rolling sharpe ratio
@@ -257,7 +257,7 @@ class EpisodeBuffer:
         self.alpha = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         self.returns = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         self.saa_returns = np.zeros(self.episode_buffer_length_days, dtype=dtype)
-        self.allocator_rewards = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.rewards = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         self.actions = np.zeros((self.episode_buffer_length_days, self.num_assets + 1), dtype=dtype)
         self.transaction_costs = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         self.sharpe_ratio = np.zeros(self.episode_buffer_length_days, dtype=dtype)
@@ -288,7 +288,7 @@ class EpisodeBuffer:
         self.previous_max_drawdown = np.zeros(self.episode_buffer_length_days, dtype=dtype)
 
     def record_step(self, external_step: int, portfolio_value: float, weights: np.ndarray, portfolio_positions: np.ndarray,
-                   daily_return: float, saa_return: float, reward: float, saa_reward: float,action: np.ndarray,
+                   daily_return: float, saa_return: float, reward_to_record: float,action: np.ndarray,
                    transaction_cost: float, prices: np.ndarray,
                    sharpe_ratio: float = 0.0, drawdown: float = 0.0, volatility: float = 0.0, turnover: float = 0.0, alpha: float = 0.0, benchmark_portfolio_value: float = 0.0,
                    comparison_portfolio_value: float = 0.0,
@@ -314,7 +314,7 @@ class EpisodeBuffer:
         self.portfolio_weights[internal_offset_step] = weights
         self.portfolio_positions[internal_offset_step] = portfolio_positions
         self.returns[internal_offset_step] = daily_return
-        self.allocator_rewards[internal_offset_step] = reward
+        self.rewards[internal_offset_step] = reward_to_record
         self.actions[internal_offset_step] = action
         self.transaction_costs[internal_offset_step] = transaction_cost
         self.asset_prices[internal_offset_step] = prices
@@ -524,7 +524,7 @@ class EpisodeBuffer:
         drawdown_seq = self.drawdown[start_idx:end_idx+1].reshape(-1, 1)
         volatility_seq = self.volatility[start_idx:end_idx+1].reshape(-1, 1)
         turnover_seq = self.turnover[start_idx:end_idx+1].reshape(-1, 1)
-        rewards_seq = self.allocator_rewards[start_idx:end_idx+1].reshape(-1, 1)
+        rewards_seq = self.rewards[start_idx:end_idx+1].reshape(-1, 1)
 
         # Concatenate all features along last axis
         features_seq = np.concatenate([
@@ -585,7 +585,7 @@ class EpisodeBuffer:
             self.portfolio_values, self.portfolio_weights, self.portfolio_positions,
             self.comparison_portfolio_value,
             self.benchmark_portfolio_value, self.alpha, self.returns,
-            self.allocator_rewards, self.actions, self.transaction_costs,
+            self.rewards, self.actions, self.transaction_costs,
             self.sharpe_ratio, self.drawdown, self.volatility, self.turnover,
             self.asset_prices, self.traded_dollar_volume, self.traded_shares_total,
             self.action_entropy, self.reward_alpha, self.reward_risk,
@@ -1931,8 +1931,7 @@ class TradingEnv(gym.Env):
             portfolio_positions=self.portfolio_state.positions.copy(),
             daily_return=0.0,
             saa_return=0.0,
-            reward=0.0,
-            saa_reward = 0.0,
+            reward_to_record=0.0,
             action=zero_action,
             transaction_cost=0.0,
             prices=initial_prices,
@@ -2366,7 +2365,14 @@ class TradingEnv(gym.Env):
         # FIX: Set external step to current step (already incremented)
         external_step = self.current_step  # zero-based index for buffer, is called first time at reset!
 
-        # NOTE: When a mode is not active the respective reward/return etc. will need to be set to 0
+        # Decide on reward to report
+        if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
+            reward_to_record = float(saa_reward) 
+        elif self.execution_mode in {EXECUTION_PORTFOLIO_WEIGHTS, EXECUTION_SIMPLE, EXECUTION_TRANCHE}:
+            reward_to_record = float(allocator_reward)
+        else:
+            raise ValueError(f"Unknown execution mode {self.execution_mode} in reward recording.")
+        
         # Record step in episode buffer
         self.episode_buffer.record_step(
             external_step=external_step,
@@ -2375,8 +2381,9 @@ class TradingEnv(gym.Env):
             weights=current_weights_after_execution.copy(),
             daily_return=float(daily_return),
             saa_return=float(saa_return),
-            reward=float(allocator_reward),
-            saa_reward=float(saa_reward),
+            #reward=float(allocator_reward),
+            reward_to_record=float(reward_to_record),
+            #saa_reward=float(saa_reward),
             action=action_vec.copy(),
             transaction_cost=float(execution_result.transaction_cost),
             prices=new_prices.copy(),
@@ -2446,7 +2453,7 @@ class TradingEnv(gym.Env):
             # Cumulative allocator reward over real steps
             if internal_end >= internal_start:
                 cumulative_reward = float(
-                    np.sum(self.episode_buffer.allocator_rewards[internal_start:internal_end + 1])
+                    np.sum(self.episode_buffer.rewards[internal_start:internal_end + 1])
                 )
             else:
                 cumulative_reward = 0.0
