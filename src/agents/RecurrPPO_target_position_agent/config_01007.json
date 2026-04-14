@@ -132,9 +132,9 @@
         "vec_env_start_method": "spawn",
         "total_timesteps": 20000000,
         "train_log_freq": 10,
-        "eval_freq": 100000,
+        "eval_freq": 25000,
         "n_eval_episodes": 100,
-        "eval_deterministic": false,
+        "eval_deterministic": true,
         "progress_bar": true,
         "config_id": 1007
     }
