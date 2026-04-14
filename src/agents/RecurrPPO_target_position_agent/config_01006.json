@@ -75,11 +75,16 @@
     "agent":{
         "policy": "MlpLstmPolicy",
         "policy_kwargs": {
+            "mlp_hidden_sizes": [128, 128],
+            "mlp_dropouts": [0.3, 0.3],
+            "mlp_activation": "SiLU",
+            "features_dim": 64,
+
             "net_arch": {
                 "pi": [64],
                 "vf": [64]
             },
-            "n_lstm_layers": 2,
+            "n_lstm_layers": 1,
             "lstm_hidden_size": 64
         },
         "device": "cuda",

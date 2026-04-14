@@ -634,7 +634,13 @@ def build_policy_kwargs(config: Dict[str, Any]) -> Dict[str, Any]:
         "n_lstm_layers": int(pk.get("n_lstm_layers", 1)),
         "lstm_hidden_size": int(pk.get("lstm_hidden_size", 128)),
         "features_extractor_class": InputMLPFeatures,
-        "features_extractor_kwargs": {"features_dim": 64}, # MLP features before LSTM
+        "features_extractor_kwargs": {
+            "features_dim": 64,
+            "mlp_hidden_sizes": pk.get("mlp_hidden_sizes", [128, 128]),
+            "mlp_dropouts": pk.get("mlp_dropouts", [0.3, 0.3]),
+            "mlp_activation": pk.get("mlp_activation", "SiLU")
+        },
+
         "ortho_init": True # init with orthogonal matrices for stability
     }
 
@@ -674,7 +680,7 @@ def build_model(env: gym.Env, config: Dict[str, Any]) -> RecurrentPPO:
     policy_kwargs = build_policy_kwargs(config)
 
     # Core PPO-Recurrent hyperparameters
-    n_steps = int(agent_cfg.get("n_steps", 128))         # sequence length per update (days)
+    n_steps = int(agent_cfg.get("n_steps", 4032))         # sequence length per update (days)
     batch_size = int(agent_cfg.get("batch_size", 256))
     gamma = float(agent_cfg.get("gamma", 0.99))
     gae_lambda = float(agent_cfg.get("gae_lambda", 0.95))
@@ -683,6 +689,7 @@ def build_model(env: gym.Env, config: Dict[str, Any]) -> RecurrentPPO:
     device = str(agent_cfg.get("device", "auto"))
     normalize_advantage = bool(agent_cfg.get("normalize_advantage", True))
     n_epochs = int(agent_cfg.get("n_epochs", 6) )
+    target_kl = float(agent_cfg.get("target_kl", 0.03)) # early stopping based on KL divergence
 
 
     # --- Actual model instantiation ---
@@ -692,6 +699,7 @@ def build_model(env: gym.Env, config: Dict[str, Any]) -> RecurrentPPO:
         learning_rate=lr_sched,
         ent_coef=ent_start, # initially float, will be updated using EntropyScheduleCallback
         clip_range=clip_sched,
+        target_kl=target_kl,
         n_steps=n_steps, # sequence length (days of interaction per update)
         n_epochs=n_epochs, # number of epochs per update (repeatitions over collected data)
         batch_size=batch_size, # minibatch size for updates (should be a fraction of n_steps)
@@ -747,27 +755,38 @@ def build_eval_callback(eval_env: gym.Env, config: Dict[str, Any], log_dir: str)
 # Custom Feature Extractor
 # ================================
 class InputMLPFeatures(BaseFeaturesExtractor):
-    def __init__(self, observation_space, features_dim=64):
+    def __init__(self, observation_space, features_dim=64,  mlp_hidden_sizes=None, mlp_dropouts=None, mlp_activation="SiLU"):
         super().__init__(observation_space, features_dim)
         n_in = observation_space.shape[0]
-        self.mlp = nn.Sequential(
-            # --- Block 1 ---
-            nn.Linear(n_in, 128),
-            nn.LayerNorm(128),
-            nn.SiLU(),
-            nn.Dropout(0.3), 
+        if mlp_hidden_sizes is None:
+            mlp_hidden_sizes = [128, 128]  # Default
+        if mlp_dropouts is None:
+            mlp_dropouts = [0.3] * len(mlp_hidden_sizes)  # Default dropouts matching hidden sizes
+        if len(mlp_dropouts) != len(mlp_hidden_sizes):
+            raise ValueError("mlp_dropouts must match the length of mlp_hidden_sizes")
+        
+        activation_map = {"SiLU": nn.SiLU, "ReLU": nn.ReLU, "Tanh": nn.Tanh}
+        activation_class = activation_map.get(mlp_activation, nn.SiLU)
+        
+        layers = []
+        prev_size = n_in
+        for i, hidden_size in enumerate(mlp_hidden_sizes):
+            layers.extend([
+                nn.Linear(prev_size, hidden_size),
+                nn.LayerNorm(hidden_size),
+                activation_class(),
+                nn.Dropout(mlp_dropouts[i]),
+            ])
+            prev_size = hidden_size
+        
+        # Output projection
+        layers.extend([
+            nn.Linear(prev_size, features_dim),
+            activation_class(),
+        ])
+        
+        self.mlp = nn.Sequential(*layers)
 
-            # --- Block 2 ---
-            nn.Linear(128, 128),
-            nn.LayerNorm(128), # Added a second LayerNorm for stability
-            nn.SiLU(),
-            nn.Dropout(0.3),
-
-            # --- Output Projection ---
-            # Fix: The input here must be 128 to match the previous layer
-            nn.Linear(128, features_dim), 
-            nn.SiLU()
-        )
     def forward(self, x):
         return self.mlp(x)
     

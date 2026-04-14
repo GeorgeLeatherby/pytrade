@@ -2294,8 +2294,9 @@ class TradingEnv(gym.Env):
 
 
         # Allocate rewards based on mode. Init all with None to check proper implementation
-        allocator_reward = 0.0
-        saa_reward = 0.0
+        allocator_reward:Optional[float] = None
+        saa_reward:Optional[float] = None
+
         reward_parts: Dict[str, float] = {}
         saa_reward_parts: Dict[str, float] = {}
 
@@ -2705,9 +2706,15 @@ class TradingEnv(gym.Env):
         # f"Cash: {self.portfolio_state.cash:.2f}, "
         # f"Total Portfolio Value: {self.portfolio_state.get_total_value():.2f}\n")
 
+        # Use correct reward to report based on the mode!
+        if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
+            reward_to_return = saa_reward
+        else:
+            reward_to_return = allocator_reward
+        if reward_to_return is None:
+            raise ValueError("[Step fct]Reward to return is None, check reward calculation logic for execution mode.")
         # Return all step outputs (observation, reward, terminated, truncated, info)
-        # NOTE: only next_observation must be a sequence for LSTM! TODO: Verify this statement
-        return next_observation, allocator_reward, terminated, truncated, info
+        return next_observation, reward_to_return, terminated, truncated, info
     
 
     def calculate_allocator_step_reward(
@@ -2945,50 +2952,60 @@ class TradingEnv(gym.Env):
             saa_cash_before, saa_cash_after
             ):
         
-        # Calculate the SAA step reward
-        # ---------- Differential Sortino ratio components ----------
-        # Get simple returns
-        saa_portfolio_return_absolut = (selected_asset_notional_after + saa_cash_after) / (selected_asset_notional_before + saa_cash_before) - 1.0
-        # portfolio_return_log = np.log(portfolio_return) if portfolio_return > 0 else -np.inf
-        # 1. Update EMAs
-        saa_delta = saa_portfolio_return_absolut - self.saa_running_mean_ema
-        self.saa_running_mean_ema += self.sortino_eta * saa_delta
+        # # Calculate the SAA step reward
+        # # ---------- Differential Sortino ratio components ----------
+        # # Get simple returns
+        # saa_portfolio_return_absolut = (selected_asset_notional_after + saa_cash_after) / (selected_asset_notional_before + saa_cash_before) - 1.0
+        # # portfolio_return_log = np.log(portfolio_return) if portfolio_return > 0 else -np.inf
+        # # 1. Update EMAs
+        # saa_delta = saa_portfolio_return_absolut - self.saa_running_mean_ema
+        # self.saa_running_mean_ema += self.sortino_eta * saa_delta
 
-        # Alternative: use squared downside returns
-        saa_downside_sq = (min(saa_portfolio_return_absolut, 0.0))**2
-        self.saa_running_downside_variance_ema += self.sortino_eta * (saa_downside_sq - self.saa_running_downside_variance_ema)
-        downside_var_floor = 1e-6
-        saa_downside_var = max(self.saa_running_downside_variance_ema, downside_var_floor)
-        current_sortino = self.saa_running_mean_ema / np.sqrt(saa_downside_var)
+        # # Alternative: use squared downside returns
+        # saa_downside_sq = (min(saa_portfolio_return_absolut, 0.0))**2
+        # self.saa_running_downside_variance_ema += self.sortino_eta * (saa_downside_sq - self.saa_running_downside_variance_ema)
+        # downside_var_floor = 1e-6
+        # saa_downside_var = max(self.saa_running_downside_variance_ema, downside_var_floor)
+        # current_sortino = self.saa_running_mean_ema / np.sqrt(saa_downside_var)
 
-        # 3. Calc Differential Sortino for reward
-        saa_sortino_reward = current_sortino - self.saa_previous_sortino
-        self.saa_previous_sortino = current_sortino
+        # # 3. Calc Differential Sortino for reward
+        # saa_sortino_reward = current_sortino - self.saa_previous_sortino
+        # self.saa_previous_sortino = current_sortino
 
-        # Mix Sortino with other metrics to get risk-aware non-deterministic policy
-        """Calculate dynamic risk window. Use self.reward_risk_window and the current step to produce
-        behaviour which starts at 2 raises with the steps up to maximum risk_reward_window"""
-        if self.current_step <= 2:
-            risk_metric_window = 2
-        else:
-            risk_metric_window = min(self.current_step, self.max_reward_risk_window)
+        # # Mix Sortino with other metrics to get risk-aware non-deterministic policy
+        # """Calculate dynamic risk window. Use self.reward_risk_window and the current step to produce
+        # behaviour which starts at 2 raises with the steps up to maximum risk_reward_window"""
+        # if self.current_step <= 2:
+        #     risk_metric_window = 2
+        # else:
+        #     risk_metric_window = min(self.current_step, self.max_reward_risk_window)
 
-        saa_max_drawdown = self.episode_buffer.saa_calculate_max_drawdown(
-            selected_asset_idx=selected_asset_index,
-            window=risk_metric_window
+        # saa_max_drawdown = self.episode_buffer.saa_calculate_max_drawdown(
+        #     selected_asset_idx=selected_asset_index,
+        #     window=risk_metric_window
+        # )
+
+        # saa_max_drawdown_delta = max(0.0, saa_max_drawdown - self.saa_previous_max_drawdown)
+        # self.saa_previous_max_drawdown = saa_max_drawdown
+        # max_drawdown_penalty = float(self.lambda_drawdown * saa_max_drawdown_delta)
+
+        # # 4. Mix in raw return & windowed drawdown penalty
+        # reward = (self.sortino_net_reward_mix * saa_sortino_reward + 
+        #         (1 - self.sortino_net_reward_mix) * saa_portfolio_return_absolut) - max_drawdown_penalty
+
+        # # 5. Clip and amplify reward
+        # gain = float(3.5)
+        # saa_reward = float(np.tanh(gain * reward))
+
+        eps = 1e-12
+        prev_value = float(selected_asset_notional_before + saa_cash_before)
+        next_value = float(selected_asset_notional_after + saa_cash_after)
+
+        # Simple log return reward
+        saa_reward = 100 * float(
+            np.log(max(next_value, eps))
+            - np.log(max(prev_value, eps))
         )
-
-        saa_max_drawdown_delta = max(0.0, saa_max_drawdown - self.saa_previous_max_drawdown)
-        self.saa_previous_max_drawdown = saa_max_drawdown
-        max_drawdown_penalty = float(self.lambda_drawdown * saa_max_drawdown_delta)
-
-        # 4. Mix in raw return & windowed drawdown penalty
-        reward = (self.sortino_net_reward_mix * saa_sortino_reward + 
-                (1 - self.sortino_net_reward_mix) * saa_portfolio_return_absolut) - max_drawdown_penalty
-
-        # 5. Clip and amplify reward
-        gain = float(3.5)
-        saa_reward = float(np.tanh(gain * reward))
 
         # NOTE: Several values here get used to fill portfolio wide metrics in the episode buffer.
         saa_reward_parts = {
@@ -3003,7 +3020,7 @@ class TradingEnv(gym.Env):
             "raw_portfolio_return": 0.0,
             "raw_benchmark_return": 0.0,
             "sharpe_ratio": 0.0,
-            "max_drawdown": saa_max_drawdown
+            "max_drawdown": 0.0
         }
         
         return saa_reward, saa_reward_parts
