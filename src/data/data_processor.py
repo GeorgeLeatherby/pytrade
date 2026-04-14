@@ -324,13 +324,16 @@ class DataEnricher:
         
         # --- 1. Return Calculations (Vectorized) ---
         print("Calculating returns...")
-        return_periods = [1, 3, 5, 10, 20, 40, 60, 80]
+        return_periods = [1, 3, 5, 10, 20, 40]
         for period in return_periods:
             df[f'return_{period}d'] = df.groupby('Symbol')['Close'].transform(lambda x: x.pct_change(periods=period))
+            df[f'open_return_{period}d'] = df.groupby('Symbol')['Open'].transform(lambda x: x.pct_change(periods=period))
+            df[f'high_return_{period}d'] = df.groupby('Symbol')['High'].transform(lambda x: x.pct_change(periods=period))
+            df[f'low_return_{period}d'] = df.groupby('Symbol')['Low'].transform(lambda x: x.pct_change(periods=period))
 
         # --- 2. Volume Change and Percentile Calculations (Vectorized) ---
         print("Calculating volume changes and percentiles...")
-        volume_periods = [1, 3, 5, 10, 20, 40, 60, 80]
+        volume_periods = [1, 3, 5, 10, 20, 40]
         for period in volume_periods:
             # Volume Percentile
             df[f'volume_percentile_{period}d'] = df.groupby('Symbol')['Volume'].transform(
