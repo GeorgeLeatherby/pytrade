@@ -128,7 +128,7 @@
 
     "training": {
         "seed": 42,
-        "num_envs": 8,
+        "n_envs": 8,
         "vec_env_start_method": "spawn",
         "total_timesteps": 20000000,
         "train_log_freq": 10,
