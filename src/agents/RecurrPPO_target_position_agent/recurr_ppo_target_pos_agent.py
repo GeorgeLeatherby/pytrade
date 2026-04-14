@@ -56,7 +56,7 @@ from sb3_contrib import RecurrentPPO
 from sb3_contrib.ppo_recurrent import MlpLstmPolicy
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.evaluation import evaluate_policy
-from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
+from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv, SubprocVecEnv
 #from stable_baselines3.common.utils import configure_logger
 
 import gymnasium as gym
@@ -482,12 +482,10 @@ class ProgressSyncCallback(BaseCallback):
     def _on_rollout_end(self) -> bool:
         # SB3 updates _current_progress_remaining each rollout
         pr = float(getattr(self.model, "_current_progress_remaining", 0.0))
-        vec_env = self.model.get_env()  # DummyVecEnv
-        # Propagate to all sub-envs (usually 1)
-        for i, env in enumerate(vec_env.envs):
-            # env is our SingleAssetEpisodeAdapter
-            if hasattr(env, "set_progress_remaining"):
-                env.set_progress_remaining(pr)
+        vec_env = self.model.get_env()
+
+        # Strict path only: require VecEnv API support.
+        vec_env.env_method("set_progress_remaining", pr)
         return True
 
     def _on_step(self) -> bool:
@@ -818,19 +816,40 @@ def run(cache, config: Dict[str, Any]) -> Dict[str, Any]:
     np.random.seed(seed)
 
     gamma_cfg = config.get("agent", {}).get("gamma", 0.99)
+    train_cfg = config.get("training", {})
 
-    # Build vectorized train/eval envs (DummyVecEnv); RecurrentPPO expects VecEnvs.
-    def make_train():
-        env = build_env(cache, config, seed=seed, for_eval=False)
-        return env
+    # Parallel env configuration (strict)
+    n_envs = int(train_cfg.get("n_envs", 1))
+    if n_envs < 1:
+        raise ValueError(f"training.n_envs must be >= 1, got {n_envs}")
+
+    vec_env_start_method = str(train_cfg.get("vec_env_start_method", "spawn"))
+    if vec_env_start_method not in ("spawn", "fork", "forkserver"):
+        raise ValueError(
+            f"training.vec_env_start_method must be one of "
+            f"('spawn', 'fork', 'forkserver'), got '{vec_env_start_method}'"
+        )
+
+    # Build vectorized train envs; each worker gets a unique seed
+    def make_train(rank: int):
+        def _init():
+            return build_env(cache, config, seed=seed + rank, for_eval=False)
+        return _init
 
     def make_eval():
-        env = build_env(cache, config, seed=seed + 1, for_eval=True)
-        return env
+        return build_env(cache, config, seed=seed + 1, for_eval=True)
 
-    # Train: normalize obs + reward; inline wrapping (no intermediate DummyVecEnv)
+    train_env_fns = [make_train(i) for i in range(n_envs)]
+
+    # Strict behavior: choose vec env implementation explicitly
+    if n_envs == 1:
+        base_train_vec = DummyVecEnv(train_env_fns)
+    else:
+        base_train_vec = SubprocVecEnv(train_env_fns, start_method=vec_env_start_method)
+
+    # Train: normalize obs + reward
     vec_train = VecNormalize(
-        DummyVecEnv([make_train]),
+        base_train_vec,
         norm_obs=True,
         norm_reward=True,
         clip_obs=10.0,
@@ -838,7 +857,7 @@ def run(cache, config: Dict[str, Any]) -> Dict[str, Any]:
         gamma=gamma_cfg,
     )
 
-    # Eval: normalized obs, raw rewards; inline wrapping
+    # Eval: normalized obs, raw rewards; keep single-env eval
     vec_eval = VecNormalize(
         DummyVecEnv([make_eval]),
         training=False,

@@ -45,4 +45,6 @@ Change SAA return calculation to a "solvable" POMDP problem. This means:
 
 - Route critical info: last action, log cash ratio, asset size past the mlp so it cannot dilute the information. Active asset size can be expressed as asset log(notional/starting funds). This should reduce relative drift introduced by other assets.
 
+- CRITICAL: Verify if last action is also reported correctly to the frozen saa models in PAA mode!
+
 - Value loss should be in range 0.1 to 1 to comfortably learn
