@@ -14,10 +14,11 @@ This is a programm
 """
 
 class Dataprep:
-    # 1. Combine all available .csv files in the folder and produce a multiindex dataframe
-    # The dataframe has the columns: date index open high low close and volume
-    # per day there are len(beginning_chars) entries
-    # The index is a multi-index with the first level being the date and the second level being the beginning_char
+    """
+    1. Combine multiple CSV files into a single multi-index dataframe
+    2. Ensure proper formatting with multi-index: (Date, Symbol)
+    3. NO forward filling, NO volume augmentation - keep raw data only
+    """
 
     # There are several csv files per beginning_char containing different time ranges but overlapping
     def __init__(self):
@@ -36,11 +37,14 @@ class Dataprep:
 
         self.load_combine_asset_data()
         self.create_multi_index_df()
-        self.add_time_features()
+
+        # Obsolete and incorrect!
+        # self.add_time_features()
         self.forward_data_fill()
         self.fill_missing_volume()
         print(f"\n{self.multi_index_df.head(45)}")
         print(f"\n{self.multi_index_df.tail(45)}")
+        # self.analyze_and_clean_data()
         self.save_multi_index_df()
 
 
@@ -237,6 +241,8 @@ class Dataprep:
             print("\nLast 45 entries of multi-index dataframe:")
             print(self.multi_index_df.tail(45))
 
+    
+
 
     def add_time_features(self):
         """
@@ -311,7 +317,7 @@ class Dataprep:
         It does so for each symbol in each column.
 
         IMPORTANT: DOES NOT introduce new rows for missing dates.
-        IMPORTANT: After forward fill, it deletes any days that do not have all 7 symbols with data.
+        IMPORTANT: After forward fill, it deletes any days that do not have all symbols with data.
         """
         print("\nApplying forward data fill...")
         
@@ -336,13 +342,13 @@ class Dataprep:
             symbol_data = self.multi_index_df.loc[(slice(None), symbol), :].copy()
             symbol_data = symbol_data.reset_index(level='Symbol', drop=True)
             
-            # Reindex to available dates and apply forward fill
+            # Reindex to available dates 
             symbol_data = symbol_data.reindex(all_available_dates)
 
             # Count NaN before forward fill
             na_before = symbol_data.isna().sum().sum()
 
-            symbol_data = symbol_data.ffill(limit=2) # Forward fill with limit of 2 days. 
+            #symbol_data = symbol_data.ffill(limit=0) # Forward fill with limit of 2 days. 
             
             # Count NaN after forward fill
             na_after = symbol_data.isna().sum().sum()
@@ -363,15 +369,15 @@ class Dataprep:
         
         print(f"Combined dataframe shape: {temp_df.shape}")
         
-        # Step 2: Delete days that don't have all 7 symbols with data
+        # Step 2: Delete days that don't have all symbols with data
         print(f"\nFiltering to keep only days with all {len(symbols)} symbols having data...")
         
         # Group by date and count how many symbols have non-null data for that date
         date_symbol_counts = temp_df.groupby('Date').apply(
-            lambda x: x.dropna(subset=['Open', 'High', 'Low', 'Close'], how='all').shape[0]
+            lambda x: x.dropna(subset=['Open', 'High', 'Low', 'Close', 'Volume'], how='all').shape[0]
         )
         
-        # Keep only dates where all 7 symbols have data
+        # Keep only dates where all symbols have data
         complete_dates = date_symbol_counts[date_symbol_counts == len(symbols)].index
         deleted_days = len(date_symbol_counts) - len(complete_dates)
         
@@ -1237,16 +1243,151 @@ class Dataprep:
         
         return int(final_volume)
 
+    def analyze_and_clean_data(self):
+        """
+        Comprehensive data quality analysis before saving.
+        - Reports all NaN and inf values
+        - Identifies dates with missing/invalid data
+        - Asks user permission to delete affected dates
+        - Deletes entire dates (all symbols) if user approves
+        """
+        print("\n" + "="*70)
+        print("DATA QUALITY ANALYSIS")
+        print("="*70)
+        
+        # 1. Count all values in theory
+        num_symbols = self.multi_index_df.index.get_level_values('Symbol').nunique()
+        num_dates = self.multi_index_df.index.get_level_values('Date').nunique()
+        num_columns = self.multi_index_df.shape[1]
+        
+        theoretical_values = num_symbols * num_dates * num_columns
+        actual_values = self.multi_index_df.shape[0] * num_columns
+        
+        print(f"\n📊 DATASET DIMENSIONS:")
+        print(f"  Symbols: {num_symbols}")
+        print(f"  Dates: {num_dates}")
+        print(f"  Data columns: {num_columns}")
+        print(f"  Total values (theoretical): {theoretical_values:,}")
+        print(f"  Total values (actual): {actual_values:,}")
+        
+        # 2. Count NaN values
+        nan_count = self.multi_index_df.isna().sum().sum()
+        nan_percentage = (nan_count / actual_values * 100) if actual_values > 0 else 0
+        
+        print(f"\n⚠️  NaN VALUES:")
+        print(f"  Total NaN count: {nan_count:,}")
+        print(f"  NaN percentage: {nan_percentage:.3f}%")
+        
+        # 3. Count inf values
+        inf_count = np.isinf(self.multi_index_df).sum().sum()
+        inf_percentage = (inf_count / actual_values * 100) if actual_values > 0 else 0
+        
+        print(f"\n⚠️  INFINITE VALUES:")
+        print(f"  Total inf/−inf count: {inf_count:,}")
+        print(f"  Inf percentage: {inf_percentage:.3f}%")
+        
+        # 4. Identify dates with NaN values
+        dates_with_nan = set()
+        for (date, symbol), row in self.multi_index_df.iterrows():
+            if row.isna().any():
+                dates_with_nan.add(date)
+        
+        dates_with_nan_count = len(dates_with_nan)
+        dates_with_nan_percentage = (dates_with_nan_count / num_dates * 100) if num_dates > 0 else 0
+        
+        print(f"\n📅 DATES WITH NaN VALUES:")
+        print(f"  Dates affected: {dates_with_nan_count}")
+        print(f"  Total dates: {num_dates}")
+        print(f"  Percentage of dates to delete: {dates_with_nan_percentage:.2f}%")
+        
+        # 5. Identify dates with inf values
+        dates_with_inf = set()
+        for (date, symbol), row in self.multi_index_df.iterrows():
+            if np.isinf(row).any():
+                dates_with_inf.add(date)
+        
+        dates_with_inf_count = len(dates_with_inf)
+        
+        print(f"\n📅 DATES WITH ±INF VALUES:")
+        print(f"  Dates affected: {dates_with_inf_count}")
+        
+        # 6. Combined list of dates to delete
+        dates_to_delete = dates_with_nan.union(dates_with_inf)
+        total_rows_to_delete = dates_to_delete_count = len(dates_to_delete)
+        total_rows_before = self.multi_index_df.shape[0]
+        total_rows_after = total_rows_before - (dates_to_delete_count * num_symbols)
+        
+        print(f"\n🔴 DATES REQUIRING DELETION (NaN OR INF):")
+        print(f"  Total dates to delete: {dates_to_delete_count}")
+        print(f"  Percentage of dates: {(dates_to_delete_count / num_dates * 100):.2f}%")
+        print(f"  Rows before deletion: {total_rows_before:,}")
+        print(f"  Rows to be deleted: {dates_to_delete_count * num_symbols:,}")
+        print(f"  Rows after deletion: {total_rows_after:,}")
+        
+        # 7. Ask user for permission
+        print("\n" + "="*70)
+        if dates_to_delete_count > 0:
+            print(f"\n⚠️  {dates_to_delete_count} dates contain NaN or inf values.")
+            print("   Deleting these dates will remove ALL symbols for those dates.")
+            
+            user_input = input("\nDelete these dates? (yes/no): ").strip().lower()
+            
+            if user_input in ['yes', 'y']:
+                print(f"\n🗑️  Deleting {dates_to_delete_count} dates...")
+                
+                # Delete dates with NaN or inf
+                dates_to_keep = self.multi_index_df.index.get_level_values('Date').unique().difference(dates_to_delete)
+                self.multi_index_df = self.multi_index_df.loc[dates_to_keep]
+                
+                print(f"✓ Deletion complete.")
+                print(f"  New shape: {self.multi_index_df.shape}")
+                
+                # Re-check for remaining NaN/inf after deletion
+                remaining_nan = self.multi_index_df.isna().sum().sum()
+                remaining_inf = np.isinf(self.multi_index_df).sum().sum()
+                
+                print(f"\n📊 DATA AFTER DELETION:")
+                print(f"  Remaining NaN values: {remaining_nan}")
+                print(f"  Remaining inf values: {remaining_inf}")
+                
+                if remaining_nan == 0 and remaining_inf == 0:
+                    print("\n✅ Data is now clean. Ready to save.")
+                    return True
+                else:
+                    print("\n⚠️  WARNING: Data still contains NaN or inf values after deletion.")
+                    return False
+            else:
+                print("\n❌ Deletion cancelled. Data will not be saved.")
+                return False
+        else:
+            print("\n✅ No NaN or inf values found. Data is clean.")
+            return True
+
+
     def save_multi_index_df(self):
         """
-        Save the multi-index DataFrame to a CSV file if no NaN values are present.
+        Save the multi-index DataFrame after data quality checks.
         """
-        if self.multi_index_df.isnull().values.any():
-            print("DataFrame contains NaN values. CSV file not saved.")
-        else:
-            print("Multi-index dataframe contains no Nans. Proceed to save")
-            # Save in the data folder
-            self.multi_index_df.to_csv("src/data/processed_multi_index_data.csv")
+
+        # Check wether ANY NaN or inf values remain before saving
+        if self.multi_index_df.isna().sum().sum() > 0 or np.isinf(self.multi_index_df).sum().sum() > 0:
+            print("\n❌ Cannot save data: NaN or inf values still present.")
+            print("Please address remaining issues before saving.")
+            return
+        
+        # Save to CSV
+        output_path = "src/data/processed_multi_index_data.csv"
+        
+        # Reset index to make Date and Symbol regular columns for CSV export
+        df_to_save = self.multi_index_df.reset_index()
+        
+        try:
+            df_to_save.to_csv(output_path, index=False)
+            print(f"\n✅ Data successfully saved to: {output_path}")
+            print(f"   Shape: {df_to_save.shape}")
+            print(f"   Date range: {df_to_save['Date'].min()} to {df_to_save['Date'].max()}")
+        except Exception as e:
+            print(f"\n❌ Error saving file: {e}")
 
 # Execution
 datapreper = Dataprep()

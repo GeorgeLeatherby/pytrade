@@ -223,7 +223,7 @@ class EpisodeBuffer:
     alpha: np.ndarray = field(init=False)                       # [episode_buffer_length_days] - excess returns over benchmark
     returns: np.ndarray = field(init=False)                     # [episode_buffer_length_days] - daily returns
     saa_returns: np.ndarray = field(init=False)                 # [episode_buffer_length_days] - daily returns of single-asset-agent (cash + selected asset)
-    allocator_rewards: np.ndarray = field(init=False)           # [episode_buffer_length_days] - RL allocator rewards
+    rewards: np.ndarray = field(init=False)           # [episode_buffer_length_days] - RL allocator rewards
     actions: np.ndarray = field(init=False)                     # [episode_buffer_length_days, num_assets+1] - agent actions
     transaction_costs: np.ndarray = field(init=False)           # [episode_buffer_length_days] - costs per step
     sharpe_ratio: np.ndarray = field(init=False)                # [episode_buffer_length_days] - rolling sharpe ratio
@@ -257,7 +257,7 @@ class EpisodeBuffer:
         self.alpha = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         self.returns = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         self.saa_returns = np.zeros(self.episode_buffer_length_days, dtype=dtype)
-        self.allocator_rewards = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.rewards = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         self.actions = np.zeros((self.episode_buffer_length_days, self.num_assets + 1), dtype=dtype)
         self.transaction_costs = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         self.sharpe_ratio = np.zeros(self.episode_buffer_length_days, dtype=dtype)
@@ -288,7 +288,7 @@ class EpisodeBuffer:
         self.previous_max_drawdown = np.zeros(self.episode_buffer_length_days, dtype=dtype)
 
     def record_step(self, external_step: int, portfolio_value: float, weights: np.ndarray, portfolio_positions: np.ndarray,
-                   daily_return: float, saa_return: float, reward: float, saa_reward: float,action: np.ndarray,
+                   daily_return: float, saa_return: float, reward_to_record: float,action: np.ndarray,
                    transaction_cost: float, prices: np.ndarray,
                    sharpe_ratio: float = 0.0, drawdown: float = 0.0, volatility: float = 0.0, turnover: float = 0.0, alpha: float = 0.0, benchmark_portfolio_value: float = 0.0,
                    comparison_portfolio_value: float = 0.0,
@@ -314,7 +314,8 @@ class EpisodeBuffer:
         self.portfolio_weights[internal_offset_step] = weights
         self.portfolio_positions[internal_offset_step] = portfolio_positions
         self.returns[internal_offset_step] = daily_return
-        self.allocator_rewards[internal_offset_step] = reward
+        self.saa_returns[internal_offset_step] = saa_return
+        self.rewards[internal_offset_step] = reward_to_record
         self.actions[internal_offset_step] = action
         self.transaction_costs[internal_offset_step] = transaction_cost
         self.asset_prices[internal_offset_step] = prices
@@ -524,7 +525,7 @@ class EpisodeBuffer:
         drawdown_seq = self.drawdown[start_idx:end_idx+1].reshape(-1, 1)
         volatility_seq = self.volatility[start_idx:end_idx+1].reshape(-1, 1)
         turnover_seq = self.turnover[start_idx:end_idx+1].reshape(-1, 1)
-        rewards_seq = self.allocator_rewards[start_idx:end_idx+1].reshape(-1, 1)
+        rewards_seq = self.rewards[start_idx:end_idx+1].reshape(-1, 1)
 
         # Concatenate all features along last axis
         features_seq = np.concatenate([
@@ -1709,6 +1710,10 @@ class TradingEnv(gym.Env):
                 initial_cash = self.initial_portfolio_value
                 initial_positions[:] = 0.0 # all assets zero
                 total_init_tc = 0.0
+                # Store initial subportfolio values for SAA mode (cash only, no selected asset position)
+                self.saa_initial_cash = initial_cash
+                self.saa_selected_asset_value = 0.0
+                self.saa_initial_subportfolio_value = self.saa_initial_cash + self.saa_selected_asset_value
             else:
                 # Random allocation between cash and assets
                 rand_weights = np.random.dirichlet(np.ones(self.market_data_cache.num_assets + 1))
@@ -1925,8 +1930,7 @@ class TradingEnv(gym.Env):
             portfolio_positions=self.portfolio_state.positions.copy(),
             daily_return=0.0,
             saa_return=0.0,
-            reward=0.0,
-            saa_reward = 0.0,
+            reward_to_record=0.0,
             action=zero_action,
             transaction_cost=0.0,
             prices=initial_prices,
@@ -2288,8 +2292,9 @@ class TradingEnv(gym.Env):
 
 
         # Allocate rewards based on mode. Init all with None to check proper implementation
-        allocator_reward = 0.0
-        saa_reward = 0.0
+        allocator_reward:Optional[float] = None
+        saa_reward:Optional[float] = None
+
         reward_parts: Dict[str, float] = {}
         saa_reward_parts: Dict[str, float] = {}
 
@@ -2359,7 +2364,14 @@ class TradingEnv(gym.Env):
         # FIX: Set external step to current step (already incremented)
         external_step = self.current_step  # zero-based index for buffer, is called first time at reset!
 
-        # NOTE: When a mode is not active the respective reward/return etc. will need to be set to 0
+        # Decide on reward to report
+        if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
+            reward_to_record = float(saa_reward) 
+        elif self.execution_mode in {EXECUTION_PORTFOLIO_WEIGHTS, EXECUTION_SIMPLE, EXECUTION_TRANCHE}:
+            reward_to_record = float(allocator_reward)
+        else:
+            raise ValueError(f"Unknown execution mode {self.execution_mode} in reward recording.")
+        
         # Record step in episode buffer
         self.episode_buffer.record_step(
             external_step=external_step,
@@ -2368,8 +2380,9 @@ class TradingEnv(gym.Env):
             weights=current_weights_after_execution.copy(),
             daily_return=float(daily_return),
             saa_return=float(saa_return),
-            reward=float(allocator_reward),
-            saa_reward=float(saa_reward),
+            #reward=float(allocator_reward),
+            reward_to_record=float(reward_to_record),
+            #saa_reward=float(saa_reward),
             action=action_vec.copy(),
             transaction_cost=float(execution_result.transaction_cost),
             prices=new_prices.copy(),
@@ -2439,7 +2452,7 @@ class TradingEnv(gym.Env):
             # Cumulative allocator reward over real steps
             if internal_end >= internal_start:
                 cumulative_reward = float(
-                    np.sum(self.episode_buffer.allocator_rewards[internal_start:internal_end + 1])
+                    np.sum(self.episode_buffer.rewards[internal_start:internal_end + 1])
                 )
             else:
                 cumulative_reward = 0.0
@@ -2671,11 +2684,11 @@ class TradingEnv(gym.Env):
                 "action_p75": float(np.percentile(self._ep_action_outputs, 75)) if self._ep_action_outputs else 0.0,
                 "action_p95": float(np.percentile(self._ep_action_outputs, 95)) if self._ep_action_outputs else 0.0,
                 # Sortino internals (episode aggregates)
-                "sortino_mean_ema": float(np.mean(self._sortino_mean_hist)) if hasattr(self, "_sortino_mean_hist") else 0.0,
-                "sortino_downside_ema": float(np.mean(self._sortino_down_hist)) if hasattr(self, "_sortino_down_hist") else 0.0,
-                "sortino_reward_raw_mean": float(np.mean(self._sortino_raw_hist)) if hasattr(self, "_sortino_raw_hist") else 0.0,
-                "sortino_reward_raw_p25": float(np.percentile(self._sortino_raw_hist, 25)) if hasattr(self, "_sortino_raw_hist") else 0.0,
-                "sortino_reward_raw_p75": float(np.percentile(self._sortino_raw_hist, 75)) if hasattr(self, "_sortino_raw_hist") else 0.0,
+                "sortino_mean_ema": float(np.mean(self._sortino_mean_hist)) if (hasattr(self, "_sortino_mean_hist") and len(self._sortino_mean_hist) > 0) else 0.0,
+                "sortino_downside_ema": float(np.mean(self._sortino_down_hist)) if (hasattr(self, "_sortino_down_hist") and len(self._sortino_down_hist) > 0) else 0.0,
+                "sortino_reward_raw_mean": float(np.mean(self._sortino_raw_hist)) if (hasattr(self, "_sortino_raw_hist") and len(self._sortino_raw_hist) > 0) else 0.0,
+                "sortino_reward_raw_p25": float(np.percentile(self._sortino_raw_hist, 25)) if (hasattr(self, "_sortino_raw_hist") and len(self._sortino_raw_hist) > 0) else 0.0,
+                "sortino_reward_raw_p75": float(np.percentile(self._sortino_raw_hist, 75)) if (hasattr(self, "_sortino_raw_hist") and len(self._sortino_raw_hist) > 0) else 0.0,
  
             })
 
@@ -2699,9 +2712,15 @@ class TradingEnv(gym.Env):
         # f"Cash: {self.portfolio_state.cash:.2f}, "
         # f"Total Portfolio Value: {self.portfolio_state.get_total_value():.2f}\n")
 
+        # Use correct reward to report based on the mode!
+        if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
+            reward_to_return = saa_reward
+        else:
+            reward_to_return = allocator_reward
+        if reward_to_return is None:
+            raise ValueError("[Step fct]Reward to return is None, check reward calculation logic for execution mode.")
         # Return all step outputs (observation, reward, terminated, truncated, info)
-        # NOTE: only next_observation must be a sequence for LSTM! TODO: Verify this statement
-        return next_observation, allocator_reward, terminated, truncated, info
+        return next_observation, reward_to_return, terminated, truncated, info
     
 
     def calculate_allocator_step_reward(
@@ -2939,50 +2958,60 @@ class TradingEnv(gym.Env):
             saa_cash_before, saa_cash_after
             ):
         
-        # Calculate the SAA step reward
-        # ---------- Differential Sortino ratio components ----------
-        # Get simple returns
-        saa_portfolio_return_absolut = (selected_asset_notional_after + saa_cash_after) / (selected_asset_notional_before + saa_cash_before) - 1.0
-        # portfolio_return_log = np.log(portfolio_return) if portfolio_return > 0 else -np.inf
-        # 1. Update EMAs
-        saa_delta = saa_portfolio_return_absolut - self.saa_running_mean_ema
-        self.saa_running_mean_ema += self.sortino_eta * saa_delta
+        # # Calculate the SAA step reward
+        # # ---------- Differential Sortino ratio components ----------
+        # # Get simple returns
+        # saa_portfolio_return_absolut = (selected_asset_notional_after + saa_cash_after) / (selected_asset_notional_before + saa_cash_before) - 1.0
+        # # portfolio_return_log = np.log(portfolio_return) if portfolio_return > 0 else -np.inf
+        # # 1. Update EMAs
+        # saa_delta = saa_portfolio_return_absolut - self.saa_running_mean_ema
+        # self.saa_running_mean_ema += self.sortino_eta * saa_delta
 
-        # Alternative: use squared downside returns
-        saa_downside_sq = (min(saa_portfolio_return_absolut, 0.0))**2
-        self.saa_running_downside_variance_ema += self.sortino_eta * (saa_downside_sq - self.saa_running_downside_variance_ema)
-        downside_var_floor = 1e-6
-        saa_downside_var = max(self.saa_running_downside_variance_ema, downside_var_floor)
-        current_sortino = self.saa_running_mean_ema / np.sqrt(saa_downside_var)
+        # # Alternative: use squared downside returns
+        # saa_downside_sq = (min(saa_portfolio_return_absolut, 0.0))**2
+        # self.saa_running_downside_variance_ema += self.sortino_eta * (saa_downside_sq - self.saa_running_downside_variance_ema)
+        # downside_var_floor = 1e-6
+        # saa_downside_var = max(self.saa_running_downside_variance_ema, downside_var_floor)
+        # current_sortino = self.saa_running_mean_ema / np.sqrt(saa_downside_var)
 
-        # 3. Calc Differential Sortino for reward
-        saa_sortino_reward = current_sortino - self.saa_previous_sortino
-        self.saa_previous_sortino = current_sortino
+        # # 3. Calc Differential Sortino for reward
+        # saa_sortino_reward = current_sortino - self.saa_previous_sortino
+        # self.saa_previous_sortino = current_sortino
 
-        # Mix Sortino with other metrics to get risk-aware non-deterministic policy
-        """Calculate dynamic risk window. Use self.reward_risk_window and the current step to produce
-        behaviour which starts at 2 raises with the steps up to maximum risk_reward_window"""
-        if self.current_step <= 2:
-            risk_metric_window = 2
-        else:
-            risk_metric_window = min(self.current_step, self.max_reward_risk_window)
+        # # Mix Sortino with other metrics to get risk-aware non-deterministic policy
+        # """Calculate dynamic risk window. Use self.reward_risk_window and the current step to produce
+        # behaviour which starts at 2 raises with the steps up to maximum risk_reward_window"""
+        # if self.current_step <= 2:
+        #     risk_metric_window = 2
+        # else:
+        #     risk_metric_window = min(self.current_step, self.max_reward_risk_window)
 
-        saa_max_drawdown = self.episode_buffer.saa_calculate_max_drawdown(
-            selected_asset_idx=selected_asset_index,
-            window=risk_metric_window
+        # saa_max_drawdown = self.episode_buffer.saa_calculate_max_drawdown(
+        #     selected_asset_idx=selected_asset_index,
+        #     window=risk_metric_window
+        # )
+
+        # saa_max_drawdown_delta = max(0.0, saa_max_drawdown - self.saa_previous_max_drawdown)
+        # self.saa_previous_max_drawdown = saa_max_drawdown
+        # max_drawdown_penalty = float(self.lambda_drawdown * saa_max_drawdown_delta)
+
+        # # 4. Mix in raw return & windowed drawdown penalty
+        # reward = (self.sortino_net_reward_mix * saa_sortino_reward + 
+        #         (1 - self.sortino_net_reward_mix) * saa_portfolio_return_absolut) - max_drawdown_penalty
+
+        # # 5. Clip and amplify reward
+        # gain = float(3.5)
+        # saa_reward = float(np.tanh(gain * reward))
+
+        eps = 1e-12
+        prev_value = float(selected_asset_notional_before + saa_cash_before)
+        next_value = float(selected_asset_notional_after + saa_cash_after)
+
+        # Simple log return reward
+        saa_reward = 100 * float(
+            np.log(max(next_value, eps))
+            - np.log(max(prev_value, eps))
         )
-
-        saa_max_drawdown_delta = max(0.0, saa_max_drawdown - self.saa_previous_max_drawdown)
-        self.saa_previous_max_drawdown = saa_max_drawdown
-        max_drawdown_penalty = float(self.lambda_drawdown * saa_max_drawdown_delta)
-
-        # 4. Mix in raw return & windowed drawdown penalty
-        reward = (self.sortino_net_reward_mix * saa_sortino_reward + 
-                (1 - self.sortino_net_reward_mix) * saa_portfolio_return_absolut) - max_drawdown_penalty
-
-        # 5. Clip and amplify reward
-        gain = float(3.5)
-        saa_reward = float(np.tanh(gain * reward))
 
         # NOTE: Several values here get used to fill portfolio wide metrics in the episode buffer.
         saa_reward_parts = {
@@ -2997,7 +3026,7 @@ class TradingEnv(gym.Env):
             "raw_portfolio_return": 0.0,
             "raw_benchmark_return": 0.0,
             "sharpe_ratio": 0.0,
-            "max_drawdown": saa_max_drawdown
+            "max_drawdown": 0.0
         }
         
         return saa_reward, saa_reward_parts
@@ -3909,18 +3938,32 @@ class TradingEnv(gym.Env):
             # Get portfolio features for current step: shape [num_portfolio_features]
             # Map to internal buffer index considering lookback warmup
             internal_step = external_step_for_obs + (self.lookback_window if self.maybe_provide_sequence else 0)
+
             # Extract weights: index 0 is cash, index (asset_index + 1) is the selected asset
             weights_vec = self.episode_buffer.portfolio_weights[internal_step]
             cash_weight = float(weights_vec[0])
             asset_weight = float(weights_vec[asset_index + 1])
 
+            # Calc log metrics for cash and asset notional
+            cash_notional = cash_weight * self.episode_buffer.portfolio_values[internal_step]
+            asset_notional = asset_weight * self.episode_buffer.portfolio_values[internal_step]
+            initial_portfolio_value = self.initial_portfolio_value
+
+            cash_log_value = np.log(cash_notional / initial_portfolio_value) if cash_notional > 0 else 0.0
+            asset_log_value = np.log(asset_notional / initial_portfolio_value) if asset_notional > 0 else 0.0
+
+
             # Daily return of the full portfolio for this step
             daily_portfolio_return = float(self.episode_buffer.returns[internal_step])
-            # Daily return of just cash plus selected asset
+
+            # Daily log return of just cash change plus selected asset notional change
             daily_agent_return = float(self.episode_buffer.saa_returns[internal_step])
+
+            # Last agents action
+            last_action = float(self.episode_buffer.actions[internal_step])
             
             # Build minimal portfolio features for single-asset mode
-            portfolio_features = np.array([cash_weight, asset_weight, daily_agent_return], dtype=np.float32)
+            portfolio_features = np.array([cash_log_value, asset_log_value, daily_agent_return, last_action], dtype=np.float32)
 
             # Verify that all values contain numeric values before concatenation and guard!
             if not np.all(np.isfinite(features)):
