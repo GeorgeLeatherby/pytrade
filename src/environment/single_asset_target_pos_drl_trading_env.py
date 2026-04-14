@@ -3009,11 +3009,11 @@ class TradingEnv(gym.Env):
         next_value = float(selected_asset_notional_after + saa_cash_after)
 
         # Simple log return reward
-        saa_reward = 100 * float(
+        saa_reward_raw = 100 * float(
             np.log(max(next_value, eps))
             - np.log(max(prev_value, eps))
         )
-
+        saa_reward = np.tanh(saa_reward_raw / 2.0) * 2.0 # Scale to [-2, 2] range
         # NOTE: Several values here get used to fill portfolio wide metrics in the episode buffer.
         saa_reward_parts = {
             "alpha_component": 0.0,
