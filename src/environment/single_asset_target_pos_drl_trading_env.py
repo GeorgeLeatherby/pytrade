@@ -314,6 +314,7 @@ class EpisodeBuffer:
         self.portfolio_weights[internal_offset_step] = weights
         self.portfolio_positions[internal_offset_step] = portfolio_positions
         self.returns[internal_offset_step] = daily_return
+        self.saa_returns[internal_offset_step] = saa_return
         self.rewards[internal_offset_step] = reward_to_record
         self.actions[internal_offset_step] = action
         self.transaction_costs[internal_offset_step] = transaction_cost
@@ -3939,18 +3940,32 @@ class TradingEnv(gym.Env):
             # Get portfolio features for current step: shape [num_portfolio_features]
             # Map to internal buffer index considering lookback warmup
             internal_step = external_step_for_obs + (self.lookback_window if self.maybe_provide_sequence else 0)
+
             # Extract weights: index 0 is cash, index (asset_index + 1) is the selected asset
             weights_vec = self.episode_buffer.portfolio_weights[internal_step]
             cash_weight = float(weights_vec[0])
             asset_weight = float(weights_vec[asset_index + 1])
 
+            # Calc log metrics for cash and asset notional
+            cash_notional = cash_weight * self.episode_buffer.portfolio_values[internal_step]
+            asset_notional = asset_weight * self.episode_buffer.portfolio_values[internal_step]
+            initial_portfolio_value = self.initial_portfolio_value
+
+            cash_log_value = np.log(cash_notional / initial_portfolio_value) if cash_notional > 0 else 0.0
+            asset_log_value = np.log(asset_notional / initial_portfolio_value) if asset_notional > 0 else 0.0
+
+
             # Daily return of the full portfolio for this step
             daily_portfolio_return = float(self.episode_buffer.returns[internal_step])
-            # Daily return of just cash plus selected asset
+
+            # Daily log return of just cash change plus selected asset notional change
             daily_agent_return = float(self.episode_buffer.saa_returns[internal_step])
+
+            # Last agents action
+            last_action = float(self.episode_buffer.actions[internal_step])
             
             # Build minimal portfolio features for single-asset mode
-            portfolio_features = np.array([cash_weight, asset_weight, daily_agent_return], dtype=np.float32)
+            portfolio_features = np.array([cash_log_value, asset_log_value, daily_agent_return, last_action], dtype=np.float32)
 
             # Verify that all values contain numeric values before concatenation and guard!
             if not np.all(np.isfinite(features)):

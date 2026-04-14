@@ -34,9 +34,15 @@ Another approach would be to increase lstm layer size to 2! This might capture t
 Change SAA return calculation to a "solvable" POMDP problem. This means:
 - Include all metrics used to calculate the reward in the observations
 - Include the previous action in the observation to enhance path understanding of the agent
+
 - Check the magnitude of the rewards. PPO tends to work best in the range of rewards being in a 1 range. Simply apply e.g. 100 factor if rewards are in 0.0001 range. 
+
 - Use log prices in return calculation to try for positive explained variance.
+
 - The simple weight observations of cash and assets is likely too simple and experiencing a drift. This is due to the fact that weights are dependent of the development of the other assets as well. 
+
 - Switch cash weight to log(cash/total value) OR log(cash/starting funds)
+
 - Route critical info: last action, log cash ratio, asset size past the mlp so it cannot dilute the information. Active asset size can be expressed as asset log(notional/starting funds). This should reduce relative drift introduced by other assets.
+
 - Value loss should be in range 0.1 to 1 to comfortably learn
