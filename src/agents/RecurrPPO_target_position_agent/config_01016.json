@@ -130,7 +130,7 @@
         "seed": 42,
         "n_envs": 8,
         "vec_env_start_method": "spawn",
-        "total_timesteps": 20000000,
+        "total_timesteps": 10000000,
         "train_log_freq": 10,
         "eval_freq": 25000,
         "n_eval_episodes": 100,

@@ -3016,7 +3016,19 @@ class TradingEnv(gym.Env):
             - np.log(max(prev_value, eps))
         )
 
-        saa_reward = saa_reward_raw - (action**2 * self.action_l2_penalty_coeff)
+        """Calculate dynamic risk window. Use self.reward_risk_window and the current step to produce
+        behaviour which starts at 2 raises with the steps up to maximum risk_reward_window"""
+        if self.current_step <= 2:
+            risk_metric_window = 2
+        else:
+            risk_metric_window = min(self.current_step, self.max_reward_risk_window)
+
+        sharpe_ratio = self.episode_buffer.calculate_sharpe_ratio(
+            window=risk_metric_window
+        )
+
+        saa_reward_raw = saa_reward_raw - (action**2 * self.action_l2_penalty_coeff) + (sharpe_ratio * 0.1)
+
         saa_reward = np.tanh(saa_reward_raw / 2.0) * 2.0 # Scale to [-2, 2] range
         
         # NOTE: Several values here get used to fill portfolio wide metrics in the episode buffer.

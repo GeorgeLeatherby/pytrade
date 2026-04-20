@@ -82,9 +82,9 @@
 
             "net_arch": {
                 "pi": [64],
-                "vf": [64]
+                "vf": [16]
             },
-            "n_lstm_layers": 1,
+            "n_lstm_layers": 2,
             "lstm_hidden_size": 64
         },
         "device": "cuda",
@@ -94,8 +94,8 @@
         "batch_size": 2016,
         "gamma": 0.99,
         "gae_lambda": 0.98,
-        "vf_coef": 0.3,
-        "max_grad_norm": 0.3,
+        "vf_coef": 0.35,
+        "max_grad_norm": 0.35,
         "target_kl": 0.015,
         "normalize_advantage": true,        
 
@@ -110,10 +110,10 @@
         "clip_schedule_warmup_pct": 0.4,
         "clip_schedule_ramping_pct": 0.6,
 
-        "ent_coef_start": 0.002,
+        "ent_coef_start": 0.005,
         "ent_coef_end": 0.00001,
         "ent_coef_schedule_type": "linear",
-        "ent_coef_schedule_warmup_pct": 0.05,
+        "ent_coef_schedule_warmup_pct": 0.3,
         "ent_coef_schedule_ramping_pct": 0.6,
 
         "action_limiting_factor_start": 0.2,
@@ -133,11 +133,11 @@
         "total_timesteps": 10000000,
         "train_log_freq": 10,
         "eval_freq": 25000,
-        "n_eval_episodes": 100,
+        "n_eval_episodes": 200,
         "eval_deterministic": true,
         "progress_bar": true,
-        "config_id": 1015,
-        "action_l2_penalty_coeff": 0.01
+        "config_id": 1023,
+        "action_l2_penalty_coeff": 0.2
     }
 
 }
