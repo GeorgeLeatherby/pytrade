@@ -1435,6 +1435,7 @@ class TradingEnv(gym.Env):
         
         self.selected_asset_index = None  # For SINGLE_ASSET_TARGET_POS mode
         self.perc_of_cash_only_starts = config["environment"].get("percentage_of_cash_only_starts", 0.2)
+        self.action_l2_penalty_coeff = config['training'].get('action_l2_penalty_coeff', 0.01)
 
         # Differential Sortino config params
         self.sortino_eta = config["environment"].get("sortino_eta", 0.0125) # Adaption rate
@@ -2321,7 +2322,8 @@ class TradingEnv(gym.Env):
                 selected_asset_notional_before=selected_asset_notional_before,
                 selected_asset_notional_after=selected_asset_notional_after,
                 saa_cash_before=live_portfolio_cash_before,
-                saa_cash_after=self.portfolio_state.cash
+                saa_cash_after=self.portfolio_state.cash,
+                action=target_position_change
             )
         else:
             raise ValueError(f"Unknown execution mode {self.execution_mode} in reward allocation.")
@@ -2956,7 +2958,7 @@ class TradingEnv(gym.Env):
             self, execution_result, selected_asset_index, delta_selected_asset_notional,
             delta_cash, saa_return, 
             selected_asset_notional_before, selected_asset_notional_after,
-            saa_cash_before, saa_cash_after
+            saa_cash_before, saa_cash_after, action
             ):
         
         # # Calculate the SAA step reward
@@ -3009,11 +3011,14 @@ class TradingEnv(gym.Env):
         next_value = float(selected_asset_notional_after + saa_cash_after)
 
         # Simple log return reward
-        saa_reward_raw = 100 * float(
+        saa_reward_raw = 50 * float(
             np.log(max(next_value, eps))
             - np.log(max(prev_value, eps))
         )
+
+        saa_reward = saa_reward_raw - (action**2 * self.action_l2_penalty_coeff)
         saa_reward = np.tanh(saa_reward_raw / 2.0) * 2.0 # Scale to [-2, 2] range
+        
         # NOTE: Several values here get used to fill portfolio wide metrics in the episode buffer.
         saa_reward_parts = {
             "alpha_component": 0.0,

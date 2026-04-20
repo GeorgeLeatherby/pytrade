@@ -1,0 +1,142 @@
+{
+    "environment": {
+        "execution_mode": "single_asset_target_position",
+        "initial_portfolio_value": 10000,
+        "episode_length_days": 252,
+        "lookback_window": 0,
+        "early_stopping_threshold": 0.1,
+        "cash_drag_rate_pa": 0.018,
+        "seed": 42,
+        "maybe_provide_sequence": false,
+        "block_buffer_multiplier": 1.0,
+        "test_val_split_ratio": 0.15,
+
+        "sortino_eta": 0.018,
+        "lambda_drawdown": 0.005,
+        "sortino_net_reward_mix": 0.4,
+
+        "percentage_of_cash_only_starts": 0.10,
+
+        "execution_min_share_threshold": 1,
+        "execution_min_trade_value_threshold": 50.0,
+        "execution_min_days_between_trades": 1,
+        "execution_weight_change_threshold": 0.005,
+        "allow_short": false,
+        "price_source": "current_close",
+        "quantity_type": "shares",
+
+        "fixed_fee_per_order": 0.0,
+        "commission_bps": 0.0002,
+        "half_spread_bps": 0.0005,
+        "impact_coeff": 0.125,
+        "adv_window": 21
+    },
+
+    "saa_features": {
+        "log_close_return_1d": true,
+        "z_vol_breakout_1d": true,
+        "z_rel_log_close_1d": true,
+        "log_volume_intensity_1d": true,
+        "norm_volume_feature_1d": true,
+
+        "z_log_intra_vol": true,
+        "norm_closing_strength": true,
+        "z_log_overnight_gap": true,
+        "norm_shadow_ratio": true,
+
+        "log_close_return_5d": true,
+        "z_vol_breakout_5d": true,
+        "z_rel_log_close_5d":  true,
+        "log_volume_intensity_5d":  true,
+        "norm_volume_feature_5d":  true,
+
+        "log_close_return_21d":  true,
+        "z_vol_breakout_21d":  true,
+        "z_rel_log_close_21d":  true,
+        "log_volume_intensity_21d":  true,
+        "norm_volume_feature_21d":  true,
+
+        "atr_z_norm": true,
+        "rsi_14": true,
+        "bb_width_reworked": true,
+        "z_fisher_corr_spy": true,
+        "z_market_dispersion": true,
+        "z_beta_spy": true,
+        "norm_ffd_feature": true,
+
+        "dow_sin": true,
+        "dow_cos": true,
+        "dom_sin": true,
+        "dom_cos": true,
+        "moy_sin": true,
+        "moy_cos": true
+    },
+
+    "agent":{
+        "policy": "MlpLstmPolicy",
+        "policy_kwargs": {
+            "mlp_hidden_sizes": [128, 128],
+            "mlp_dropouts": [0.3, 0.3],
+            "mlp_activation": "SiLU",
+            "features_dim": 64,
+
+            "net_arch": {
+                "pi": [64],
+                "vf": [64]
+            },
+            "n_lstm_layers": 1,
+            "lstm_hidden_size": 64
+        },
+        "device": "cuda",
+        "verbose": 1,
+        "n_epochs": 3,
+        "n_steps": 504,
+        "batch_size": 504,
+        "gamma": 0.99,
+        "gae_lambda": 0.98,
+        "vf_coef": 0.5,
+        "max_grad_norm": 0.5,
+        "target_kl": 0.015,
+        "normalize_advantage": true,        
+
+        "learning_rate_start":  5.0e-6,
+        "learning_rate_end": 1.0e-6,
+        "lr_schedule_type": "linear",
+        "lr_schedule_warmup_pct": 0.3,
+        "lr_schedule_ramping_pct": 0.6,
+
+        "clip_range_start": 0.1,
+        "clip_range_end": 0.05,
+        "clip_schedule_warmup_pct": 0.2,
+        "clip_schedule_ramping_pct": 0.6,
+
+        "ent_coef_start": 0.001,
+        "ent_coef_end": 0.00001,
+        "ent_coef_schedule_type": "linear",
+        "ent_coef_schedule_warmup_pct": 0.05,
+        "ent_coef_schedule_ramping_pct": 0.6,
+
+        "action_limiting_factor_start": 0.2,
+        "action_limiting_factor_end": 0.10,
+        "action_limiting_factor_schedule_type": "linear",
+        "action_limiting_factor_schedule_warmup_pct": 0.3,
+        "action_limiting_factor_schedule_ramping_pct": 0.6,
+
+        "stats_window_size": 100
+
+    },
+
+    "training": {
+        "seed": 42,
+        "n_envs": 8,
+        "vec_env_start_method": "spawn",
+        "total_timesteps": 20000000,
+        "train_log_freq": 10,
+        "eval_freq": 25000,
+        "n_eval_episodes": 100,
+        "eval_deterministic": true,
+        "progress_bar": true,
+        "config_id": 1010
+    }
+
+}

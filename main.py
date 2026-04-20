@@ -14,7 +14,7 @@ def discover_agents():
         if os.path.isdir(full):
             py_files = [f for f in os.listdir(full) if f.endswith(".py")]
             if py_files:
-                agents.append(entry)
+                agents.append(entry) 
     return sorted(agents)
 
 def load_config(path):

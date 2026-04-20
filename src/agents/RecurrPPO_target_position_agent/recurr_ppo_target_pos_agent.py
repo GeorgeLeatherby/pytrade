@@ -255,7 +255,7 @@ class ValidationMetricsCallback(BaseCallback):
             saa_subpf = info.get("saa_final_subportfolio_value", None)
             saa_return_after_rdn_portf_init = info.get("saa_return_final", None)
             
-            # Accumulate all eval episode metricsin buffers
+            # Accumulate all eval episode metrics in buffers
             if pv is not None:
                 self.pv_buffer.append(pv)
             if comp_pv is not None:
@@ -276,6 +276,22 @@ class ValidationMetricsCallback(BaseCallback):
                 self.saa_subpf_buffer.append(saa_subpf)
             if saa_return_after_rdn_portf_init is not None:
                 self.saa_return_after_rdn_portf_init_buffer.append(saa_return_after_rdn_portf_init)
+
+            # Raise error if any of the metrics contains a Nan of Inf value
+            for metric_name, metric_value in [
+                ("pv", pv), 
+                ("comp_pv", comp_pv), 
+                ("bench", bench), 
+                ("ret", ret), 
+                ("sharpe", sharpe), 
+                ("dd", dd), 
+                ("alpha_ret", alpha_ret), 
+                ("cum_reward", cum_reward),
+                ("saa_subpf", saa_subpf),
+                ("saa_return_after_rdn_portf_init", saa_return_after_rdn_portf_init)
+            ]:
+                if metric_value is not None and (np.isnan(metric_value) or np.isinf(metric_value)):
+                    raise ValueError(f"Invalid metric value detected in evaluation episode {self.eval_episode_count}: {metric_name}={metric_value}")
                 
         return True
     
@@ -581,6 +597,7 @@ def build_env(cache, config: Dict[str, Any], seed: Optional[int] = None, for_eva
     ))
 
     if alf_keys_present:
+        print("Configuring action limiting factor schedule with agent config keys...")
         start = float(agent_cfg.get("action_limiting_factor_start", 0.2))
         end = float(agent_cfg.get("action_limiting_factor_end", start))
         schedule_type = str(agent_cfg.get("action_limiting_factor_schedule_type", "linear")).lower()

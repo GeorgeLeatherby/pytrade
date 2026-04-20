@@ -48,3 +48,15 @@ Change SAA return calculation to a "solvable" POMDP problem. This means:
 - CRITICAL: Verify if last action is also reported correctly to the frozen saa models in PAA mode!
 
 - Value loss should be in range 0.1 to 1 to comfortably learn
+
+## Network ideas:
+Apply smoother width sizing within the narrowing critic network path. Try reducing depth of the FeatureExtractor. Try deepening the individual actor critic paths.
+
+
+## Reward ideas:
+- L2 penalty on overall action sizing to avoid pivot towards long only plateau. 
+- Reintroduce Volatility awareness through Diff Sortino or other metrics. 
+- Add the generated alpha as mix into reward, to allow for market trend substracted signal. Agent behaviour which avoids huge losses when market is in falldown is good, even if it still generates small losses. 
+
+## PAA ideas:
+- Introduce route critical info of last requested weights! That way the agent might also learn how the env is applying its output!
