@@ -1102,6 +1102,13 @@ class SAASignalWrapper(VecEnvWrapper):
             high=np.concatenate([new_high_assets, old_high[asset_size:]]),
             dtype=np.float32,
         )
+        # Cache direct handles to the underlying TradingEnv instances (works for DummyVecEnv).
+        # Required so we can read/write the per-asset SAA sub-portfolio state in the env's episode_buffer.
+        # Assumes SAASignalWrapper wraps the raw DummyVecEnv (no VecNormalize in between), which is how run() builds it.
+        self._base_envs = list(self.venv.envs)  # len == num_envs; each is a TradingEnv
+        if any(not hasattr(e, "episode_buffer") for e in self._base_envs):
+            raise RuntimeError("SAASignalWrapper requires direct access to TradingEnv.episode_buffer; "
+                               "do not place VecNormalize between the raw env and this wrapper.")
 
     def reset(self):
         res = self.venv.reset()
@@ -1146,15 +1153,38 @@ class SAASignalWrapper(VecEnvWrapper):
         # Select the configured SAA market features.
         saa_market_feats = asset_feats[:, :, self.saa_idx]
 
-        # Portfolio-derived pieces
-        cash_w = portfolio_part[:, 0:1]                                # (B, 1)
-        asset_w = portfolio_part[:, 1:1 + self.num_assets]             # (B, N)
-        cash_w_exp = np.repeat(cash_w[:, None, :], self.num_assets, axis=1)  # (B, N, 1)
-        asset_w_exp = asset_w[:, :, None]                              # (B, N, 1)
-        third_component = np.zeros_like(asset_w_exp, dtype=np.float32) # (B, N, 1)
+        # --- Build SAA per-asset obs EXACTLY like SAA training (num_saa_features + 4) ---
+        # Read per-asset hypothetical sub-portfolio state from each underlying env's buffer.
+        num_envs = obs.shape[0]
+        N = self.num_assets
+        initial_pv = float(self._base_envs[0].initial_portfolio_value)  # cached in __init__
 
-        # Final per-asset SAA obs: selected SAA market feats + 3 portfolio feats.
-        saa_obs = np.concatenate([saa_market_feats, cash_w_exp, asset_w_exp, third_component], axis=-1)
+        cash_all   = np.zeros((num_envs, N), dtype=np.float32)
+        shares_all = np.zeros((num_envs, N), dtype=np.float32)
+        last_act_all = np.zeros((num_envs, N), dtype=np.float32)
+        dret_all   = np.zeros((num_envs, N), dtype=np.float32)
+        prices_all = np.zeros((num_envs, N), dtype=np.float32)
+
+        for b in range(num_envs):
+            env_b = self._base_envs[b]
+            c, s, la, dr = env_b.episode_buffer.get_saa_sub_state(env_b.current_step)
+            cash_all[b]   = c
+            shares_all[b] = s
+            last_act_all[b] = la
+            dret_all[b]   = dr
+            prices_all[b] = env_b.portfolio_state.prices
+
+        asset_notional = shares_all * prices_all                                                  # (B, N)
+        # Log-ratios with gating at 0 (matches get_observation_single_step L3973-3976)
+        eps = 1e-12
+        cash_log_value  = np.where(cash_all        > 0, np.log(np.maximum(cash_all,        eps) / initial_pv), 0.0).astype(np.float32)
+        asset_log_value = np.where(asset_notional  > 0, np.log(np.maximum(asset_notional,  eps) / initial_pv), 0.0).astype(np.float32)
+
+        # Stack into per-asset 4-feature memory block: (B, N, 4)
+        mem_block = np.stack([cash_log_value, asset_log_value, dret_all, last_act_all], axis=-1)  # (B, N, 4)
+
+        # Combine with configured SAA market features
+        saa_obs = np.concatenate([saa_market_feats, mem_block], axis=-1)                          # (B, N, F_saa + 4)
 
         # Collect SAA signals per asset using distinct models/states
         signals = []
@@ -1185,6 +1215,11 @@ class SAASignalWrapper(VecEnvWrapper):
             signals.append(actions_np[:, 0:1])  # (B, 1)
 
         saa_sig = np.stack(signals, axis=1)  # (B, N, 1)
+        
+        # After the for-a loop, saa_sig has shape (B, N, 1). Commit the actions to each underlying env
+        # so the sub-portfolios update for the next step's MTM.
+        for b in range(num_envs):
+            self._base_envs[b].apply_saa_sub_actions(saa_sig[b, :, 0])
 
         # Inject SAA signal into asset features
         augmented_assets = np.concatenate(

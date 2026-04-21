@@ -286,6 +286,14 @@ class EpisodeBuffer:
         self.running_mean_ema = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         self.downside_var_sqrt = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         self.previous_max_drawdown = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        # --- Per-asset hypothetical SAA sub-portfolio containers ---
+        # Used ONLY in PORTFOLIO_WEIGHTS execution mode to feed frozen SAAs inside SAASignalWrapper.
+        # One independent sub-portfolio per asset; each mimics SAA-training obs inputs.
+        # Shapes: [T, N] for per-asset scalars.
+        self.saa_sub_cash         = np.zeros((self.episode_buffer_length_days, self.num_assets), dtype=dtype)  # $ cash per asset
+        self.saa_sub_shares       = np.zeros((self.episode_buffer_length_days, self.num_assets), dtype=dtype)  # shares held per asset
+        self.saa_sub_last_action  = np.zeros((self.episode_buffer_length_days, self.num_assets), dtype=dtype)  # previous SAA scalar action per asset
+        self.saa_sub_daily_return = np.zeros((self.episode_buffer_length_days, self.num_assets), dtype=dtype)  # $-delta matching env.saa_returns formula
 
     def record_step(self, external_step: int, portfolio_value: float, weights: np.ndarray, portfolio_positions: np.ndarray,
                    daily_return: float, saa_return: float, reward_to_record: float,action: np.ndarray,
@@ -345,11 +353,38 @@ class EpisodeBuffer:
             self.reward_concentration[internal_offset_step] = reward_parts.get("concentration_component", 0.0)
             self.reward_survival[internal_offset_step] = reward_parts.get("survival_component", 0.0)
         
-
         # Update current step and episode length
         self.current_step = external_step
         self.episode_length = min(external_step + 1, self.episode_buffer_length_days)
 
+    def set_saa_sub_state_mtm(self, external_step: int, cash: np.ndarray, shares: np.ndarray,
+                            last_action: np.ndarray, daily_return: np.ndarray) -> None:
+        """
+        Write per-asset sub-portfolio state AFTER price update + cash drag, BEFORE the new SAA action.
+        All arrays expected shape [N].
+        """
+        internal_offset_step = external_step + self.lookback_window if self.maybe_provide_sequence else external_step
+        self.saa_sub_cash[internal_offset_step]         = cash
+        self.saa_sub_shares[internal_offset_step]       = shares
+        self.saa_sub_last_action[internal_offset_step]  = last_action
+        self.saa_sub_daily_return[internal_offset_step] = daily_return
+
+    def set_saa_sub_state_after_action(self, external_step: int, cash: np.ndarray, shares: np.ndarray,
+                                    last_action: np.ndarray) -> None:
+        """Overwrite cash/shares/last_action in the current slot AFTER the SAA action has been applied."""
+        internal_offset_step = external_step + self.lookback_window if self.maybe_provide_sequence else external_step
+        self.saa_sub_cash[internal_offset_step]        = cash
+        self.saa_sub_shares[internal_offset_step]      = shares
+        self.saa_sub_last_action[internal_offset_step] = last_action
+
+    def get_saa_sub_state(self, external_step: int):
+        """Read [cash(N), shares(N), last_action(N), daily_return(N)] at the given external step."""
+        internal_offset_step = external_step + self.lookback_window if self.maybe_provide_sequence else external_step
+        return (self.saa_sub_cash[internal_offset_step],
+                self.saa_sub_shares[internal_offset_step],
+                self.saa_sub_last_action[internal_offset_step],
+                self.saa_sub_daily_return[internal_offset_step])
+    
     def get_returns_window(self, window: int) -> np.ndarray:
         """Get last N returns for risk calculations (no wrap-around, no ring buffer)"""
         end_idx = self.current_step
@@ -1947,6 +1982,20 @@ class TradingEnv(gym.Env):
             effective_asset_concentration_norm=effective_asset_concentration_norm
         )
         
+        # Seed per-asset SAA sub-portfolios for PORTFOLIO_WEIGHTS mode.
+        # Cash-only start: each sub-portfolio holds initial_portfolio_value in cash, 0 shares.
+        if self.execution_mode == EXECUTION_PORTFOLIO_WEIGHTS:
+            num_assets = self.market_data_cache.num_assets
+            self.episode_buffer.set_saa_sub_state_mtm(
+                external_step=0,
+                cash        = np.full(num_assets, self.initial_portfolio_value, dtype=np.float32),
+                shares      = np.zeros(num_assets, dtype=np.float32),
+                last_action = np.zeros(num_assets, dtype=np.float32),
+                daily_return= np.zeros(num_assets, dtype=np.float32),
+            )
+            # Snapshot previous sub-portfolio values for next-step return computation
+            self._saa_sub_prev_value = np.full(num_assets, self.initial_portfolio_value, dtype=np.float32)
+
         # Initialize previous portfolio value for return calculation
         self._previous_portfolio_value = actual_initial_value
         
@@ -1989,6 +2038,67 @@ class TradingEnv(gym.Env):
             return self.market_data_cache.close_prices[0].copy()
         
         return self.market_data_cache.close_prices[current_absolute_step].copy()
+
+    def apply_saa_sub_actions(self, actions_per_asset: np.ndarray) -> None:
+        """
+        Apply one SAA target_position_change per asset to its hypothetical sub-portfolio.
+        Updates cash/shares/last_action at the current buffer slot in place.
+        Called by SAASignalWrapper AFTER reading obs and running predict.
+
+        Args:
+            actions_per_asset: [N] float, each value in [-1, 1] (already clipped upstream).
+        """
+        if self.execution_mode != EXECUTION_PORTFOLIO_WEIGHTS:
+            return
+        ebuf = self.episode_buffer
+        cash, shares, _, _ = ebuf.get_saa_sub_state(self.current_step)  # current MTM state
+        cash   = cash.copy()
+        shares = shares.copy()
+
+        prices = self.portfolio_state.prices  # current (new) prices
+        num_assets = self.market_data_cache.num_assets
+        weight_thr = self.execution_weight_change_threshold
+        value_thr  = self.execution_min_trade_value_threshold
+
+        for a in range(num_assets):
+            px = float(prices[a])
+            if px <= 0.0 or not np.isfinite(px):
+                continue
+            tpc = float(actions_per_asset[a])
+            sub_value = float(cash[a] + shares[a] * px)
+            if sub_value <= 0.0:
+                continue
+            desired_notional = tpc * sub_value
+            if abs(desired_notional) < value_thr:
+                continue
+            current_w = (shares[a] * px) / sub_value
+            new_w = np.clip(current_w + tpc, 0.0, 1.0) if not self.allow_short else current_w + tpc
+            delta_w = new_w - current_w
+            if abs(delta_w) < weight_thr:
+                continue
+            trade_notional = delta_w * sub_value
+            delta_shares = trade_notional / px
+
+            # One-hot TC call; asset_mask keeps the call cheap and avoids corrupting cost on other assets
+            shares_vec = np.zeros(num_assets, dtype=np.float32)
+            shares_vec[a] = delta_shares
+            mask = np.zeros(num_assets, dtype=bool); mask[a] = True
+            tc = self._calculate_transaction_costs(
+                shares_traded=shares_vec, prices=prices,
+                abs_step=self.current_absolute_step, asset_mask=mask,
+            )
+
+            shares[a] += delta_shares
+            cash[a]   -= (delta_shares * px + tc)
+
+        ebuf.set_saa_sub_state_after_action(
+            external_step=self.current_step,
+            cash=cash.astype(np.float32),
+            shares=shares.astype(np.float32),
+            last_action=actions_per_asset.astype(np.float32),
+        )
+        # Refresh the cached "previous sub-portfolio value" so next step's MTM uses post-trade state
+        self._saa_sub_prev_value = (cash + shares * prices).astype(np.float32)
 
     def _get_info(self):
         """Get info dictionary for current step."""
@@ -2247,6 +2357,7 @@ class TradingEnv(gym.Env):
         
         # Update portfolio state with new prices (mark-to-market)
         # Portfolio positions remain the same, but prices change
+        self._saa_sub_prev_prices = self.portfolio_state.prices.copy() 
         self.portfolio_state.prices[:] = new_prices # in-place update
         self.portfolio_state.step = self.current_step
 
@@ -2272,6 +2383,45 @@ class TradingEnv(gym.Env):
             self.benchmark_portfolio_state.cash *= (1.0 - daily_decay_factor)
             self.shadow_portfolio_state.cash *= (1.0 - daily_decay_factor)
         
+        # --- SAA sub-portfolio MTM update (PORTFOLIO_WEIGHTS mode only) ---
+        # Mirrors live-portfolio treatment: apply cash drag, then price-revalue. Records per-asset
+        # saa_sub_daily_return using the same $-delta formula the SAA saw during training:
+        #     delta_notional + (cash_before - cash_after_drag)   (see env.py L2290-2292 for single-asset path)
+        if self.execution_mode == EXECUTION_PORTFOLIO_WEIGHTS:
+            ebuf = self.episode_buffer
+            # Previous-slot state (from end of previous step, i.e. post-SAA-action)
+            prev_cash, prev_shares, prev_last_action, _ = ebuf.get_saa_sub_state(self.current_step - 1)  # note: current_step already advanced
+
+            # Cash before drag (snapshotted at start of this step, stored on env at reset/after last action)
+            cash_before_drag = prev_cash.copy()
+            
+            # Apply cash drag (matches live-portfolio decay on L2268)
+            if self.cash_drag_rate_pa > 0:
+                # daily_decay_factor is computed locally in the surrounding block; recompute here to keep this block self-contained
+                daily_decay_factor = (1.0 + self.cash_drag_rate_pa) ** (1.0 / 252.0) - 1.0
+                cash_after_drag = prev_cash * (1.0 - daily_decay_factor)
+            else:
+                cash_after_drag = prev_cash.copy()
+
+            # Revalue at new prices
+            notional_after   = prev_shares * new_prices                                      # [N]
+            sub_value_after  = cash_after_drag + notional_after                              # [N]
+            # delta_cash = cash_before - cash_after; delta_notional = after - before_at_NEW_prices
+            # But env's formula compares: after(new_price) vs before(old_price) for notional, and before vs after_drag for cash.
+            delta_cash        = cash_before_drag - cash_after_drag                           # [N] (only drag, no trade yet)
+            delta_notional    = notional_after - (prev_shares * self._saa_sub_prev_prices)  # [N] (price change effect on old shares, ignores trades)
+            saa_sub_ret       = delta_notional + delta_cash                                  # [N]
+
+            ebuf.set_saa_sub_state_mtm(
+                external_step = self.current_step,
+                cash          = cash_after_drag.astype(np.float32),
+                shares        = prev_shares.astype(np.float32),
+                last_action   = prev_last_action.astype(np.float32),
+                daily_return  = saa_sub_ret.astype(np.float32),
+            )
+            # Cache for the NEXT step's "before_notional" read (avoids indexing into buffer again)
+            self._saa_sub_prev_value = (cash_after_drag + notional_after).astype(np.float32)
+
         # Calculate new portfolio value after price changes
         portfolio_value_after = self.portfolio_state.get_total_value()
         benchmark_portfolio_value_after = self.benchmark_portfolio_state.get_total_value()
