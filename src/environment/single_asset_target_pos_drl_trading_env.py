@@ -2394,7 +2394,7 @@ class TradingEnv(gym.Env):
 
             # Cash before drag (snapshotted at start of this step, stored on env at reset/after last action)
             cash_before_drag = prev_cash.copy()
-            
+
             # Apply cash drag (matches live-portfolio decay on L2268)
             if self.cash_drag_rate_pa > 0:
                 # daily_decay_factor is computed locally in the surrounding block; recompute here to keep this block self-contained
@@ -3162,11 +3162,28 @@ class TradingEnv(gym.Env):
         prev_value = float(selected_asset_notional_before + saa_cash_before)
         next_value = float(selected_asset_notional_after + saa_cash_after)
 
+        # SAA realized log return (portfolio-level, includes cash drag and TC)
+        saa_log_return = np.log(max(next_value, eps)) - np.log(max(prev_value, eps))
+
+        # Single-asset passive benchmark: same-asset fully-invested buy-and-hold.
+        # Rationale: the SAA chooses between "be in this asset" and "be in cash".
+        # Benchmark is "always in this asset" — measures alpha of timing vs. always-on.
+        # Prices are taken one-day apart (matches env's step cadence).
+        old_price = float(self._saa_sub_prev_prices[selected_asset_index])   # snapshot taken in step() just before MTM
+        new_price = float(self.portfolio_state.prices[selected_asset_index])
+        if old_price > 0 and new_price > 0:
+            passive_log_return = float(np.log(new_price) - np.log(old_price))
+        else:
+            passive_log_return = 0.0
+
+        # Scale the passive benchmark by the SAA's achievable notional so the reward
+        # is on the same scale as a fully-invested SAA would see.
+        # sub_portfolio_notional = prev_value; passive return applied to it = passive_log_return.
+        # (log-return is scale-free; no multiplication needed — just subtract.)
+        saa_excess_log_return = saa_log_return - passive_log_return
+
         # Simple log return reward
-        saa_reward_raw = 50 * float(
-            np.log(max(next_value, eps))
-            - np.log(max(prev_value, eps))
-        )
+        saa_reward_raw = 50 * saa_excess_log_return  # Scale factor to get reasonable reward magnitudes
 
         """Calculate dynamic risk window. Use self.reward_risk_window and the current step to produce
         behaviour which starts at 2 raises with the steps up to maximum risk_reward_window"""
@@ -3179,7 +3196,7 @@ class TradingEnv(gym.Env):
             window=risk_metric_window
         )
 
-        saa_reward_raw = saa_reward_raw - ((action * (1 / self.action_limiting_factor_start))**2 * self.action_l2_penalty_coeff) + (sharpe_ratio * 0.1)
+        saa_reward_raw = saa_reward_raw #- ((action * (1 / self.action_limiting_factor_start))**2 * self.action_l2_penalty_coeff) + (sharpe_ratio * 0.1)
 
         saa_reward = np.tanh(saa_reward_raw / 2.0) * 2.0 # Scale to [-2, 2] range
         
