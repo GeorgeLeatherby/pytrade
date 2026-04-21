@@ -1434,8 +1434,10 @@ class TradingEnv(gym.Env):
         self.saa_initial_subportfolio_value = None  # For SAA benchmark
         
         self.selected_asset_index = None  # For SINGLE_ASSET_TARGET_POS mode
+        
         self.perc_of_cash_only_starts = config["environment"].get("percentage_of_cash_only_starts", 0.2)
         self.action_l2_penalty_coeff = config['training'].get('action_l2_penalty_coeff', 0.01)
+        self.action_limiting_factor_start = config['training'].get('action_limiting_factor_start', 0.2)
 
         # Differential Sortino config params
         self.sortino_eta = config["environment"].get("sortino_eta", 0.0125) # Adaption rate
@@ -3027,7 +3029,7 @@ class TradingEnv(gym.Env):
             window=risk_metric_window
         )
 
-        saa_reward_raw = saa_reward_raw - (action**2 * self.action_l2_penalty_coeff) + (sharpe_ratio * 0.1)
+        saa_reward_raw = saa_reward_raw - ((action * (1 / self.action_limiting_factor_start))**2 * self.action_l2_penalty_coeff) + (sharpe_ratio * 0.1)
 
         saa_reward = np.tanh(saa_reward_raw / 2.0) * 2.0 # Scale to [-2, 2] range
         
