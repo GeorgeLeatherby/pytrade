@@ -3196,7 +3196,7 @@ class TradingEnv(gym.Env):
             window=risk_metric_window
         )
 
-        saa_reward_raw = saa_reward_raw #- ((action * (1 / self.action_limiting_factor_start))**2 * self.action_l2_penalty_coeff) + (sharpe_ratio * 0.1)
+        saa_reward_raw = saa_reward_raw - ((action * (1 / self.action_limiting_factor_start))**2 * self.action_l2_penalty_coeff) + (sharpe_ratio * 0.1)
 
         saa_reward = np.tanh(saa_reward_raw / 2.0) * 2.0 # Scale to [-2, 2] range
         
