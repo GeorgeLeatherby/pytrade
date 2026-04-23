@@ -1455,8 +1455,10 @@ class TradingEnv(gym.Env):
 
         # Execution-mode config (backwards compatible defaults)
         self.execution_mode = config["environment"]["execution_mode"] # "single_asset_target_pos" | "simple" | "tranche" | "portfolio_weights"
-        if self.execution_mode == "portfolio_weights":
-            self.min_initial_cash_allocation = config["environment"]["percentage_of_cash_only_starts"]
+
+        if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
+            self.min_initial_cash_allocation = config["environment"]["min_initial_cash_allocation"]  # e.g., 0.1 for at least 10% cash at start
+
         self.quantity_type = config["environment"].get("quantity_type", "shares")
         self.price_source = config["environment"].get("price_source", "next_open")  # "next_open" | "current_close"
         self.allow_short = bool(config["environment"].get("allow_short", False))
@@ -1473,6 +1475,7 @@ class TradingEnv(gym.Env):
         self.perc_of_cash_only_starts = config["environment"].get("percentage_of_cash_only_starts", 0.2)
         self.action_l2_penalty_coeff = config['training'].get('action_l2_penalty_coeff', 0.01)
         self.action_limiting_factor_start = config['training'].get('action_limiting_factor_start', 0.2)
+        self.saa_differential_sharpe_ratio_weight = config["environment"].get("saa_differential_sharpe_ratio_weight", 0.2)
 
         # Differential Sortino config params
         self.sortino_eta = config["environment"].get("sortino_eta", 0.0125) # Adaption rate
@@ -1813,53 +1816,63 @@ class TradingEnv(gym.Env):
 
         # Portfolio mode: random weights across all assets + cash, ensuring minimum cash allocation
         else:
-            # Calculate initial cash allocation ensuring minimum threshold
-            # Generate random portfolio weights including cash
-            random_weights = np.random.random(num_assets + 1)  # +1 for cash
-            random_weights = random_weights / random_weights.sum()  # Normalize to sum to 1
-            
-            # Ensure minimum cash allocation
-            cash_weight = random_weights[0]
-            if cash_weight < self.min_initial_cash_allocation:
-                # Set cash to minimum and rescale other weights
-                cash_weight = self.min_initial_cash_allocation
+            # Start with cash only and no positions to simulate real trading start
+            if np.random.random() < self.perc_of_cash_only_starts:
+                # Cash-only start (no transaction costs)
+                initial_cash = self.initial_portfolio_value
+                initial_positions[:] = 0.0 # all assets zero
+                total_init_tc = 0.0
+                initial_prices = self._get_current_prices(self.current_absolute_step)
+
+            # Start with random allocation across all assets and cash, ensuring minimum cash allocation
+            else:
+                # Calculate initial cash allocation ensuring minimum threshold
+                # Generate random portfolio weights including cash
+                random_weights = np.random.random(num_assets + 1)  # +1 for cash
+                random_weights = random_weights / random_weights.sum()  # Normalize to sum to 1
+                
+                # Ensure minimum cash allocation
+                cash_weight = random_weights[0]
+                if cash_weight < self.min_initial_cash_allocation:
+                    # Set cash to minimum and rescale other weights
+                    cash_weight = self.min_initial_cash_allocation
+                    asset_weights = random_weights[1:]
+                    asset_weights_sum = asset_weights.sum()
+                    
+                    if asset_weights_sum > 0:
+                        # Rescale asset weights to fit remaining allocation
+                        remaining_allocation = 1.0 - cash_weight
+                        asset_weights = asset_weights * (remaining_allocation / asset_weights_sum)
+                    else:
+                        # If all asset weights were zero, distribute remaining equally
+                        remaining_allocation = 1.0 - cash_weight
+                        asset_weights = np.full(num_assets, remaining_allocation / num_assets)
+                    
+                    # Update the weights array
+                    random_weights = np.concatenate(([cash_weight], asset_weights))
+                
+                # Calculate target positions from weights
                 asset_weights = random_weights[1:]
-                asset_weights_sum = asset_weights.sum()
+                target_positions = np.zeros(num_assets, dtype=np.float32)
                 
-                if asset_weights_sum > 0:
-                    # Rescale asset weights to fit remaining allocation
-                    remaining_allocation = 1.0 - cash_weight
-                    asset_weights = asset_weights * (remaining_allocation / asset_weights_sum)
-                else:
-                    # If all asset weights were zero, distribute remaining equally
-                    remaining_allocation = 1.0 - cash_weight
-                    asset_weights = np.full(num_assets, remaining_allocation / num_assets)
+                for i in range(num_assets):
+                    assets_notional = self.initial_portfolio_value * asset_weights[i]
+                    if assets_notional > 0 and initial_prices[i] > 0:
+                        target_positions[i] = assets_notional / initial_prices[i]
                 
-                # Update the weights array
-                random_weights = np.concatenate(([cash_weight], asset_weights))
-            
-            # Calculate target positions from weights
-            asset_weights = random_weights[1:]
-            target_positions = np.zeros(num_assets, dtype=np.float32)
-            
-            for i in range(num_assets):
-                assets_notional = self.initial_portfolio_value * asset_weights[i]
-                if assets_notional > 0 and initial_prices[i] > 0:
-                    target_positions[i] = assets_notional / initial_prices[i]
-            
-            # Apply transaction costs (reserves intended cash weight from portfolio value)
-            intended_cash = self.initial_portfolio_value * random_weights[0]
-            available_for_assets = self.initial_portfolio_value - intended_cash
-            
-            initial_cash, initial_positions, total_init_tc = self._initialize_portfolio_with_costs(
-                target_positions=target_positions,
-                initial_prices=initial_prices,
-                initial_value=available_for_assets,
-                allow_cash_residual=True,
-                max_iterations=10
-            )
-            # Add back the intended cash reserve
-            initial_cash += intended_cash
+                # Apply transaction costs (reserves intended cash weight from portfolio value)
+                intended_cash = self.initial_portfolio_value * random_weights[0]
+                available_for_assets = self.initial_portfolio_value - intended_cash
+                
+                initial_cash, initial_positions, total_init_tc = self._initialize_portfolio_with_costs(
+                    target_positions=target_positions,
+                    initial_prices=initial_prices,
+                    initial_value=available_for_assets,
+                    allow_cash_residual=True,
+                    max_iterations=10
+                )
+                # Add back the intended cash reserve
+                initial_cash += intended_cash
 
         # from here same logic for all modes ----------------------------------
 
@@ -3200,7 +3213,7 @@ class TradingEnv(gym.Env):
         differential_sharpe_ratio = sharpe_ratio - self.previous_saa_sharpe_ratio
         self.previous_saa_sharpe_ratio = sharpe_ratio
 
-        saa_reward_raw = saa_reward_raw - ((action * (1 / self.action_limiting_factor_start))**2 * self.action_l2_penalty_coeff) + (differential_sharpe_ratio * 0.3) - max_drawdown_penalty
+        saa_reward_raw = (saa_reward_raw - ((action * (1 / self.action_limiting_factor_start)) * self.action_l2_penalty_coeff) + (differential_sharpe_ratio * self.saa_differential_sharpe_ratio_weight) - max_drawdown_penalty)
 
         saa_reward = np.tanh(saa_reward_raw / 2.0) * 2.0 # Scale to [-2, 2] range
         
