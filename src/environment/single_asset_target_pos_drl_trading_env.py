@@ -1486,6 +1486,7 @@ class TradingEnv(gym.Env):
         self.saa_previous_sortino = None
         self.saa_running_mean_ema = None
         self.saa_running_downside_variance_ema = None
+        self.previous_saa_sharpe_ratio = None
         
         # Initialize state variables
         self.current_step = None
@@ -1666,6 +1667,7 @@ class TradingEnv(gym.Env):
         self.previous_sortino = 0.0
         self.running_mean_ema = 1e-4
         self.running_downside_variance_ema = 2.5e-5
+        self.previous_saa_sharpe_ratio = 0.0
 
         # Sortino SAA reward metrics
         self.saa_previous_sortino = 0.0
@@ -3133,22 +3135,22 @@ class TradingEnv(gym.Env):
         # saa_sortino_reward = current_sortino - self.saa_previous_sortino
         # self.saa_previous_sortino = current_sortino
 
-        # # Mix Sortino with other metrics to get risk-aware non-deterministic policy
-        # """Calculate dynamic risk window. Use self.reward_risk_window and the current step to produce
-        # behaviour which starts at 2 raises with the steps up to maximum risk_reward_window"""
-        # if self.current_step <= 2:
-        #     risk_metric_window = 2
-        # else:
-        #     risk_metric_window = min(self.current_step, self.max_reward_risk_window)
+        # Mix Sortino with other metrics to get risk-aware non-deterministic policy
+        """Calculate dynamic risk window. Use self.reward_risk_window and the current step to produce
+        behaviour which starts at 2 raises with the steps up to maximum risk_reward_window"""
+        if self.current_step <= 2:
+            risk_metric_window = 2
+        else:
+            risk_metric_window = min(self.current_step, self.max_reward_risk_window)
 
-        # saa_max_drawdown = self.episode_buffer.saa_calculate_max_drawdown(
-        #     selected_asset_idx=selected_asset_index,
-        #     window=risk_metric_window
-        # )
+        saa_max_drawdown = self.episode_buffer.saa_calculate_max_drawdown(
+            selected_asset_idx=selected_asset_index,
+            window=risk_metric_window
+        )
 
-        # saa_max_drawdown_delta = max(0.0, saa_max_drawdown - self.saa_previous_max_drawdown)
-        # self.saa_previous_max_drawdown = saa_max_drawdown
-        # max_drawdown_penalty = float(self.lambda_drawdown * saa_max_drawdown_delta)
+        saa_max_drawdown_delta = max(0.0, saa_max_drawdown - self.saa_previous_max_drawdown)
+        self.saa_previous_max_drawdown = saa_max_drawdown
+        max_drawdown_penalty = float(self.lambda_drawdown * saa_max_drawdown_delta)
 
         # # 4. Mix in raw return & windowed drawdown penalty
         # reward = (self.sortino_net_reward_mix * saa_sortino_reward + 
@@ -3195,8 +3197,10 @@ class TradingEnv(gym.Env):
         sharpe_ratio = self.episode_buffer.calculate_sharpe_ratio(
             window=risk_metric_window
         )
+        differential_sharpe_ratio = sharpe_ratio - self.previous_saa_sharpe_ratio
+        self.previous_saa_sharpe_ratio = sharpe_ratio
 
-        saa_reward_raw = saa_reward_raw - ((action * (1 / self.action_limiting_factor_start))**2 * self.action_l2_penalty_coeff) + (sharpe_ratio * 0.1)
+        saa_reward_raw = saa_reward_raw - ((action * (1 / self.action_limiting_factor_start))**2 * self.action_l2_penalty_coeff) + (differential_sharpe_ratio * 0.3) - max_drawdown_penalty
 
         saa_reward = np.tanh(saa_reward_raw / 2.0) * 2.0 # Scale to [-2, 2] range
         
@@ -3212,8 +3216,8 @@ class TradingEnv(gym.Env):
             "raw_alpha": 0.0,
             "raw_portfolio_return": 0.0,
             "raw_benchmark_return": 0.0,
-            "sharpe_ratio": 0.0,
-            "max_drawdown": 0.0
+            "sharpe_ratio": sharpe_ratio,
+            "max_drawdown": saa_max_drawdown
         }
         
         return saa_reward, saa_reward_parts
