@@ -3213,7 +3213,7 @@ class TradingEnv(gym.Env):
         differential_sharpe_ratio = sharpe_ratio - self.previous_saa_sharpe_ratio
         self.previous_saa_sharpe_ratio = sharpe_ratio
 
-        saa_reward_raw = (saa_reward_raw - ((action * (1 / self.action_limiting_factor_start)) * self.action_l2_penalty_coeff) + (differential_sharpe_ratio * self.saa_differential_sharpe_ratio_weight) - max_drawdown_penalty)
+        saa_reward_raw = 1.5 * (saa_reward_raw - ((abs(action) * (1 / self.action_limiting_factor_start)) * self.action_l2_penalty_coeff) + (differential_sharpe_ratio * self.saa_differential_sharpe_ratio_weight) - max_drawdown_penalty)
 
         saa_reward = np.tanh(saa_reward_raw / 2.0) * 2.0 # Scale to [-2, 2] range
         
