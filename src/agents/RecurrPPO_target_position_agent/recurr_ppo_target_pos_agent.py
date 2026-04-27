@@ -650,10 +650,12 @@ def build_policy_kwargs(config: Dict[str, Any]) -> Dict[str, Any]:
         "lstm_hidden_size": int(pk.get("lstm_hidden_size", 128)),
         "features_extractor_class": InputMLPFeatures,
         "features_extractor_kwargs": {
-            "features_dim": 64,
+            "features_dim": int(pk.get("features_dim", 64)),
             "mlp_hidden_sizes": pk.get("mlp_hidden_sizes", [128, 128]),
             "mlp_dropouts": pk.get("mlp_dropouts", [0.3, 0.3]),
-            "mlp_activation": pk.get("mlp_activation", "SiLU")
+            "mlp_activation": pk.get("mlp_activation", "SiLU"),
+            "num_assets": int(pk.get("num_assets", 11)),
+            "embedding_dim": int(pk.get("embedding_dim", 6)),
         },
 
         "ortho_init": True # init with orthogonal matrices for stability
@@ -770,9 +772,14 @@ def build_eval_callback(eval_env: gym.Env, config: Dict[str, Any], log_dir: str)
 # Custom Feature Extractor
 # ================================
 class InputMLPFeatures(BaseFeaturesExtractor):
-    def __init__(self, observation_space, features_dim=64,  mlp_hidden_sizes=None, mlp_dropouts=None, mlp_activation="SiLU"):
+    def __init__(self, observation_space, features_dim=64, mlp_hidden_sizes=None, mlp_dropouts=None,
+                 mlp_activation="SiLU", num_assets: int = 11, embedding_dim: int = 6):
         super().__init__(observation_space, features_dim)
         n_in = observation_space.shape[0]
+        self.num_assets = num_assets
+        # Learnable asset embedding: maps the one-hot asset-ID block (last num_assets dims of obs)
+        # to a dense embedding_dim vector. Trained jointly with the rest of the policy by PPO.
+        self.asset_embedding = nn.Embedding(num_assets, embedding_dim)
         if mlp_hidden_sizes is None:
             mlp_hidden_sizes = [128, 128]  # Default
         if mlp_dropouts is None:
@@ -784,7 +791,8 @@ class InputMLPFeatures(BaseFeaturesExtractor):
         activation_class = activation_map.get(mlp_activation, nn.SiLU)
         
         layers = []
-        prev_size = n_in
+        # Replace the one-hot block (num_assets dims) with the embedding (embedding_dim dims).
+        prev_size = (n_in - num_assets) + embedding_dim
         for i, hidden_size in enumerate(mlp_hidden_sizes):
             layers.extend([
                 nn.Linear(prev_size, hidden_size),
@@ -803,7 +811,12 @@ class InputMLPFeatures(BaseFeaturesExtractor):
         self.mlp = nn.Sequential(*layers)
 
     def forward(self, x):
-        return self.mlp(x)
+        # Slice out the one-hot asset-ID block from the end of the observation.
+        # argmax recovers the asset index even after VecNormalize affine scaling.
+        features = x[:, :-self.num_assets]
+        asset_id = x[:, -self.num_assets:].argmax(dim=-1)  # (batch,)
+        emb = self.asset_embedding(asset_id)               # (batch, embedding_dim)
+        return self.mlp(torch.cat([features, emb], dim=-1))
     
 
 # ================================
