@@ -81,6 +81,8 @@
             "mlp_dropouts": [0.05, 0.05],
             "mlp_activation": "SiLU",
             "features_dim": 64,
+            "num_assets": 11,
+            "embedding_dim": 6,
 
             "net_arch": {
                 "pi": [64, 64],

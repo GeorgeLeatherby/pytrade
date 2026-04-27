@@ -4184,13 +4184,13 @@ class TradingEnv(gym.Env):
                 
             # One-hot asset-ID vector: shape [num_assets]. Argmax is invariant to VecNormalize
             # affine transforms, so the embedding lookup inside InputMLPFeatures is always correct.
-            one_hot = np.zeros(self.market_data_cache.num_assets, dtype=np.float32)
-            one_hot[self.selected_asset_index] = 1.0
+            one_hot_asset_id = np.zeros(self.market_data_cache.num_assets, dtype=np.float32)
+            one_hot_asset_id[self.selected_asset_index] = 1.0
 
             observation = np.concatenate([
                 features,
                 portfolio_features,
-                one_hot,
+                one_hot_asset_id,
             ]).astype(np.float32)
 
             return observation
