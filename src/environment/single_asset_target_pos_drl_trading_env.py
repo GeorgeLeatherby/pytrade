@@ -1585,7 +1585,12 @@ class TradingEnv(gym.Env):
                 portfolio_obs_size = num_portfolio_features  # Single step portfolio features
             
         # Single flattened observation space for maximum performance
-        total_obs_size = asset_obs_size + portfolio_obs_size
+        # EXECUTION_SINGLE_ASSET_TARGET_POS appends a one-hot asset-ID block (num_assets dims)
+        # so the policy can learn asset-specific behaviour via nn.Embedding inside the extractor.
+        if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
+            total_obs_size = asset_obs_size + portfolio_obs_size + num_assets
+        else:
+            total_obs_size = asset_obs_size + portfolio_obs_size
         self.observation_space = spaces.Box(
             low=-np.inf, 
             high=np.inf, 
@@ -4177,9 +4182,15 @@ class TradingEnv(gym.Env):
                 portfolio_features = np.nan_to_num(portfolio_features, nan=0.0, posinf=0.0, neginf=0.0)
                 print(f"Warning: Non-finite portfolio feature values encountered at step {internal_step}. Replaced with zeros.")
                 
+            # One-hot asset-ID vector: shape [num_assets]. Argmax is invariant to VecNormalize
+            # affine transforms, so the embedding lookup inside InputMLPFeatures is always correct.
+            one_hot = np.zeros(self.market_data_cache.num_assets, dtype=np.float32)
+            one_hot[self.selected_asset_index] = 1.0
+
             observation = np.concatenate([
                 features,
-                portfolio_features
+                portfolio_features,
+                one_hot,
             ]).astype(np.float32)
 
             return observation
