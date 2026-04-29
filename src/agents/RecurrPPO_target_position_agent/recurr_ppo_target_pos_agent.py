@@ -1006,3 +1006,175 @@ def run(cache, config: Dict[str, Any]) -> Dict[str, Any]:
         "gae_lambda": float(agent_cfg.get("gae_lambda", 0.95)),
         "lstm_hidden_size": int(agent_cfg.get("policy_kwargs", {}).get("lstm_hidden_size", 128)),
     }
+
+
+def continue_run(cache, config: Dict[str, Any], model_path: str, saved_models_dir: str, model_dir_name: str) -> Dict[str, Any]:
+    """
+    Continue training from a saved model checkpoint.
+    
+    Process:
+    1) Build training and evaluation environments (same as fresh training).
+    2) Load VecNormalize stats from saved pickle file.
+    3) Load the pre-trained RecurrentPPO model from .zip file.
+    4) Continue training for configured total timesteps, evaluating periodically.
+    5) Save updated model; return summary dict.
+    
+    Args:
+        cache: MarketDataCache from main.py (duck-typed).
+        config: dict containing environment, saa_features, agent, training settings.
+        model_path: path to best_model.zip file.
+        saved_models_dir: path to saved_models directory.
+        model_dir_name: name of the model directory (e.g., "00181_config_01033_26_04_28").
+    
+    Returns:
+        dict with summary: paths, timings, and key hyperparameters used.
+    """
+    # Set seeds for reproducibility (PyTorch, NumPy, env wrappers)
+    seed = int(config.get("training", {}).get("seed", 42))
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    gamma_cfg = config.get("agent", {}).get("gamma", 0.99)
+    train_cfg = config.get("training", {})
+
+    # Parallel env configuration (strict)
+    n_envs = int(train_cfg.get("n_envs", 1))
+    if n_envs < 1:
+        raise ValueError(f"training.n_envs must be >= 1, got {n_envs}")
+
+    vec_env_start_method = str(train_cfg.get("vec_env_start_method", "spawn"))
+    if vec_env_start_method not in ("spawn", "fork", "forkserver"):
+        raise ValueError(
+            f"training.vec_env_start_method must be one of "
+            f"('spawn', 'fork', 'forkserver'), got '{vec_env_start_method}'"
+        )
+
+    # Build vectorized train envs; each worker gets a unique seed
+    def make_train(rank: int):
+        def _init():
+            return build_env(cache, config, seed=seed + rank, for_eval=False)
+        return _init
+
+    def make_eval():
+        return build_env(cache, config, seed=seed + 1, for_eval=True)
+
+    train_env_fns = [make_train(i) for i in range(n_envs)]
+
+    # Strict behavior: choose vec env implementation explicitly
+    if n_envs == 1:
+        base_train_vec = DummyVecEnv(train_env_fns)
+    else:
+        base_train_vec = SubprocVecEnv(train_env_fns, start_method=vec_env_start_method)
+
+    base_eval_vec = DummyVecEnv([make_eval])
+
+    # Create VecNormalize wrappers
+    vec_train = VecNormalize(
+        base_train_vec,
+        norm_obs=True,
+        norm_reward=True,
+        clip_obs=10.0,
+        clip_reward=np.inf,
+        gamma=gamma_cfg,
+    )
+
+    vec_eval = VecNormalize(
+        base_eval_vec,
+        training=False,
+        norm_obs=True,
+        norm_reward=False,
+        clip_obs=10.0,
+        clip_reward=np.inf,
+        gamma=gamma_cfg,
+    )
+
+    # Load VecNormalize stats from saved pickle file
+    vecnorm_path = os.path.join(saved_models_dir, model_dir_name, "best_model_vecnormalize.pkl")
+    if not os.path.isfile(vecnorm_path):
+        raise FileNotFoundError(f"VecNormalize stats not found at {vecnorm_path}")
+    
+    # Load training VecNormalize stats
+    vec_train = VecNormalize.load(vecnorm_path, venv=base_train_vec)
+    
+    # Load evaluation VecNormalize stats (same file, but for eval env)
+    vec_eval = VecNormalize.load(vecnorm_path, venv=base_eval_vec)
+    vec_eval.training = False  # Ensure eval mode
+
+    # Load the pre-trained model
+    if not os.path.isfile(model_path):
+        raise FileNotFoundError(f"Model not found at {model_path}")
+    
+    model = RecurrentPPO.load(model_path, env=vec_train)
+
+    # Extract tb_log_name from model directory name
+    tb_log_name = model_dir_name
+    
+    # Setup eval callback with same directory (to continue saving to the best_model checkpoint)
+    best_model_dir = os.path.join(saved_models_dir, model_dir_name)
+    eval_cb = build_eval_callback(vec_eval, config, best_model_dir)
+
+    # Entropy schedule callback (if parameters present)
+    acfg = config.get("agent", {})
+    if all(k in acfg for k in ("ent_coef_start", "ent_coef_end", "ent_coef_schedule_warmup_pct", "ent_coef_schedule_ramping_pct")):
+        ent_cb = EntropyScheduleCallback(
+            start=float(acfg["ent_coef_start"]),
+            end=float(acfg["ent_coef_end"]),
+            warmup_pct=float(acfg["ent_coef_schedule_warmup_pct"]),
+            ramping_pct=float(acfg["ent_coef_schedule_ramping_pct"]),
+        )
+    else:
+        ent_cb = None
+
+    # Training metrics callback with throttling
+    train_log_freq = int(train_cfg.get("train_log_freq", 50))
+    train_tb_cb = EpisodePortfolioSB3LoggerCallback(
+        tag_prefix="train", 
+        log_freq=train_log_freq
+    )
+
+    # Progress sync callback
+    progress_sync_cb = ProgressSyncCallback()
+
+    # Build callback list
+    if ent_cb is not None:
+        callback = [eval_cb, ent_cb, progress_sync_cb, train_tb_cb]
+    else:
+        callback = [eval_cb, progress_sync_cb, train_tb_cb]
+
+    # ----------- Continue Training -----------------
+    total_timesteps = int(config.get("training", {}).get("total_timesteps", 300_000))
+
+    # Start time
+    t0 = time.time()
+
+    # Continue training with callbacks
+    model.learn(
+        total_timesteps=total_timesteps, 
+        callback=callback, 
+        progress_bar=True,
+        tb_log_name=tb_log_name
+    )
+    
+    # End time
+    t1 = time.time()
+
+    # Save updated model (overwrite existing checkpoint)
+    model.save(model_path)
+
+    # Return summary (printed in main.py)
+    agent_cfg = config.get("agent", {})
+    return {
+        "agent": "RecurrPPO_target_position_agent (CONTINUED)",
+        "policy": "MlpLstmPolicy",
+        "continued_from_model": model_dir_name,
+        "total_timesteps": total_timesteps,
+        "elapsed_sec": round(t1 - t0, 2),
+        "model_path": model_path,
+        "tb_log_name": tb_log_name,
+        "config_id": config.get("training", {}).get("config_id", "unknown"),
+        "n_steps": int(agent_cfg.get("n_steps", 128)),
+        "batch_size": int(agent_cfg.get("batch_size", 256)),
+        "gamma": float(agent_cfg.get("gamma", 0.99)),
+        "gae_lambda": float(agent_cfg.get("gae_lambda", 0.95)),
+        "lstm_hidden_size": int(agent_cfg.get("policy_kwargs", {}).get("lstm_hidden_size", 128)),
+    }

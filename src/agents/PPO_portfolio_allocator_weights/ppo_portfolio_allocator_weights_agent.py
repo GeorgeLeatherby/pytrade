@@ -2456,3 +2456,220 @@ def run(cache: MarketDataCache, config: Dict[str, Any]) -> Dict[str, Any]:
         "num_assets": len(config.get("environment", {}).get("assets", [])),
         "training_completed": True
     }
+
+
+def continue_run(cache: MarketDataCache, config: Dict[str, Any], model_path: str, saved_models_dir: str, model_dir_name: str) -> Dict[str, Any]:
+    """
+    Continue training from a saved PPO allocator model checkpoint.
+    
+    Process:
+    1. Load pre-trained SAA models from config (frozen for inference)
+    2. Build allocator environments with SAA ensemble
+    3. Load VecNormalize stats from saved pickle file
+    4. Load the pre-trained PPO model from .zip file
+    5. Continue training for configured total timesteps with evaluation callbacks
+    6. Save updated model; return summary dict
+    
+    Args:
+        cache: MarketDataCache from main.py
+        config: Full configuration dict (allocator_*, environment, etc.)
+        model_path: path to best_model.zip file
+        saved_models_dir: path to saved_models directory
+        model_dir_name: name of the model directory
+    
+    Returns:
+        Summary dict with training results, model path, timing, hyperparameters
+    """
+    
+    # --- Seeds & Gamma Extraction ---
+    seed = int(config.get("training", {}).get("seed", 42))
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    gamma_cfg = config.get("portfolio_allocator_agent", {}).get("gamma", 0.99)
+    saa_config = config.get("saa_config", {})
+    num_assets = cache.num_assets
+    raw_feature_dim = cache.num_features
+    
+    # Load frozen SAA once (required for PAA to function)
+    saa_model, saa_vecnorm, saa_device = _load_saa_from_config(saa_config)
+
+    # --- Build Environments for train/validation ---
+    print("[continue_run] Building training and evaluation environments...")
+    def make_env(mode: str):
+        return lambda: TradingEnv(
+            config=config, 
+            market_data_cache=cache, 
+            mode=mode
+        )
+    
+    # Create raw (not normalized) vectorized environments
+    vec_train_raw = DummyVecEnv([make_env("train")])
+    vec_eval_raw = DummyVecEnv([make_env("validation")])
+
+    # Wrap envs with SAA signal injection
+    vec_train_saa = SAASignalWrapper(
+        vec_train_raw, saa_model, saa_vecnorm, num_assets, saa_device, config=config, 
+        feature_to_index=cache.feature_to_index
+    )
+    vec_eval_saa = SAASignalWrapper(
+        vec_eval_raw, saa_model, saa_vecnorm, num_assets, saa_device, config=config, 
+        feature_to_index=cache.feature_to_index
+    )
+    
+    # Create VecNormalize wrappers
+    vec_train = VecNormalize(
+        vec_train_saa,
+        norm_obs=True,
+        norm_reward=True,
+        clip_obs=10.0,
+        clip_reward=10.0,
+        gamma=gamma_cfg,
+        training=True,
+    )
+    vec_eval = VecNormalize(
+        vec_eval_saa,
+        norm_obs=True,
+        norm_reward=False,
+        clip_obs=10.0,
+        clip_reward=10.0,
+        gamma=gamma_cfg,
+        training=False,
+    )
+
+    # Load VecNormalize stats from saved pickle file
+    vecnorm_path = os.path.join(saved_models_dir, model_dir_name, "vecnormalize_stats.pkl")
+    if not os.path.isfile(vecnorm_path):
+        raise FileNotFoundError(f"VecNormalize stats not found at {vecnorm_path}")
+    
+    # Load training VecNormalize stats
+    vec_train = VecNormalize.load(vecnorm_path, venv=vec_train_saa)
+    vec_train.training = True
+    vec_train.norm_reward = True
+    
+    # Load evaluation VecNormalize stats (same file)
+    vec_eval = VecNormalize.load(vecnorm_path, venv=vec_eval_saa)
+    vec_eval.training = False
+    vec_eval.norm_reward = False
+
+    # Load the pre-trained model
+    if not os.path.isfile(model_path):
+        raise FileNotFoundError(f"Model not found at {model_path}")
+    
+    model = PPO.load(model_path, env=vec_train)
+
+    # Extract tb_log_name from model directory name
+    tb_log_name = model_dir_name
+    
+    # Setup eval callback with same directory (continues saving to the best_model checkpoint)
+    best_model_dir = os.path.join(saved_models_dir, model_dir_name)
+    eval_callback = build_allocator_eval_callback(
+        eval_env=vec_eval,
+        config=config,
+        log_dir=best_model_dir
+    )
+
+    # Entropy schedule callback (if parameters present)
+    agent_cfg = config.get("portfolio_allocator_agent", {})
+    ent_schedule_keys = ("ent_coef_start", "ent_coef_end", "ent_coef_schedule_warmup_pct", "ent_coef_schedule_ramping_pct")
+    
+    if all(k in agent_cfg for k in ent_schedule_keys):
+        ent_callback = EntropyScheduleCallback(
+            start=float(agent_cfg["ent_coef_start"]),
+            end=float(agent_cfg["ent_coef_end"]),
+            warmup_pct=float(agent_cfg["ent_coef_schedule_warmup_pct"]),
+            ramping_pct=float(agent_cfg["ent_coef_schedule_ramping_pct"]),
+            verbose=int(agent_cfg.get("verbose", 1))
+        )
+        print("[continue_run] Entropy schedule callback enabled")
+    else:
+        ent_callback = None
+        print("[continue_run] Entropy schedule callback disabled (missing config keys)")
+    
+    # Training metrics callback
+    train_cfg = config.get("training", {})
+    train_log_freq = int(train_cfg.get("train_log_freq", 10))
+    
+    train_callback = AllocatorPortfolioLoggerCallback(
+        tag_prefix="train",
+        log_freq=train_log_freq,
+        verbose=int(agent_cfg.get("verbose", 1))
+    )
+    
+    # Build callback list
+    callbacks = [eval_callback, train_callback]
+    if ent_callback is not None:
+        callbacks.append(ent_callback)
+    
+    print(f"[continue_run] Registered {len(callbacks)} callbacks for training")
+    
+    # --- Continue Training ---
+    
+    total_timesteps = int(train_cfg.get("total_timesteps", 2_000_000))
+    verbose = int(agent_cfg.get("verbose", 1))
+    
+    print(f"\n[continue_run] Continuing training: {total_timesteps} timesteps")
+    print(f"[continue_run] Verbose level: {verbose}")
+    
+    # Record start time
+    t0 = time.time()
+    
+    # Continue training with callbacks
+    model.learn(
+        total_timesteps=total_timesteps,
+        callback=callbacks,
+        progress_bar=True,
+        tb_log_name=tb_log_name
+    )
+    
+    # Record end time
+    t1 = time.time()
+    elapsed_seconds = round(t1 - t0, 2)
+    
+    print(f"[continue_run] Training completed in ({elapsed_seconds / 60:.1f} minutes)")
+    
+    # --- Save Updated Model ---
+    
+    # Save updated model back to same path
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)
+    model.save(model_path)
+    print(f"[continue_run] Updated model saved to {model_path}")
+    
+    # --- Return Summary ---
+    
+    n_steps = int(agent_cfg.get("n_steps", 2048))
+    batch_size = int(agent_cfg.get("batch_size", 256))
+    n_epochs = int(agent_cfg.get("n_epochs", 6))
+    gamma = float(agent_cfg.get("gamma", 0.99))
+    gae_lambda = float(agent_cfg.get("gae_lambda", 0.95))
+    lr_start = float(agent_cfg.get("learning_rate_start", 3e-4))
+    lr_end = float(agent_cfg.get("learning_rate_end", 3e-5))
+    
+    transformer_cfg = config.get("allocator_transformer", {})
+    d_model = int(transformer_cfg.get("d_model", 128))
+    n_heads = int(transformer_cfg.get("n_heads", 8))
+    n_layers = int(transformer_cfg.get("n_layers", 4))
+    
+    return {
+        "agent": "PPO_portfolio_allocator (CONTINUED)",
+        "policy": "TransformerAllocatorPolicy",
+        "continued_from_model": model_dir_name,
+        "total_timesteps": total_timesteps,
+        "elapsed_sec": elapsed_seconds,
+        "model_path": model_path,
+        "best_model_path": os.path.join(best_model_dir, "best_model.zip"),
+        "tb_log_name": tb_log_name,
+        "config_id": config.get("training", {}).get("config_id", "unknown"),
+        "n_steps": n_steps,
+        "batch_size": batch_size,
+        "n_epochs": n_epochs,
+        "gamma": gamma,
+        "gae_lambda": gae_lambda,
+        "learning_rate_start": lr_start,
+        "learning_rate_end": lr_end,
+        "d_model": d_model,
+        "n_heads": n_heads,
+        "n_layers": n_layers,
+        "num_assets": len(config.get("environment", {}).get("assets", [])),
+        "training_continued": True
+    }
