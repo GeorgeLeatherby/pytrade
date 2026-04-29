@@ -15,7 +15,8 @@
         "lambda_drawdown": 2.0,
         "sortino_net_reward_mix": 0.4,
 
-        "percentage_of_cash_only_starts": 0.10,
+        "percentage_of_cash_only_starts": 0.1,
+        "min_initial_cash_allocation": 0.1,
 
         "execution_min_share_threshold": 1,
         "execution_min_trade_value_threshold": 50.0,

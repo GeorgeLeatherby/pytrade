@@ -11,7 +11,7 @@
         "block_buffer_multiplier": 1.0,
         "test_val_split_ratio": 0.2,
 
-        "sortino_eta": 0.018,
+        "sortino_eta": 0.05,
         "lambda_drawdown": 2.0,
         "sortino_net_reward_mix": 0.4,
 
@@ -114,7 +114,7 @@
         "clip_schedule_warmup_pct": 0.4,
         "clip_schedule_ramping_pct": 0.6,
 
-        "ent_coef_start": 0.12,
+        "ent_coef_start": 0.16,
         "ent_coef_end": 0.01,
         "ent_coef_schedule_type": "linear",
         "ent_coef_schedule_warmup_pct": 0.3,
@@ -140,8 +140,8 @@
         "n_eval_episodes": 200,
         "eval_deterministic": true,
         "progress_bar": true,
-        "config_id": 1032,
-        "action_l2_penalty_coeff": 0.0
+        "config_id": 1033,
+        "action_l2_penalty_coeff": 0.001
     }
 
 }

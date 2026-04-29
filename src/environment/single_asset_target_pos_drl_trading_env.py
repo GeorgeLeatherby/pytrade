@@ -3133,25 +3133,30 @@ class TradingEnv(gym.Env):
             saa_cash_before, saa_cash_after, action
             ):
         
-        # # Calculate the SAA step reward
-        # # ---------- Differential Sortino ratio components ----------
-        # # Get simple returns
-        # saa_portfolio_return_absolut = (selected_asset_notional_after + saa_cash_after) / (selected_asset_notional_before + saa_cash_before) - 1.0
-        # # portfolio_return_log = np.log(portfolio_return) if portfolio_return > 0 else -np.inf
-        # # 1. Update EMAs
-        # saa_delta = saa_portfolio_return_absolut - self.saa_running_mean_ema
-        # self.saa_running_mean_ema += self.sortino_eta * saa_delta
+        # Calculate the SAA step reward
+        # ---------- Differential Sortino ratio components ----------
+        # Get simple returns
+        saa_portfolio_return_absolut = (selected_asset_notional_after + saa_cash_after) / (selected_asset_notional_before + saa_cash_before) - 1.0
+        # portfolio_return_log = np.log(portfolio_return) if portfolio_return > 0 else -np.inf
+        # 1. Update EMAs
+        saa_delta = saa_portfolio_return_absolut - self.saa_running_mean_ema
+        self.saa_running_mean_ema += self.sortino_eta * saa_delta
 
-        # # Alternative: use squared downside returns
-        # saa_downside_sq = (min(saa_portfolio_return_absolut, 0.0))**2
-        # self.saa_running_downside_variance_ema += self.sortino_eta * (saa_downside_sq - self.saa_running_downside_variance_ema)
-        # downside_var_floor = 1e-6
-        # saa_downside_var = max(self.saa_running_downside_variance_ema, downside_var_floor)
-        # current_sortino = self.saa_running_mean_ema / np.sqrt(saa_downside_var)
+        # Alternative: use squared downside returns
+        saa_downside_sq = (min(saa_portfolio_return_absolut, 0.0))**2
+        self.saa_running_downside_variance_ema += self.sortino_eta * (saa_downside_sq - self.saa_running_downside_variance_ema)
+        downside_var_floor = 1e-6
+        saa_downside_var = max(self.saa_running_downside_variance_ema, downside_var_floor)
+        current_sortino = self.saa_running_mean_ema / np.sqrt(saa_downside_var)
 
-        # # 3. Calc Differential Sortino for reward
-        # saa_sortino_reward = current_sortino - self.saa_previous_sortino
-        # self.saa_previous_sortino = current_sortino
+        # 3. Calc Differential Sortino for reward
+        saa_sortino_reward = current_sortino - self.saa_previous_sortino
+        self.saa_previous_sortino = current_sortino
+
+        eps = 1e-12
+        
+        # Calc logarithmic differential sortino reward
+        log_diff_sortino_reward = np.log(max(current_sortino, eps)) - np.log(max(self.saa_previous_sortino, eps))
 
         # Mix Sortino with other metrics to get risk-aware non-deterministic policy
         """Calculate dynamic risk window. Use self.reward_risk_window and the current step to produce
@@ -3178,7 +3183,6 @@ class TradingEnv(gym.Env):
         # gain = float(3.5)
         # saa_reward = float(np.tanh(gain * reward))
 
-        eps = 1e-12
         prev_value = float(selected_asset_notional_before + saa_cash_before)
         next_value = float(selected_asset_notional_after + saa_cash_after)
 
@@ -3205,6 +3209,8 @@ class TradingEnv(gym.Env):
         # Simple log return reward
         saa_reward_raw = 50 * saa_excess_log_return  # Scale factor to get reasonable reward magnitudes
 
+        scaled_log_diff_sortino = 50 * log_diff_sortino_reward
+
         """Calculate dynamic risk window. Use self.reward_risk_window and the current step to produce
         behaviour which starts at 2 raises with the steps up to maximum risk_reward_window"""
         if self.current_step <= 2:
@@ -3218,7 +3224,7 @@ class TradingEnv(gym.Env):
         differential_sharpe_ratio = sharpe_ratio - self.previous_saa_sharpe_ratio
         self.previous_saa_sharpe_ratio = sharpe_ratio
 
-        saa_reward_raw = 1.5 * (saa_reward_raw - ((abs(action) * (1 / self.action_limiting_factor_start)) * self.action_l2_penalty_coeff) + (differential_sharpe_ratio * self.saa_differential_sharpe_ratio_weight) - max_drawdown_penalty)
+        saa_reward_raw = 1.0 * (saa_reward_raw + scaled_log_diff_sortino - ((abs(action) * (1 / self.action_limiting_factor_start)) * self.action_l2_penalty_coeff) + (differential_sharpe_ratio * self.saa_differential_sharpe_ratio_weight) - max_drawdown_penalty)
 
         saa_reward = np.tanh(saa_reward_raw / 2.0) * 2.0 # Scale to [-2, 2] range
         
