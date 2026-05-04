@@ -32,29 +32,29 @@
 > **Key Question:** How do you mathematically ensure the agent's actions remain within valid budget constraints (sum to 1, no shorting unless specified)?
 
 ## 4. Proposed Hierarchical Architecture
-* **4.1 Layer 1: Temporal Extraction Module (Single-Asset):** A shared-weight recurrent network (LSTM) for per-asset pattern recognition[cite: 33].
-* **4.2 Layer 2: Cross-Sectional Allocator (Portfolio-Level):** Self-attention mechanisms to coordinate the extracted features into a portfolio[cite: 34, 35].
+* **4.1 Layer 1: Temporal Extraction Module (Single-Asset):** A shared-weight recurrent network (LSTM) for per-asset pattern recognition[cite: 33]. This layer is recurrent by algorithm since it is using sb3-contrib RecurrentPPO and recurrent by the 2 lstm layers.
+* **4.2 Layer 2: Cross-Sectional Allocator (Portfolio-Level):** Self-attention mechanisms to coordinate the extracted features into a portfolio[cite: 34, 35]. Uses the output of frozen SAAs as features. 
 * **4.3 Information Flow:** How the temporal embeddings are concatenated and passed to the attention head.
 
 > **Prof's Tip:** This is the "concept" section. Use diagrams to show the flow. Explain why a *shared* network for Layer 1 acts as a regularizer—learning "universal" asset behavior rather than overfitting to one stock.
 > **Key Question:** Why is the separation of "history" (Layer 1) and "context" (Layer 2) architecturally superior to a monolithic Transformer?[cite: 24, 37].
 
 ## 5. The PyTrade Environment & Implementation
-* **5.1 Simulator Design:** Building a Gymnasium-compliant environment for experimental control[cite: 16, 32].
-* **5.2 Friction Modeling:** Mathematical implementation of commissions, spreads, and market impact[cite: 15, 30].
+* **5.1 Simulator Design:** Building a Gymnasium-compliant environment for experimental control[cite: 16, 32]. Find out here what the best way is to describe a custom environment. 
+* **5.2 Friction Modeling:** Mathematical implementation of commissions, spreads, and market impact[cite: 15, 30]. Best to simply give the "checking graphs" of actually occured costs as proof. Still explain th elogic used.
 * **5.3 Asset Universe:** Selection of the 11 instruments (2000-2025) and the rationale for their diversity[cite: 27, 28].
 
 > **Prof's Tip:** High-quality code is expected. Discuss your "walk-forward" implementation and how you prevent data leakage (purging and embargoing)[cite: 15].
 > **Key Question:** How does the simulator handle the "path-dependency" of transaction costs?[cite: 7].
 
 ## 6. Empirical Evaluation & Ablation Studies
-* **6.1 Baseline:** Cross-sectional only (no temporal memory)[cite: 39].
+* **6.1 Baseline:** Cross-sectional only (no temporal memory)[cite: 39]. Just PPO on setup without SAA addition.
 * **6.2 Monolithic Baseline:** Standard end-to-end recurrent PPO[cite: 42].
 * **6.3 The "Control" Test:** Hierarchical setup with randomized temporal signals.
-* **6.4 The Proposed Hierarchical Model:** Modular memory + Cross-sectional attention[cite: 40].
+* **6.4 The Proposed Hierarchical Model:** Modular memory + Cross-sectional attention[cite: 40]. SAA and PAA together.
 
 > **Prof's Tip:** This is where you earn your grade. If the "Control" (randomized signal) performs well, your model is just finding lucky noise. You must prove the Hierarchical model wins because of *information*.
-> **Key Question:** Does the hierarchical model show faster convergence (sample efficiency) compared to the monolithic approach?[cite: 37, 43].
+> **Key Question:** Does the hierarchical model show faster convergence (sample efficiency) compared to the monolithic approach?[cite: 37, 43]. What about final performance?
 
 ## 7. Results & Financial Interpretation
 * **7.1 Performance Metrics:** Sharpe Ratio, Sortino Ratio, and Max Drawdown[cite: 43].

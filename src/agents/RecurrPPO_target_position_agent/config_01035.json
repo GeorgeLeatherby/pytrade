@@ -119,8 +119,8 @@
         "ent_coef_schedule_warmup_pct": 0.3,
         "ent_coef_schedule_ramping_pct": 0.6,
 
-        "action_limiting_factor_start": 0.4,
-        "action_limiting_factor_end": 0.4,
+        "action_limiting_factor_start": 0.2,
+        "action_limiting_factor_end": 0.2,
         "action_limiting_factor_schedule_type": "linear",
         "action_limiting_factor_schedule_warmup_pct": 0.3,
         "action_limiting_factor_schedule_ramping_pct": 0.6,
@@ -139,8 +139,8 @@
         "n_eval_episodes": 200,
         "eval_deterministic": true,
         "progress_bar": true,
-        "config_id": 1033,
-        "action_l2_penalty_coeff": 0.001
+        "config_id": 1035,
+        "action_l2_penalty_coeff": 0.007
     }
 
 }

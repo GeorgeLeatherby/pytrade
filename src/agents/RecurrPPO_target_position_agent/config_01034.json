@@ -139,8 +139,8 @@
         "n_eval_episodes": 200,
         "eval_deterministic": true,
         "progress_bar": true,
-        "config_id": 1033,
-        "action_l2_penalty_coeff": 0.001
+        "config_id": 1034,
+        "action_l2_penalty_coeff": 0.005
     }
 
 }
