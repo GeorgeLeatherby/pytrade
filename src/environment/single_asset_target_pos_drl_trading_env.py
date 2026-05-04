@@ -3207,24 +3207,25 @@ class TradingEnv(gym.Env):
         saa_excess_log_return = saa_log_return - passive_log_return
 
         # Simple log return reward
-        saa_reward_raw = 50 * saa_excess_log_return  # Scale factor to get reasonable reward magnitudes
+        saa_excess_return_scaled = 50 * saa_excess_log_return  # Scale factor to get reasonable reward magnitudes
 
-        scaled_log_diff_sortino = 50 * log_diff_sortino_reward
+        # scaled_log_diff_sortino = 50 * log_diff_sortino_reward
 
-        """Calculate dynamic risk window. Use self.reward_risk_window and the current step to produce
-        behaviour which starts at 2 raises with the steps up to maximum risk_reward_window"""
-        if self.current_step <= 2:
-            risk_metric_window = 2
-        else:
-            risk_metric_window = min(self.current_step, self.max_reward_risk_window)
+        # """Calculate dynamic risk window. Use self.reward_risk_window and the current step to produce
+        # behaviour which starts at 2 raises with the steps up to maximum risk_reward_window"""
+        # if self.current_step <= 2:
+        #     risk_metric_window = 2
+        # else:
+        #     risk_metric_window = min(self.current_step, self.max_reward_risk_window)
 
-        sharpe_ratio = self.episode_buffer.calculate_sharpe_ratio(
-            window=risk_metric_window
-        )
-        differential_sharpe_ratio = sharpe_ratio - self.previous_saa_sharpe_ratio
-        self.previous_saa_sharpe_ratio = sharpe_ratio
+        # sharpe_ratio = self.episode_buffer.calculate_sharpe_ratio(
+        #    window=risk_metric_window)
+        # differential_sharpe_ratio = sharpe_ratio - self.previous_saa_sharpe_ratio
+        # self.previous_saa_sharpe_ratio = sharpe_ratio
 
-        saa_reward_raw = 1.0 * (saa_reward_raw + scaled_log_diff_sortino - ((abs(action) * (1 / self.action_limiting_factor_start)) * self.action_l2_penalty_coeff) + (differential_sharpe_ratio * self.saa_differential_sharpe_ratio_weight) - max_drawdown_penalty)
+        # saa_reward_raw = 1.0 * (saa_excess_return_scaled + scaled_log_diff_sortino - ((abs(action) * (1 / self.action_limiting_factor_start)) * self.action_l2_penalty_coeff) + (differential_sharpe_ratio * self.saa_differential_sharpe_ratio_weight) - max_drawdown_penalty)
+
+        saa_reward_raw = 50.0 * (log_diff_sortino_reward - max_drawdown_penalty)
 
         saa_reward = np.tanh(saa_reward_raw / 2.0) * 2.0 # Scale to [-2, 2] range
         
