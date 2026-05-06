@@ -1444,6 +1444,7 @@ class TradingEnv(gym.Env):
         self.lambda_transaction_cost = float(config["environment"].get("lambda_transaction_cost", 0.0))
         self.action_forgiveness_width_sigma = config["environment"].get("action_forgiveness_width_sigma", None)  # Width of forgiveness zone in terms of action space std dev
         self.action_hold_reward_weight_omega = config["environment"].get("action_hold_reward_weight_omega", None)  # Weight for holding action reward
+        self.lambda_execution_gap = config["environment"].get("lambda_execution_gap", None)  # Penalty coefficient for execution gap (difference between target and executed weights)
 
         self.previous_max_drawdown = None
         self.saa_previous_max_drawdown = None
@@ -3232,7 +3233,13 @@ class TradingEnv(gym.Env):
         # action_holding_reward = self.action_hold_reward_weight_omega * np.exp(-(action**2) / (2 * (self.action_forgiveness_width_sigma**2)))
         action_holding_reward = self.action_hold_reward_weight_omega * (1 - abs(action)**2)
 
-        saa_reward_raw = (saa_excess_return_scaled - max_drawdown_penalty + action_holding_reward)
+        # Execution gap penalty: penalizes deviation between requested and executed action
+        total_value_before = float(selected_asset_notional_before + saa_cash_before)
+        action_executed = float(delta_selected_asset_notional / max(total_value_before, eps))
+        execution_gap_penalty = float(self.lambda_execution_gap * abs(action - action_executed))
+        
+
+        saa_reward_raw = (saa_excess_return_scaled - max_drawdown_penalty - execution_gap_penalty)
 
         saa_reward = np.tanh(saa_reward_raw / 2.0) * 2.0 # Scale to [-2, 2] range
         
