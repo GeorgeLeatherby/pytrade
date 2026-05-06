@@ -12,8 +12,10 @@
         "test_val_split_ratio": 0.2,
 
         "sortino_eta": 0.05,
-        "lambda_drawdown": 4.0,
+        "lambda_drawdown": 0.4,
         "sortino_net_reward_mix": 0.4,
+        "action_forgiveness_width_sigma": 0.25,
+        "action_hold_reward_weight_omega": 0.05,
 
         "percentage_of_cash_only_starts": 0.10,
         "min_initial_cash_allocation": 0.1,
@@ -139,7 +141,7 @@
         "n_eval_episodes": 200,
         "eval_deterministic": true,
         "progress_bar": true,
-        "config_id": 1037,
+        "config_id": 1041,
         "action_l2_penalty_coeff": 0.0
     }
 

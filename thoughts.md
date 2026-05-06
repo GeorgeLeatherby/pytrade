@@ -60,3 +60,6 @@ Apply smoother width sizing within the narrowing critic network path. Try reduci
 
 ## PAA ideas:
 - Introduce route critical info of last requested weights! That way the agent might also learn how the env is applying its output!
+
+## Reward idea
+funktion +1 when action output 0 and 0 when 1/-1

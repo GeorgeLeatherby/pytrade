@@ -32,7 +32,7 @@
 > **Key Question:** How do you mathematically ensure the agent's actions remain within valid budget constraints (sum to 1, no shorting unless specified)?
 
 ## 4. Proposed Hierarchical Architecture
-* **4.1 Layer 1: Temporal Extraction Module (Single-Asset):** A shared-weight recurrent network (LSTM) for per-asset pattern recognition[cite: 33]. This layer is recurrent by algorithm since it is using sb3-contrib RecurrentPPO and recurrent by the 2 lstm layers.
+* **4.1 Layer 1: Temporal Extraction Module (Single-Asset):** A shared-weight recurrent network (LSTM) for per-asset pattern recognition[cite: 33]. This layer is recurrent by algorithm since it is using sb3-contrib RecurrentPPO and recurrent by the 2 lstm layers. Since PPO is so sensitive to changes in reward structure a significant part of work was finding a well-tuned reward composition. There have been countless training runs with collapsed policies of the SAA either to buy or sell only strategies.
 * **4.2 Layer 2: Cross-Sectional Allocator (Portfolio-Level):** Self-attention mechanisms to coordinate the extracted features into a portfolio[cite: 34, 35]. Uses the output of frozen SAAs as features. 
 * **4.3 Information Flow:** How the temporal embeddings are concatenated and passed to the attention head.
 

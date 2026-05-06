@@ -1442,6 +1442,8 @@ class TradingEnv(gym.Env):
         # -lambda_spread * sum_i(w_i * log(w_i + 1e-8)).
         self.lambda_spread = float(config["environment"].get("lambda_spread", 0.0))
         self.lambda_transaction_cost = float(config["environment"].get("lambda_transaction_cost", 0.0))
+        self.action_forgiveness_width_sigma = config["environment"].get("action_forgiveness_width_sigma", None)  # Width of forgiveness zone in terms of action space std dev
+        self.action_hold_reward_weight_omega = config["environment"].get("action_hold_reward_weight_omega", None)  # Weight for holding action reward
 
         self.previous_max_drawdown = None
         self.saa_previous_max_drawdown = None
@@ -2961,7 +2963,7 @@ class TradingEnv(gym.Env):
             window=risk_metric_window
         )
 
-        max_drawdown_delta = max(0.0, max_drawdown - self.previous_max_drawdown)
+        max_drawdown_delta = max(0.0, np.log(max_drawdown) - np.log(self.previous_max_drawdown))
         self.previous_max_drawdown = max_drawdown
         max_drawdown_penalty = float(self.lambda_drawdown * max_drawdown_delta)
 
@@ -2979,8 +2981,7 @@ class TradingEnv(gym.Env):
         excess_log_ret = port_log_ret - comp_log_ret
 
         # Risk control: penalize worsening drawdown (incremental only)
-        reward = float(excess_log_ret - self.lambda_drawdown * max_drawdown_delta)
-
+        reward = float(excess_log_ret - max_drawdown_penalty)
 
         # # 4b. Concentration term on executed normalized weights.
         # # action is expected to be the already-normalized execution target w.
@@ -3209,7 +3210,7 @@ class TradingEnv(gym.Env):
         # Simple log return reward
         saa_excess_return_scaled = 50 * saa_excess_log_return  # Scale factor to get reasonable reward magnitudes
 
-        # scaled_log_diff_sortino = 50 * log_diff_sortino_reward
+        scaled_log_diff_sortino = 50 * log_diff_sortino_reward
 
         # """Calculate dynamic risk window. Use self.reward_risk_window and the current step to produce
         # behaviour which starts at 2 raises with the steps up to maximum risk_reward_window"""
@@ -3225,7 +3226,12 @@ class TradingEnv(gym.Env):
 
         # saa_reward_raw = 1.0 * (saa_excess_return_scaled + scaled_log_diff_sortino - ((abs(action) * (1 / self.action_limiting_factor_start)) * self.action_l2_penalty_coeff) + (differential_sharpe_ratio * self.saa_differential_sharpe_ratio_weight) - max_drawdown_penalty)
 
-        saa_reward_raw = 50.0 * (log_diff_sortino_reward - max_drawdown_penalty)
+        # Action hold reward: small positive reward for taking action close to zero (holding)
+        # Calculate the continuous Gaussian reward
+        # Peak of 'hold_reward_weight' at action=0, decaying as action moves away
+        action_holding_reward = self.action_hold_reward_weight_omega * np.exp(-(action**2) / (2 * (self.action_forgiveness_width_sigma**2)))
+
+        saa_reward_raw = (saa_excess_return_scaled - max_drawdown_penalty + action_holding_reward)
 
         saa_reward = np.tanh(saa_reward_raw / 2.0) * 2.0 # Scale to [-2, 2] range
         
@@ -3241,7 +3247,7 @@ class TradingEnv(gym.Env):
             "raw_alpha": 0.0,
             "raw_portfolio_return": 0.0,
             "raw_benchmark_return": 0.0,
-            "sharpe_ratio": sharpe_ratio,
+            "sharpe_ratio": 0.0,
             "max_drawdown": saa_max_drawdown
         }
         
