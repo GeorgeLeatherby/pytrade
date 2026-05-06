@@ -3208,7 +3208,7 @@ class TradingEnv(gym.Env):
         saa_excess_log_return = saa_log_return - passive_log_return
 
         # Simple log return reward
-        saa_excess_return_scaled = 50 * saa_excess_log_return  # Scale factor to get reasonable reward magnitudes
+        saa_excess_return_scaled = 10 * saa_excess_log_return  # Scale factor to get reasonable reward magnitudes
 
         scaled_log_diff_sortino = 50 * log_diff_sortino_reward
 
@@ -3229,7 +3229,8 @@ class TradingEnv(gym.Env):
         # Action hold reward: small positive reward for taking action close to zero (holding)
         # Calculate the continuous Gaussian reward
         # Peak of 'hold_reward_weight' at action=0, decaying as action moves away
-        action_holding_reward = self.action_hold_reward_weight_omega * np.exp(-(action**2) / (2 * (self.action_forgiveness_width_sigma**2)))
+        # action_holding_reward = self.action_hold_reward_weight_omega * np.exp(-(action**2) / (2 * (self.action_forgiveness_width_sigma**2)))
+        action_holding_reward = self.action_hold_reward_weight_omega * (1 - abs(action)**2)
 
         saa_reward_raw = (saa_excess_return_scaled - max_drawdown_penalty + action_holding_reward)
 
