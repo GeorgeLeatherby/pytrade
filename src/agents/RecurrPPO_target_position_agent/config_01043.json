@@ -105,7 +105,7 @@
         "target_kl": 0.015,
         "normalize_advantage": true,        
 
-        "learning_rate_start": 1.0e-4,
+        "learning_rate_start": 8.0e-5,
         "learning_rate_end": 8.0e-6,
         "lr_schedule_type": "linear",
         "lr_schedule_warmup_pct": 0.4,
