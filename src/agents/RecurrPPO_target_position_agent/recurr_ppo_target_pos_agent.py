@@ -131,84 +131,175 @@ class EntropyScheduleCallback(BaseCallback):
 # Custom Logger Callback (portfolio metrics into tb logs)
 # ================================
 class EpisodePortfolioSB3LoggerCallback(BaseCallback):
-    def __init__(self, tag_prefix: str = "train", log_freq: int = 100, verbose: int = 0):
-        super().__init__(verbose)
+    """
+    Aggregates per-episode env infos across ALL parallel workers within a rollout
+    and emits the rollout-mean of every tracked metric to the SB3 logger at
+    rollout end.
 
+    Why this design:
+    - The previous implementation read only `infos[0]` (worker 0) and called
+      `logger.record` per episode. With `n_envs=8` this discarded ~7/8 of the
+      data. Worse, when multiple worker-0 episodes finalized within the same
+      rollout, each `logger.record(key, ...)` overwrote the prior value
+      (SB3's Logger keeps only the latest value per key until `dump`). At
+      rollout end, SB3 dumped only the last surviving value, not an average.
+    - This rewrite collects every finalized episode from every worker into
+      per-key buffers, then emits a single mean per key at `_on_rollout_end`,
+      immediately before SB3's automatic logger dump.
+
+    Key semantics:
+    - Every step: scan ALL `infos` entries; for each `episode_final=True`
+      info, append every tracked metric value into its buffer.
+    - At rollout end: if `rollout_count % log_freq == 0`, emit
+      `f"{tag_prefix}/{key}_mean"` for each non-empty buffer, plus a paired
+      `return_diff_after_rdn_portf_init_mean` and an
+      `episodes_in_rollout` sample-size diagnostic, then reset buffers.
+    - `log_freq` semantics changed: now "every N rollouts" (default 1 = every
+      rollout). Previous semantics (every N worker-0 episodes) is replaced
+      because aggregation across workers + within-rollout averaging removes
+      the noise that motivated the throttle. With `train_log_freq=10` the
+      callback now emits roughly 10x less frequently than before; set it to
+      1 to match prior cadence.
+    - All emitted train keys gain a `_mean` suffix to mirror the validation
+      callback's naming convention.
+
+    Attributes:
+        tag_prefix: prefix for all TB tags ("train" by default).
+        log_freq: int >= 1; how many rollouts between emissions.
+        rollout_count: count of completed rollouts since callback init.
+        _buffers: Dict[str, list[float]] keyed by env-info key.
+        _episode_count: number of episodes that contributed to current buffers.
+    """
+
+    # Tracked metric keys. Each must appear in env episode_final info dict to
+    # be buffered. Anything missing is silently skipped per episode (lists
+    # remain length-aligned only across keys that are always co-emitted by
+    # the env, which is the case for this single-asset env).
+    _METRIC_KEYS = (
+        "portfolio_final_value",
+        "comparison_final_value",
+        "benchmark_final_value",
+        "portfolio_return",
+        "episode_sharpe",
+        "episode_max_drawdown",
+        "alpha_return",
+        "saa_return_final",
+        # Turnover / costs
+        # NOTE: env emits "total_transaction_costs" (plural). The old callback
+        # looked up the singular form and therefore never logged any cost
+        # metric. Using the correct plural key restores cost reporting.
+        "total_turnover",
+        "avg_turnover",
+        "total_transaction_costs",
+        "episode_cost_commission",
+        "episode_cost_spread",
+        "episode_cost_impact",
+        # Exposure
+        "exposure_start",
+        "exposure_avg",
+        "exposure_end",
+        # Gross vs net
+        "shadow_return",
+        # Buy/Sell totals
+        "total_buy_notional",
+        "total_sell_notional",
+        # Trade sizes
+        "trade_size_mean",
+        "trade_size_median",
+        # Action stats (single-asset mode)
+        "action_mean",
+        "action_median",
+        "action_p05",
+        "action_p25",
+        "action_p75",
+        "action_p95",
+        # Sortino internals
+        "sortino_mean_ema",
+        "sortino_downside_ema",
+        "sortino_reward_raw_mean",
+        "sortino_reward_raw_p25",
+        "sortino_reward_raw_p75",
+    )
+
+    def __init__(self, tag_prefix: str = "train", log_freq: int = 1, verbose: int = 0):
+        super().__init__(verbose)
         self.tag_prefix = tag_prefix
-        self.log_freq = log_freq
-        self.episode_count = 0 # Track completed episodes
+        # Now interpreted as "emit every N rollouts" (>=1).
+        self.log_freq = max(int(log_freq), 1)
+        self.rollout_count = 0
+        # Dict-of-lists buffer; one list per tracked metric key.
+        self._buffers: Dict[str, list] = {k: [] for k in self._METRIC_KEYS}
+        # Episodes finalized within current (un-flushed) rollout window.
+        self._episode_count = 0
 
     def _on_step(self) -> bool:
-        info = self.locals.get("infos", [{}])[0]
-        if info.get("episode_final", False):
-            self.episode_count += 1
-
-            # Only log every log_freq episodes
-            if self.episode_count % self.log_freq != 0:
-                return True # Skip logging but continue training
-            
-            # Extract portfolio metrics from info dict
-            pv = info.get("portfolio_final_value", None)
-            comp_pv = info.get("comparison_final_value", None)
-            bench = info.get("benchmark_final_value", None)
-            ret = info.get("portfolio_return", None)
-            sharpe = info.get("episode_sharpe", None)
-            dd = info.get("episode_max_drawdown", None)
-            if pv is not None:
-                self.model.logger.record(f"{self.tag_prefix}/portfolio_final_value", pv, exclude=("stdout",))
-            if comp_pv is not None:
-                self.model.logger.record(f"{self.tag_prefix}/comparison_final_value", comp_pv, exclude=("stdout",))
-            if pv is not None and comp_pv is not None:
-                return_difference_after_random_portfolio_initialization = pv - comp_pv
-                self.model.logger.record(f"{self.tag_prefix}/return_diff_after_rdn_portf_init", return_difference_after_random_portfolio_initialization, exclude=("stdout",))
-            if bench is not None:
-                self.model.logger.record(f"{self.tag_prefix}/benchmark_final_value", bench, exclude=("stdout",))
-            if ret is not None:
-                self.model.logger.record(f"{self.tag_prefix}/portfolio_return", ret, exclude=("stdout",))
-            if sharpe is not None:
-                self.model.logger.record(f"{self.tag_prefix}/episode_sharpe", sharpe, exclude=("stdout",))
-            if dd is not None:
-                self.model.logger.record(f"{self.tag_prefix}/episode_max_drawdown", dd, exclude=("stdout",))
-            # Turnover and costs
-            if "total_turnover" in info:
-                self.model.logger.record(f"{self.tag_prefix}/episode_turnover", float(info["total_turnover"]), exclude=("stdout",))
-                self.model.logger.record(f"{self.tag_prefix}/avg_turnover", float(info["avg_turnover"]), exclude=("stdout",))
-            if "total_transaction_cost" in info:
-                self.model.logger.record(f"{self.tag_prefix}/cost_total", float(info["total_transaction_cost"]), exclude=("stdout",))
-                self.model.logger.record(f"{self.tag_prefix}/cost_commission", float(info["episode_cost_commission"]), exclude=("stdout",))
-                self.model.logger.record(f"{self.tag_prefix}/cost_spread", float(info["episode_cost_spread"]), exclude=("stdout",))
-                self.model.logger.record(f"{self.tag_prefix}/cost_impact", float(info["episode_cost_impact"]), exclude=("stdout",))
-            # Exposure
-            if "exposure_avg" in info:
-                self.model.logger.record(f"{self.tag_prefix}/exposure_start", float(info["exposure_start"]), exclude=("stdout",))
-                self.model.logger.record(f"{self.tag_prefix}/exposure_avg", float(info["exposure_avg"]), exclude=("stdout",))
-                self.model.logger.record(f"{self.tag_prefix}/exposure_end", float(info["exposure_end"]), exclude=("stdout",))
-            # Gross vs net
-            if "shadow_return" in info:
-                self.model.logger.record(f"{self.tag_prefix}/gross_return", float(info["shadow_return"]), exclude=("stdout",))
-            # Buy/Sell totals and trade sizes
-            if "total_buy_notional" in info:
-                self.model.logger.record(f"{self.tag_prefix}/total_buy_notional", float(info["total_buy_notional"]), exclude=("stdout",))
-                self.model.logger.record(f"{self.tag_prefix}/total_sell_notional", float(info["total_sell_notional"]), exclude=("stdout",))
-            if "trade_size_mean" in info:
-                self.model.logger.record(f"{self.tag_prefix}/trade_size_mean", float(info["trade_size_mean"]), exclude=("stdout",))
-                self.model.logger.record(f"{self.tag_prefix}/trade_size_median", float(info["trade_size_median"]), exclude=("stdout",))
-            # Action stats
-            if "action_mean" in info:
-                self.model.logger.record(f"{self.tag_prefix}/action_mean", float(info["action_mean"]), exclude=("stdout",))
-                self.model.logger.record(f"{self.tag_prefix}/action_median", float(info["action_median"]), exclude=("stdout",))
-                self.model.logger.record(f"{self.tag_prefix}/action_p05", float(info["action_p05"]), exclude=("stdout",))
-                self.model.logger.record(f"{self.tag_prefix}/action_p25", float(info["action_p25"]), exclude=("stdout",))
-                self.model.logger.record(f"{self.tag_prefix}/action_p75", float(info["action_p75"]), exclude=("stdout",))
-                self.model.logger.record(f"{self.tag_prefix}/action_p95", float(info["action_p95"]), exclude=("stdout",))
-            # Sortino components
-            if "sortino_mean_ema" in info:
-                self.model.logger.record(f"{self.tag_prefix}/sortino_mean_ema", float(info["sortino_mean_ema"]), exclude=("stdout",))
-                self.model.logger.record(f"{self.tag_prefix}/sortino_downside_ema", float(info["sortino_downside_ema"]), exclude=("stdout",))
-                self.model.logger.record(f"{self.tag_prefix}/sortino_reward_raw_mean", float(info["sortino_reward_raw_mean"]), exclude=("stdout",))
-                self.model.logger.record(f"{self.tag_prefix}/sortino_reward_raw_p25", float(info["sortino_reward_raw_p25"]), exclude=("stdout",))
-                self.model.logger.record(f"{self.tag_prefix}/sortino_reward_raw_p75", float(info["sortino_reward_raw_p75"]), exclude=("stdout",))
+        # `infos` is a list of dicts of length n_envs (one per parallel worker).
+        # Every step, scan all workers and buffer any finalized episode metrics.
+        infos = self.locals.get("infos", [])
+        for info in infos:
+            if not isinstance(info, dict):
+                continue
+            if not info.get("episode_final", False):
+                continue
+            self._episode_count += 1
+            for key in self._METRIC_KEYS:
+                v = info.get(key, None)
+                if v is None:
+                    continue
+                self._buffers[key].append(float(v))
         return True
+
+    def _on_rollout_end(self) -> bool:
+        # Called by SB3 at the end of every rollout, just before logger.dump.
+        # Emit one mean per tracked key, then reset buffers for the next window.
+        self.rollout_count += 1
+        if self.rollout_count % self.log_freq != 0:
+            # Drop accumulated data for skipped emissions to keep windows
+            # disjoint and prevent unbounded buffer growth.
+            self._reset_buffers()
+            return True
+
+        # Sample-size diagnostic: tells the reader how many episodes contributed
+        # to each metric mean at this TB tick. Crucial for interpreting noise.
+        self.model.logger.record(
+            f"{self.tag_prefix}/episodes_in_rollout",
+            float(self._episode_count),
+            exclude=("stdout",),
+        )
+
+        # Paired diff: per-episode (pv - comp) then mean. With env always
+        # emitting both keys together, the lists are length-aligned; the
+        # paired mean equals the difference of means but expresses intent.
+        pv_buf = self._buffers.get("portfolio_final_value", [])
+        comp_buf = self._buffers.get("comparison_final_value", [])
+        if pv_buf and comp_buf and len(pv_buf) == len(comp_buf):
+            diffs = np.subtract(pv_buf, comp_buf)
+            self.model.logger.record(
+                f"{self.tag_prefix}/return_diff_after_rdn_portf_init_mean",
+                float(np.mean(diffs)),
+                exclude=("stdout",),
+            )
+
+        # Generic mean emission for every non-empty buffer.
+        for key, buf in self._buffers.items():
+            if not buf:
+                continue
+            self.model.logger.record(
+                f"{self.tag_prefix}/{key}_mean",
+                float(np.mean(buf)),
+                exclude=("stdout",),
+            )
+
+        self._reset_buffers()
+        return True
+
+    def _reset_buffers(self) -> None:
+        # Clear all per-key episode buffers and the rollout-window episode
+        # counter. Called both on emit and on skipped-emission rollouts to
+        # keep emission windows disjoint.
+        for k in self._buffers:
+            self._buffers[k].clear()
+        self._episode_count = 0
 
 
 class ValidationMetricsCallback(BaseCallback):
@@ -221,7 +312,8 @@ class ValidationMetricsCallback(BaseCallback):
         self.tag_prefix = tag_prefix
         self.eval_episode_count = 0
 
-        # Buffers to accumulate per-episode metrics
+        # Buffers to accumulate per-episode metrics. Each list collects one
+        # float per finalized eval episode; means/std emitted in flush_metrics.
         self.pv_buffer = []
         self.comp_pv_buffer = []
         self.bench_buffer = []
@@ -232,10 +324,19 @@ class ValidationMetricsCallback(BaseCallback):
         self.cum_reward_buffer = []
         self.saa_subpf_buffer = []
         self.saa_return_after_rdn_portf_init_buffer = []
+        # Action distribution stats per eval episode (raw target_position_change
+        # in [-action_limiting_factor, +action_limiting_factor]).
+        self.action_mean_buffer = []
+        self.action_median_buffer = []
+        self.action_p05_buffer = []
+        self.action_p25_buffer = []
+        self.action_p75_buffer = []
+        self.action_p95_buffer = []
 
         # Store last computed return_diff_vs_init_mean for best-model selection
         self.last_return_diff_total_mean = None
         self.last_return_diff_target_mean = None
+        self.last_alpha_return_mean = None
 
     def _on_step(self) -> bool:
         """Called during evaluation episodes (by EvalCallback)."""
@@ -277,6 +378,19 @@ class ValidationMetricsCallback(BaseCallback):
             if saa_return_after_rdn_portf_init is not None:
                 self.saa_return_after_rdn_portf_init_buffer.append(saa_return_after_rdn_portf_init)
 
+            # Action distribution stats (single-asset mode emits these every episode)
+            for buf, key in (
+                (self.action_mean_buffer, "action_mean"),
+                (self.action_median_buffer, "action_median"),
+                (self.action_p05_buffer, "action_p05"),
+                (self.action_p25_buffer, "action_p25"),
+                (self.action_p75_buffer, "action_p75"),
+                (self.action_p95_buffer, "action_p95"),
+            ):
+                v = info.get(key, None)
+                if v is not None:
+                    buf.append(float(v))
+
             # Raise error if any of the metrics contains a Nan of Inf value
             for metric_name, metric_value in [
                 ("pv", pv), 
@@ -298,12 +412,20 @@ class ValidationMetricsCallback(BaseCallback):
     def flush_metrics(self, n_eval_episodes: int) -> None:
         """
         Called after all eval episodes complete to log aggregated metrics.
-        
+
         Args:
             n_eval_episodes: expected number of episodes (used to verify buffer is full)
+
+        Buffer-leak fix: buffers are always reset before returning, including
+        on the early-return path where buffer is incomplete. Previously the
+        early return left partial data in place, which would then bleed into
+        the next eval cycle and bias every subsequent mean.
         """
-        # Only log if we have accumulated the expected number of episodes
+        # Only log if we have accumulated the expected number of episodes.
+        # Either way, buffers are reset before returning to keep eval cycles
+        # independent.
         if self.eval_episode_count < n_eval_episodes:
+            self._reset_buffers()
             return
         
         # Compute and log means
@@ -351,22 +473,62 @@ class ValidationMetricsCallback(BaseCallback):
         if self.alpha_ret_buffer:
             mean_alpha = float(np.mean(self.alpha_ret_buffer))
             self.model.logger.record(f"{self.tag_prefix}/alpha_return_mean", mean_alpha, exclude=("stdout",))
+            self.last_alpha_return_mean = mean_alpha
         
         if self.cum_reward_buffer:
             mean_cum_reward = float(np.mean(self.cum_reward_buffer))
             self.model.logger.record(f"{self.tag_prefix}/cumulative_reward_mean", mean_cum_reward, exclude=("stdout",))
-        
+
+        # Action distribution: emit mean (and std for action_mean only, since the
+        # other percentile-buffers are already distributional summaries within
+        # an episode; cross-episode mean of percentiles is the standard report).
+        if self.action_mean_buffer:
+            self.model.logger.record(
+                f"{self.tag_prefix}/action_mean_mean",
+                float(np.mean(self.action_mean_buffer)),
+                exclude=("stdout",),
+            )
+            self.model.logger.record(
+                f"{self.tag_prefix}/action_mean_std",
+                float(np.std(self.action_mean_buffer)),
+                exclude=("stdout",),
+            )
+        if self.action_median_buffer:
+            self.model.logger.record(
+                f"{self.tag_prefix}/action_median_mean",
+                float(np.mean(self.action_median_buffer)),
+                exclude=("stdout",),
+            )
+        for buf, tag in (
+            (self.action_p05_buffer, "action_p05_mean"),
+            (self.action_p25_buffer, "action_p25_mean"),
+            (self.action_p75_buffer, "action_p75_mean"),
+            (self.action_p95_buffer, "action_p95_mean"),
+        ):
+            if buf:
+                self.model.logger.record(
+                    f"{self.tag_prefix}/{tag}",
+                    float(np.mean(buf)),
+                    exclude=("stdout",),
+                )
+
         # Reset buffers for next eval run
         self._reset_buffers()
 
-    def get_best_return_diff(self) -> Optional[float]:
+    def get_best_return_diff_total_mean(self) -> Optional[float]:
         """
-        Return the last computed return_diff_vs_init_mean.
+        Return the last computed return_diff_vs_init_total_mean.
         Used by EvalCallbackWithMetrics for best-model selection.
+
+        Average of 
         """
         if self.last_return_diff_total_mean is not None:
             return self.last_return_diff_total_mean
         return None
+    
+    def get_best_alpha_return_mean(self) -> Optional[float]:
+        """Return the last computed alpha_return_mean."""
+        return self.last_alpha_return_mean
     
     def _reset_buffers(self) -> None:
         """Reset all accumulation buffers at the end of an evaluation run."""
@@ -381,6 +543,13 @@ class ValidationMetricsCallback(BaseCallback):
         self.eval_episode_count = 0
         self.saa_subpf_buffer = []
         self.saa_return_after_rdn_portf_init_buffer = []
+        # Action distribution buffers
+        self.action_mean_buffer = []
+        self.action_median_buffer = []
+        self.action_p05_buffer = []
+        self.action_p25_buffer = []
+        self.action_p75_buffer = []
+        self.action_p95_buffer = []
     
 
 class EvalCallbackWithMetrics(BaseCallback):
@@ -388,7 +557,7 @@ class EvalCallbackWithMetrics(BaseCallback):
     Eval callback that forwards each eval step to a per-episode metrics callback
     (e.g., ValidationMetricsCallback) while preserving SB3 eval logging.
 
-    Saves best model based on last_return_diff_target_mean (value creation metric)
+    Saves best model based on last_return_diff_total_mean (value creation metric)
     rather than raw cumulative reward.
     """
     def __init__(
@@ -420,6 +589,7 @@ class EvalCallbackWithMetrics(BaseCallback):
         self.warn = warn
         self.best_mean_reward = -np.inf
         self.best_return_diff = -np.inf # Track best last_return_diff_target_mean
+        self.best_alpha_return_mean = -np.inf # Track best alpha_return_mean
         self.n_eval_calls = 0
 
     def _init_callback(self) -> None:
@@ -468,24 +638,37 @@ class EvalCallbackWithMetrics(BaseCallback):
                 )
 
             # Check if this is a new best model based on last_return_diff_target_mean
-            current_return_diff = None
+            current_return_diff_total_mean = None
+            current_alpha_return_mean = None
             if isinstance(self.eval_step_callback, ValidationMetricsCallback):
-                current_return_diff = self.eval_step_callback.get_best_return_diff()
+                current_return_diff_total_mean = self.eval_step_callback.get_best_return_diff_total_mean()
+                current_alpha_return_mean = self.eval_step_callback.get_best_alpha_return_mean()
             
-            if current_return_diff is not None and current_return_diff > self.best_return_diff:
-                self.best_return_diff = current_return_diff
+            # Save based on return_diff_vs_init_total_mean
+            if current_return_diff_total_mean is not None and current_return_diff_total_mean > self.best_return_diff:
+                self.best_return_diff = current_return_diff_total_mean
                 if self.best_model_save_path is not None:
-                    self.model.save(os.path.join(self.best_model_save_path, "best_model"))
+                    self.model.save(os.path.join(self.best_model_save_path, "best_model_return_diff_target"))
                     # Save VecNormalize stats at the exact same checkpoint time
                     vec_env = self.model.get_env()
                     if isinstance(vec_env, VecNormalize):
-                        vec_env.save(os.path.join(self.best_model_save_path, "best_model_vecnormalize.pkl"))
-                        print(f"New best model saved! last_return_diff_target_mean: {current_return_diff:.4f}")
+                        vec_env.save(os.path.join(self.best_model_save_path, "best_model_return_diff_target_vecnormalize.pkl"))
+                        print(f"New best model saved! last_return_diff_target_mean: {current_return_diff_total_mean:.4f}")
                     else:
-                        raise RuntimeError(f"New best model saved! last_return_diff_target_mean: {current_return_diff:.4f} (VecNormalize not found!)")
+                        raise RuntimeError(f"New best model saved! last_return_diff_target_mean: {current_return_diff_total_mean:.4f} (VecNormalize not found!)")
                 if self.callback_on_new_best is not None:
                     self.callback_on_new_best.on_step()
-            
+
+            # Save based on alpha_return_mean (secondary saving metric)
+            if current_alpha_return_mean is not None and current_alpha_return_mean > self.best_alpha_return_mean:
+                self.best_alpha_return_mean = current_alpha_return_mean
+                if self.best_model_save_path is not None:
+                    self.model.save(os.path.join(self.best_model_save_path, "best_model_alpha_return_mean"))
+                    vec_env = self.model.get_env()
+                    if isinstance(vec_env, VecNormalize):
+                        vec_env.save(os.path.join(self.best_model_save_path, "best_model_alpha_return_mean_vecnormalize.pkl"))
+                        print(f"New best alpha model saved! alpha_return_mean: {current_alpha_return_mean:.4f}")
+
             if self.callback_after_eval is not None:
                 self.callback_after_eval.on_step()
         return True
@@ -955,10 +1138,15 @@ def run(cache, config: Dict[str, Any]) -> Dict[str, Any]:
 
     # Training metrics callback with throttling
     train_cfg = config.get("training", {})
-    train_log_freq = int(train_cfg.get("train_log_freq", 50))  # NEW CONFIG KEY
+    # SEMANTIC CHANGE: train_log_freq is now "emit every N rollouts" (default 1).
+    # Previously it meant "emit every N worker-0 episodes". The new callback
+    # aggregates across all workers and within each rollout, so a per-rollout
+    # cadence is the natural unit. If your config still has train_log_freq=10
+    # (old per-episode meaning), TB will be ~10x sparser; set to 1 for parity.
+    train_log_freq = int(train_cfg.get("train_log_freq", 1))
     train_tb_cb = EpisodePortfolioSB3LoggerCallback(
         tag_prefix="train", 
-        log_freq=train_log_freq  # Log every 50 episodes by default
+        log_freq=train_log_freq  # rollouts between TB emissions
     )
 
     # Progress sync callback to propagate progress_remaining to envs
@@ -1088,8 +1276,9 @@ def continue_run(cache, config: Dict[str, Any], model_path: str, saved_models_di
         gamma=gamma_cfg,
     )
 
-    # Load VecNormalize stats from saved pickle file
-    vecnorm_path = os.path.join(saved_models_dir, model_dir_name, "best_model_vecnormalize.pkl")
+    # Load VecNormalize stats that correspond to selected model_path
+    model_base = os.path.splitext(os.path.basename(model_path))[0]
+    vecnorm_path = os.path.join(saved_models_dir, model_dir_name, f"{model_base}_vecnormalize.pkl")
     if not os.path.isfile(vecnorm_path):
         raise FileNotFoundError(f"VecNormalize stats not found at {vecnorm_path}")
     
@@ -1125,8 +1314,8 @@ def continue_run(cache, config: Dict[str, Any], model_path: str, saved_models_di
     else:
         ent_cb = None
 
-    # Training metrics callback with throttling
-    train_log_freq = int(train_cfg.get("train_log_freq", 50))
+    # Training metrics callback with throttling (per-rollout semantics; see run()).
+    train_log_freq = int(train_cfg.get("train_log_freq", 1))
     train_tb_cb = EpisodePortfolioSB3LoggerCallback(
         tag_prefix="train", 
         log_freq=train_log_freq

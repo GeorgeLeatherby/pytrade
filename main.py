@@ -69,20 +69,37 @@ def run_agent(agent_folder, config_path):
     print(f"\n=== Agent: {agent_folder} | Config: {os.path.basename(config_path)} ===")
     print(result)
 
+def list_checkpoint_pairs(model_dir):
+    """
+    Return list of (zip_name, pkl_name) where both files exist.
+    Pairing rule: <base>.zip <-> <base>_vecnormalize.pkl
+    """
+    if not os.path.isdir(model_dir):
+        return []
+
+    zips = sorted([f for f in os.listdir(model_dir) if f.lower().endswith(".zip")])
+    pairs = []
+    for zip_name in zips:
+        base = os.path.splitext(zip_name)[0]
+        pkl_name = f"{base}_vecnormalize.pkl"
+        if os.path.isfile(os.path.join(model_dir, pkl_name)):
+            pairs.append((zip_name, pkl_name))
+    return pairs
+
 def get_saved_models(agent_folder):
     """
-    Get list of saved models in agent's saved_models directory.
-    Returns list of directory names that contain best_model.zip.
+    Get list of saved model run folders that contain at least one valid (zip, pkl) checkpoint pair.
     """
     saved_models_dir = os.path.join(AGENTS_DIR, agent_folder, "saved_models")
     if not os.path.isdir(saved_models_dir):
         return []
+
     models = []
     for entry in os.listdir(saved_models_dir):
         model_dir = os.path.join(saved_models_dir, entry)
-        if os.path.isdir(model_dir) and os.path.isfile(os.path.join(model_dir, "best_model.zip")):
+        if os.path.isdir(model_dir) and list_checkpoint_pairs(model_dir):
             models.append(entry)
-    return sorted(models, reverse=True)  # Most recent first
+    return sorted(models, reverse=True) # Sort with most recent first
 
 def select_agent_and_configs_gui():
     root = Tk(); root.title("Select Agent")
@@ -122,8 +139,12 @@ def select_agent_and_configs_gui():
 
 def select_resume_training_gui():
     """
-    GUI for selecting a saved model and config to continue training.
-    Returns (agent_folder, model_dir_name, config_path) or (None, None, None) if cancelled.
+    GUI for selecting:
+    1) agent
+    2) run folder
+    3) checkpoint file (zip + matching pkl required)
+    4) config
+    Returns (agent_folder, model_dir_name, model_zip_name, config_path) or (None, None, None, None) if cancelled.
     """
     root = Tk(); root.title("Resume Training")
     agents = discover_agents()
@@ -132,7 +153,7 @@ def select_resume_training_gui():
     for a in agents: lb.insert(END, a)
     lb.pack(padx=10, pady=5)
 
-    selected = {"agent": None, "model": None, "config": None}
+    selected = {"agent": None, "model_dir": None, "model_zip": None, "config": None}
 
     def on_select_agent():
         sel = lb.curselection()
@@ -141,54 +162,79 @@ def select_resume_training_gui():
             return
         agent = agents[sel[0]]
         selected["agent"] = agent
-        
-        # Show saved models window
-        models = get_saved_models(agent)
-        if not models:
+
+        # Select run folder first
+        model_dirs = get_saved_models(agent)
+        if not model_dirs:
             messagebox.showwarning("No Models", f"No saved models found for {agent}")
             return
-        
-        model_win = Toplevel(root); model_win.title(f"Saved Models for {agent}")
-        Label(model_win, text="Saved Models:").pack(padx=10, pady=5)
-        model_lb = Listbox(model_win, selectmode=SINGLE, width=60, height=min(15, len(models)))
-        for m in models: model_lb.insert(END, m)
+
+        model_win = Toplevel(root); model_win.title(f"Saved Runs for {agent}")
+        Label(model_win, text="Saved Run Folders:").pack(padx=10, pady=5)
+        model_lb = Listbox(model_win, selectmode=SINGLE, width=60, height=min(15, len(model_dirs)))
+        for m in model_dirs: model_lb.insert(END, m)
         model_lb.pack(padx=10, pady=5)
-        
-        def on_select_model():
+
+        def on_select_model_dir():
             sel_m = model_lb.curselection()
             if not sel_m:
-                messagebox.showwarning("Selection", "Pick a model.")
+                messagebox.showwarning("Selection", "Pick a run folder.")
                 return
-            model_name = models[sel_m[0]]
-            selected["model"] = model_name
-            
-            # Show config selection window
-            cfg_win = Toplevel(model_win); cfg_win.title(f"Config for {agent}")
-            agent_dir = os.path.join(AGENTS_DIR, agent)
-            jsons = [f for f in os.listdir(agent_dir) if f.lower().endswith(".json")]
-            Label(cfg_win, text="Config:").pack(padx=10, pady=5)
-            cfg_lb = Listbox(cfg_win, selectmode=SINGLE, width=60, height=min(15, max(1, len(jsons))))
-            for jf in jsons: cfg_lb.insert(END, jf)
-            cfg_lb.pack(padx=10, pady=5)
-            
-            def on_confirm():
-                sel_c = cfg_lb.curselection()
-                if not sel_c:
-                    messagebox.showwarning("Selection", "Pick a config.")
+
+            model_dir_name = model_dirs[sel_m[0]]
+            selected["model_dir"] = model_dir_name
+
+            model_dir_abs = os.path.join(AGENTS_DIR, agent, "saved_models", model_dir_name)
+            pairs = list_checkpoint_pairs(model_dir_abs)
+            if not pairs:
+                messagebox.showwarning("No Checkpoints", "No valid checkpoint pairs found in this run folder.")
+                return
+
+            # Second menu: concrete checkpoint choice
+            ckpt_win = Toplevel(model_win); ckpt_win.title(f"Checkpoints in {model_dir_name}")
+            Label(ckpt_win, text="Checkpoint (zip | pkl):").pack(padx=10, pady=5)
+            ckpt_lb = Listbox(ckpt_win, selectmode=SINGLE, width=90, height=min(15, len(pairs)))
+            for zip_name, pkl_name in pairs:
+                ckpt_lb.insert(END, f"{zip_name} | {pkl_name}")
+            ckpt_lb.pack(padx=10, pady=5)
+
+            def on_select_checkpoint():
+                sel_k = ckpt_lb.curselection()
+                if not sel_k:
+                    messagebox.showwarning("Selection", "Pick a checkpoint.")
                     return
-                config_file = jsons[sel_c[0]]
-                selected["config"] = os.path.join(agent_dir, config_file)
-                cfg_win.destroy(); model_win.destroy(); root.destroy()
-            
-            Button(cfg_win, text="Confirm", command=on_confirm).pack(padx=30, pady=12)
-        
-        Button(model_win, text="Select Model", command=on_select_model).pack(padx=30, pady=12)
-    
+                zip_name, _pkl_name = pairs[sel_k[0]]
+                selected["model_zip"] = zip_name
+
+                # Config selection
+                cfg_win = Toplevel(ckpt_win); cfg_win.title(f"Config for {agent}")
+                agent_dir = os.path.join(AGENTS_DIR, agent)
+                jsons = [f for f in os.listdir(agent_dir) if f.lower().endswith(".json")]
+                Label(cfg_win, text="Config:").pack(padx=10, pady=5)
+                cfg_lb = Listbox(cfg_win, selectmode=SINGLE, width=60, height=min(15, max(1, len(jsons))))
+                for jf in jsons: cfg_lb.insert(END, jf)
+                cfg_lb.pack(padx=10, pady=5)
+
+                def on_confirm():
+                    sel_c = cfg_lb.curselection()
+                    if not sel_c:
+                        messagebox.showwarning("Selection", "Pick a config.")
+                        return
+                    config_file = jsons[sel_c[0]]
+                    selected["config"] = os.path.join(agent_dir, config_file)
+                    cfg_win.destroy(); ckpt_win.destroy(); model_win.destroy(); root.destroy()
+
+                Button(cfg_win, text="Confirm", command=on_confirm).pack(padx=30, pady=12)
+
+            Button(ckpt_win, text="Select Checkpoint", command=on_select_checkpoint).pack(padx=30, pady=12)
+
+        Button(model_win, text="Select Run Folder", command=on_select_model_dir).pack(padx=30, pady=12)
+
     Button(root, text="Select Agent", command=on_select_agent).pack(padx=30, pady=12)
     root.mainloop()
-    return selected["agent"], selected["model"], selected["config"]
+    return selected["agent"], selected["model_dir"], selected["model_zip"], selected["config"]
 
-def continue_training_agent(agent_folder, model_dir_name, config_path):
+def continue_training_agent(agent_folder, model_dir_name, model_zip_name, config_path):
     """
     Continue training from a saved model.
     Dynamically loads the agent module and calls its continue_run function.
@@ -217,7 +263,7 @@ def continue_training_agent(agent_folder, model_dir_name, config_path):
 
     # Model path information
     saved_models_dir = os.path.join(agent_dir, "saved_models")
-    model_path = os.path.join(saved_models_dir, model_dir_name, "best_model.zip")
+    model_path = os.path.join(saved_models_dir, model_dir_name, model_zip_name)
 
     # Run the agent's continue_run function if available
     if hasattr(mod, "continue_run"):
@@ -243,10 +289,10 @@ def main():
     
     def on_continue_training():
         root.destroy()
-        agent, model, config = select_resume_training_gui()
-        if not agent or not model or not config:
+        agent, model_dir, model_zip, config = select_resume_training_gui()
+        if not agent or not model_dir or not model_zip or not config:
             print("No selection. Exiting."); return
-        continue_training_agent(agent, model, config)
+        continue_training_agent(agent, model_dir, model_zip, config)
     
     Button(root, text="Train New Agent", command=on_train_new, width=30, height=3).pack(padx=20, pady=10)
     Button(root, text="Continue Training", command=on_continue_training, width=30, height=3).pack(padx=20, pady=10)
