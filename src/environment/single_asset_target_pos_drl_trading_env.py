@@ -3237,7 +3237,7 @@ class TradingEnv(gym.Env):
         total_value_before = float(selected_asset_notional_before + saa_cash_before)
         action_executed = float(delta_selected_asset_notional / max(total_value_before, eps))
         execution_gap_penalty = float(self.lambda_execution_gap * abs(action - action_executed))
-        
+        # 
 
         saa_reward_raw = (saa_excess_return_scaled - max_drawdown_penalty - execution_gap_penalty)
 
