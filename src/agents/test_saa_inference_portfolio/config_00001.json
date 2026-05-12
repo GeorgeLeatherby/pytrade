@@ -4,7 +4,7 @@
   "test_agent": {
     "num_episodes": 5,
     "device": "cpu",
-    "saa_model_run_dir": "src/agents/RecurrPPO_target_position_agent/saved_models/00076_config_00010_26_02_28",
+    "saa_model_run_dir": "src/agents/RecurrPPO_target_position_agent/saved_models/00210_config_01043_26_05_10",
     "allocation_mode": "uniform",
     "deterministic_saa": true,
     "report_subdir": "reports",
