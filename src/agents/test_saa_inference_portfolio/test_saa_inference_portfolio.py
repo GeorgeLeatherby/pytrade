@@ -29,17 +29,24 @@ Workflow:
        matplotlib reports for the five comparisons listed in the preamble.
 
 DESIGN NOTES:
-    - environment.* and saa_features.* in the test config MUST mirror the SAA
-      training config of the loaded model — cache feature ordering and obs dim
-      depend on them. The test runner overrides ``execution_mode`` → "simple"
-      so env.step() accepts a list[TradeInstruction] across all assets.
-    - Per-asset "sub-portfolio" bookkeeping is virtual and serves only to build
-      SAA observations consistent with training-time distribution. Real shares
-      live in env.portfolio_state.positions; real cash is a shared pool that we
-      re-divide equally each step (initial_pv / N) to reflect "uniform cash
-      allocation".
-    - Random-allocation mode and minimum-cash-allocation are listed as TODOs in
-      the preamble; explicit NotImplementedError raised when requested.
+    - The test config is intentionally minimal. main._maybe_inherit_saa_training_config
+      reads the SAA training config that produced the checkpoint at
+      ``test_agent.saa_model_run_dir`` (a specific .zip path) and shallow-merges its
+      ``environment``, ``saa_features``, ``agent``, ``training`` and
+      ``market_data_path`` sections into the test config before cache build. The
+      VecNormalize file is derived by replacing ``.zip`` with ``_vecnormalize.pkl``.
+    - The test runner overrides three env keys after merge: ``execution_mode → simple``
+      (so env.step accepts a TradeInstruction list), ``percentage_of_cash_only_starts
+      → 1.0`` (deterministic cash-only baseline), ``min_initial_cash_allocation → 1.0``
+      (only consulted if random init branch ran).
+    - ``action_limiting_factor`` is taken from ``agent.action_limiting_factor_end`` of
+      the inherited training config so test-time action scale matches deployment.
+    - Per-asset "sub-portfolio" bookkeeping is virtual and serves only to build SAA
+      observations consistent with training-time distribution. Real shares live in
+      env.portfolio_state.positions; real cash is a shared pool that we re-divide
+      equally each step (initial_pv / N) to reflect "uniform cash allocation".
+    - Random-allocation mode and minimum-cash-allocation are listed as TODOs in the
+      preamble; an explicit NotImplementedError is raised when requested.
 
 End of preamble.
 """
@@ -48,11 +55,21 @@ End of preamble.
 # Imports
 # ================================
 import os
+import sys
 import copy
 import json
 import traceback
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
+
+# Force line-buffered stdout so progress prints surface immediately when this agent
+# is launched via the Tk-driven main.py (where stdout is not always a tty and Python
+# defaults to block buffering, which can make the run look like it has hung even
+# though it is making progress).
+try:
+    sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+except Exception:
+    pass
 
 import numpy as np
 import pandas as pd
@@ -131,31 +148,63 @@ def _normalize_obs(obs: np.ndarray, vecnorm: Optional[VecNormalize]) -> np.ndarr
 # SAA model loader
 # ================================
 def _load_saa_assets(
-    model_run_dir: str,
+    model_zip_path: str,
     device: torch.device,
 ) -> Tuple[RecurrentPPO, Optional[VecNormalize]]:
-    """Load best_model.zip + best_model_vecnormalize.pkl from a saved run directory.
+    """Load a specific SAA checkpoint .zip and its sibling _vecnormalize.pkl.
 
-    Shapes/contract:
-        model_run_dir/best_model.zip          → RecurrentPPO checkpoint
-        model_run_dir/best_model_vecnormalize.pkl → VecNormalize stats
+    Naming contract (mandated by user):
+        <model>.zip                  → RecurrentPPO checkpoint
+        <model>_vecnormalize.pkl     → VecNormalize stats (same stem + suffix)
+    Example:
+        .../best_model_alpha_return_mean.zip
+        .../best_model_alpha_return_mean_vecnormalize.pkl
     """
-    model_path = os.path.join(model_run_dir, "best_model.zip")
-    vecnorm_path = os.path.join(model_run_dir, "best_model_vecnormalize.pkl")
-    if not os.path.isfile(model_path):
-        raise FileNotFoundError(f"SAA best_model.zip not found at: {model_path}")
-    model = RecurrentPPO.load(model_path, device=device)
-    print(f"[SAA-Test] Loaded SAA model: {model_path}")
+    if not model_zip_path.lower().endswith(".zip"):
+        raise ValueError(
+            f"saa_model_run_dir must point at a .zip checkpoint file, got: {model_zip_path!r}"
+        )
+    if not os.path.isfile(model_zip_path):
+        raise FileNotFoundError(f"SAA checkpoint not found: {model_zip_path}")
+    vecnorm_path = model_zip_path[:-4] + "_vecnormalize.pkl"
+
+    # Inference-only safe load:
+    # Some checkpoints serialize callable schedules (learning_rate/lr_schedule/clip_range)
+    # that can crash the interpreter on Windows during deserialization when training code
+    # changed across runs. We override them with constants because schedules are irrelevant
+    # for inference and this keeps policy/state_dict loading stable.
+    safe_custom_objects = {
+        "learning_rate": 3e-5,
+        "lr_schedule": lambda _p: 3e-5,
+        "clip_range": lambda _p: 0.2,
+        "clip_range_vf": None,
+    }
+
+    print(f"[SAA-Test] Loading RecurrentPPO from: {model_zip_path}", flush=True)
+    model = RecurrentPPO.load(
+        model_zip_path,
+        device=device,
+        custom_objects=safe_custom_objects,
+    )
+    print(
+        f"[SAA-Test] Loaded SAA model. obs_dim={model.observation_space.shape[0]} "
+        f"action_dim={model.action_space.shape[0]} device={device}",
+        flush=True,
+    )
 
     vecnorm: Optional[VecNormalize] = None
     if os.path.isfile(vecnorm_path):
+        print(f"[SAA-Test] Loading VecNormalize from: {vecnorm_path}", flush=True)
         dummy = DummyVecEnv([lambda: _ObsNormDummyEnv(model.observation_space)])
         vecnorm = VecNormalize.load(vecnorm_path, dummy)
         vecnorm.training = False
         vecnorm.norm_reward = False
-        print(f"[SAA-Test] Loaded VecNormalize: {vecnorm_path}")
+        print("[SAA-Test] VecNormalize loaded (training=False, norm_reward=False).", flush=True)
     else:
-        print(f"[SAA-Test] No VecNormalize found at {vecnorm_path}; using raw obs (may degrade quality).")
+        print(
+            f"[SAA-Test] No VecNormalize at {vecnorm_path}; using raw obs (may degrade quality).",
+            flush=True,
+        )
     return model, vecnorm
 
 
@@ -195,8 +244,19 @@ class SAAPortfolioInferenceRunner:
         self.asset_names: List[str] = list(self.cache.asset_names)
         self.num_assets: int = len(self.asset_names)
         self.initial_pv: float = float(self.config["environment"]["initial_portfolio_value"])
-        self.action_limiting_factor: float = float(self.config["test_agent"].get("action_limiting_factor", 1.0))
+
+        # Action scaling: ALWAYS inherit the SAA's training-time end-of-schedule action limit
+        # so test-time action distribution mirrors deployment. The training config was merged
+        # into `config` by main._maybe_inherit_saa_training_config.
+        agent_cfg = self.config.get("agent", {})
+        if "action_limiting_factor_end" not in agent_cfg:
+            raise ValueError(
+                "Inherited SAA training config is missing 'agent.action_limiting_factor_end'; "
+                "cannot determine deployment-time action scaling."
+            )
+        self.action_limiting_factor: float = float(agent_cfg["action_limiting_factor_end"])
         self.deterministic: bool = bool(self.config["test_agent"].get("deterministic_saa", True))
+        print(f"[SAA-Test] action_limiting_factor (from SAA training) = {self.action_limiting_factor}")
 
         allocation_mode = self.config["test_agent"].get("allocation_mode", "uniform")
         if allocation_mode != "uniform":
@@ -233,10 +293,14 @@ class SAAPortfolioInferenceRunner:
             )
         print(f"[SAA-Test] Model obs_dim={expected_obs_dim} -> use_one_hot={self.use_one_hot}")
 
-        # Build env in EXECUTION_SIMPLE mode (overrides whatever the SAA training used).
+        # Build env config with test-time overrides on top of inherited training env block:
+        #   - execution_mode -> "simple" so env.step() accepts List[TradeInstruction]
+        #   - cash-only start (we want deterministic baseline; SAA decides allocation)
+        #   - min_initial_cash_allocation set to 1.0 (only consulted if random branch runs)
         env_cfg = copy.deepcopy(self.config)
         env_cfg["environment"]["execution_mode"] = "simple"
         env_cfg["environment"]["percentage_of_cash_only_starts"] = 1.0
+        env_cfg["environment"]["min_initial_cash_allocation"] = 1.0
         self._env_cfg = env_cfg
 
         # One model per asset (shared weights, independent LSTM state). Mirrors PAA SAASignalWrapper.
@@ -396,10 +460,17 @@ class SAAPortfolioInferenceRunner:
 
     def run_episode(self, episode_idx: int) -> Dict[str, Any]:
         """Run a single validation episode and return its per-step records."""
+        print(f"[SAA-Test]   building env (validation mode)...", flush=True)
         env = TradingEnv(self._env_cfg, self.cache, mode="validation")
+        print(f"[SAA-Test]   resetting env with seed={self.seed + episode_idx}...", flush=True)
         env.reset(seed=self.seed + episode_idx)
 
         self._reset_lstm_states()
+        print(
+            f"[SAA-Test]   start: pv=${env.portfolio_state.get_total_value():,.2f} "
+            f"cash=${env.portfolio_state.cash:,.2f} step={env.current_absolute_step}",
+            flush=True,
+        )
 
         N = self.num_assets
         initial_pv = self.initial_pv
@@ -554,12 +625,13 @@ class SAAPortfolioInferenceRunner:
 
     def run(self) -> List[Dict[str, Any]]:
         for ep in range(self.num_episodes):
-            print(f"\n[SAA-Test] === Episode {ep + 1}/{self.num_episodes} ===")
+            print(f"\n[SAA-Test] === Episode {ep + 1}/{self.num_episodes} ===", flush=True)
             try:
                 rec = self.run_episode(ep)
             except Exception:
-                print(f"[SAA-Test] Episode {ep} failed:")
+                print(f"[SAA-Test] Episode {ep} failed:", flush=True)
                 traceback.print_exc()
+                sys.stdout.flush()
                 continue
             self.episode_records.append(rec)
             self._print_episode_summary(rec)
@@ -794,9 +866,99 @@ def _generate_report(
     report_path = os.path.join(output_dir, "report.json")
     with open(report_path, "w") as f:
         json.dump(report, f, indent=2, default=float)
-    print(f"\n[SAA-Test] Report: {report_path}")
-    print(f"[SAA-Test] Figures: {fig_dir}")
+    md_path = _write_markdown_report(report, output_dir, fig_dir)
+    print(f"\n[SAA-Test] Report (JSON):     {report_path}")
+    print(f"[SAA-Test] Report (Markdown): {md_path}")
+    print(f"[SAA-Test] Figures:           {fig_dir}")
     return report
+
+
+def _write_markdown_report(report: Dict[str, Any], output_dir: str, fig_dir: str) -> str:
+    """Write a human-readable Markdown summary. Tables follow finance reporting conventions."""
+    md_path = os.path.join(output_dir, "report.md")
+    fig_rel = os.path.relpath(fig_dir, output_dir)
+    asset_names = report["asset_names"]
+    per_ep = report["per_episode_metrics"]
+    agg = report["aggregate"]
+
+    def fmt_pct(x: float) -> str:
+        return f"{x * 100:+.2f}%"
+
+    def fmt_curve(m: Optional[Dict[str, float]]) -> str:
+        if m is None:
+            return "—"
+        return (
+            f"{fmt_pct(m['total_return'])} | "
+            f"{m['annual_sharpe']:.2f} | "
+            f"{m['annual_volatility'] * 100:.2f}% | "
+            f"{m['max_drawdown'] * 100:.2f}% | "
+            f"${m['final_value']:.0f}"
+        )
+
+    lines: List[str] = []
+    lines.append("# SAA Portfolio Inference Report")
+    lines.append("")
+    lines.append(f"- **Timestamp**: {report['test_timestamp']}")
+    lines.append(f"- **Episodes completed**: {report['num_episodes_completed']}")
+    lines.append(f"- **Assets**: {', '.join(asset_names)}")
+    lines.append("")
+    lines.append("## Aggregate Summary (mean over episodes)")
+    lines.append("")
+    lines.append("| Metric | Value |")
+    lines.append("|---|---|")
+    lines.append(f"| Mean SAA total return | {fmt_pct(agg['mean_saa_total_return'])} |")
+    lines.append(f"| Mean SAA annualized Sharpe | {agg['mean_saa_sharpe']:.4f} |")
+    lines.append(f"| Mean SAA max drawdown | {fmt_pct(agg['mean_saa_max_drawdown'])} |")
+    lines.append(f"| Mean buy-and-hold (uniform) total return | {fmt_pct(agg['mean_bh_total_return'])} |")
+    lines.append(f"| Mean benchmark total return | {fmt_pct(agg['mean_benchmark_total_return'])} |")
+    lines.append(f"| Mean transaction costs | ${agg['mean_total_transaction_costs']:.2f} |")
+    lines.append("")
+
+    for em in per_ep:
+        ep = em["episode"]
+        lines.append(f"## Episode {ep}")
+        lines.append("")
+        lines.append("### Portfolio-level comparisons")
+        lines.append("")
+        lines.append("| Curve | Total Ret | Ann. Sharpe | Ann. Vol | Max DD | Final $ |")
+        lines.append("|---|---:|---:|---:|---:|---:|")
+        lines.append(f"| SAA portfolio | {fmt_curve(em['saa_portfolio'])} |")
+        lines.append(f"| Benchmark | {fmt_curve(em['benchmark'])} |")
+        lines.append(f"| Buy-and-hold (uniform) | {fmt_curve(em['bh_portfolio'])} |")
+        if em.get("bh_spy") is not None:
+            lines.append(f"| Buy-and-hold SPY | {fmt_curve(em['bh_spy'])} |")
+        lines.append("")
+        lines.append(f"![SAA vs Benchmark]({fig_rel}/ep{ep:02d}_01_saa_vs_benchmark.pdf)")
+        lines.append("")
+        lines.append(f"![SAA vs Buy-and-hold portfolio]({fig_rel}/ep{ep:02d}_02_saa_vs_bh_portfolio.pdf)")
+        lines.append("")
+        if em.get("bh_spy") is not None:
+            lines.append(f"![SAA vs Buy-and-hold SPY]({fig_rel}/ep{ep:02d}_04_saa_vs_bh_spy.pdf)")
+            lines.append("")
+        lines.append("### Per-asset SAA sub-portfolios vs Buy-and-hold")
+        lines.append("")
+        lines.append("| Asset | SAA Ret | SAA Sharpe | SAA MaxDD | B&H Ret | B&H Sharpe | Action μ±σ | Trade days |")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+        for a in asset_names:
+            pa = em["per_asset"][a]
+            saa_m = pa["saa_sub_portfolio"]
+            bh_m = pa["buy_and_hold"]
+            lines.append(
+                f"| {a} | {fmt_pct(saa_m['total_return'])} | {saa_m['annual_sharpe']:.2f} | "
+                f"{fmt_pct(saa_m['max_drawdown'])} | {fmt_pct(bh_m['total_return'])} | "
+                f"{bh_m['annual_sharpe']:.2f} | "
+                f"{pa['action_mean']:+.3f}±{pa['action_std']:.3f} | {pa['trade_days']} |"
+            )
+        lines.append("")
+        for a in asset_names:
+            lines.append(f"![{a} sub-pv vs B&H]({fig_rel}/ep{ep:02d}_03_perasset_{a}.pdf)")
+            lines.append("")
+            lines.append(f"![{a} price/action/position]({fig_rel}/ep{ep:02d}_05_panel_{a}.pdf)")
+            lines.append("")
+
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return md_path
 
 
 # ================================
@@ -806,20 +968,22 @@ def run(cache: MarketDataCache, config: Dict[str, Any]) -> Dict[str, Any]:
     """
     Main entry point. Loads SAA model, runs validation episodes, generates report.
     """
-    print("\n" + "=" * 70)
-    print("SAA PORTFOLIO INFERENCE TEST")
-    print("=" * 70)
+    print("\n" + "=" * 70, flush=True)
+    print("SAA PORTFOLIO INFERENCE TEST", flush=True)
+    print("=" * 70, flush=True)
 
     try:
         test_cfg = config.get("test_agent", {})
         num_episodes = int(test_cfg.get("num_episodes", 5))
         device = torch.device(test_cfg.get("device", "cpu"))
-        model_run_dir = test_cfg.get("saa_model_run_dir")
-        if not model_run_dir:
+        saa_zip_path = test_cfg.get("saa_model_run_dir")
+        if not saa_zip_path:
             raise ValueError("config['test_agent']['saa_model_run_dir'] is required.")
+        # Normalize path separators for cross-OS robustness.
+        saa_zip_path = os.path.normpath(saa_zip_path)
         seed = int(config.get("training", {}).get("seed", 42))
 
-        model, vecnorm = _load_saa_assets(model_run_dir, device)
+        model, vecnorm = _load_saa_assets(saa_zip_path, device)
 
         runner = SAAPortfolioInferenceRunner(
             cache=cache,
@@ -834,11 +998,15 @@ def run(cache: MarketDataCache, config: Dict[str, Any]) -> Dict[str, Any]:
         if not records:
             raise RuntimeError("No episodes completed successfully.")
 
-        # Output dir: <agent_dir>/<report_subdir>/<timestamp>/
-        agent_dir = os.path.dirname(__file__)
-        report_subdir = test_cfg.get("report_subdir", "reports")
-        timestamp = datetime.now().strftime("%y_%m_%d_%H_%M_%S")
-        output_dir = os.path.join(agent_dir, report_subdir, timestamp)
+        # Output: <SAA_agent_root>/reports/<run_dir_name>/<zip_stem>/
+        # SAA agent root is two levels up from the zip:
+        #   .../<agent_root>/saved_models/<run_dir_name>/<zip_name>
+        run_dir = os.path.dirname(saa_zip_path)
+        run_dir_name = os.path.basename(run_dir)
+        saved_models_dir = os.path.dirname(run_dir)
+        saa_agent_root = os.path.dirname(saved_models_dir)
+        zip_stem = os.path.splitext(os.path.basename(saa_zip_path))[0]
+        output_dir = os.path.join(saa_agent_root, "reports", run_dir_name, zip_stem)
         report = _generate_report(records, runner.asset_names, output_dir)
 
         agg = report["aggregate"]
@@ -860,11 +1028,10 @@ def run(cache: MarketDataCache, config: Dict[str, Any]) -> Dict[str, Any]:
             "aggregate": agg,
         }
 
-    except Exception as e:
-        print("\n[SAA-Test] Test failed:")
+    except Exception:
+        print("\n[SAA-Test] Test failed:", flush=True)
         traceback.print_exc()
-        return {
-            "agent": "test_saa_inference_portfolio",
-            "status": "failed",
-            "error": str(e),
-        }
+        sys.stdout.flush()
+        # Re-raise so main.py surfaces the failure prominently instead of silently
+        # printing a status dict that can be missed in long terminal output.
+        raise

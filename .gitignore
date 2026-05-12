@@ -16,6 +16,12 @@ runs/
 # # zip files
 # *.zip
 
+#pdf files
+.pdf
+
+# Exclude the full report section for now.
+reports/
+
 # utils
 utils/
 
