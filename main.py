@@ -34,6 +34,66 @@ def verify_requested_features(df: pd.DataFrame, config: dict) -> None:
         raise ValueError(f"Missing requested features in data: {sorted(missing)}")
     print(f"[verify_requested_features] All {len(requested)} requested features are present.")
 
+def _maybe_inherit_saa_training_config(config):
+    """
+    If `config['test_agent']['saa_model_run_dir']` is present, infer the SAA training
+    config that produced that checkpoint and shallow-merge its `environment`,
+    `saa_features`, `paa_asset_token_features`, `paa_portfolio_token_features`,
+    `agent`, and `training` sections into the test config (only where the test config
+    does not already define them). The training config id is extracted from the saved
+    run-directory name with pattern `<runid>_config_<cfgid>_<date>`.
+
+    No-op when `test_agent.saa_model_run_dir` is absent.
+    """
+    import re
+
+    test_cfg = config.get("test_agent", {})
+    saa_path = test_cfg.get("saa_model_run_dir")
+    if not saa_path:
+        return config
+
+    # saa_path may be a .zip file path or a directory; the run dir is its parent if .zip.
+    if saa_path.lower().endswith(".zip"):
+        run_dir = os.path.dirname(saa_path)
+    else:
+        run_dir = saa_path
+    run_dir_name = os.path.basename(os.path.normpath(run_dir))
+    m = re.search(r"_config_(\d+)_", run_dir_name)
+    if not m:
+        raise ValueError(
+            f"Cannot infer SAA training config id from run directory name: {run_dir_name!r}. "
+            "Expected pattern '<runid>_config_<cfgid>_<date>'."
+        )
+    cfg_id = m.group(1)
+
+    # Run dir lives at <agent_root>/saved_models/<run_dir_name>; training config sits
+    # alongside the agent root as config_<cfgid>.json.
+    saved_models_dir = os.path.dirname(os.path.normpath(run_dir))
+    saa_agent_root = os.path.dirname(saved_models_dir)
+    training_cfg_path = os.path.join(saa_agent_root, f"config_{cfg_id}.json")
+    if not os.path.isfile(training_cfg_path):
+        raise FileNotFoundError(f"Inferred SAA training config not found: {training_cfg_path}")
+
+    training_cfg = load_config(training_cfg_path)
+    inherit_keys = (
+        "environment",
+        "saa_features",
+        "paa_asset_token_features",
+        "paa_portfolio_token_features",
+        "agent",
+        "training",
+        "market_data_path",
+    )
+    for k in inherit_keys:
+        if k in training_cfg and k not in config:
+            config[k] = training_cfg[k]
+    # Record provenance for the test agent.
+    config.setdefault("test_agent", {})["_inherited_training_config_path"] = training_cfg_path
+    config["test_agent"]["_inherited_training_run_dir_name"] = run_dir_name
+    print(f"[main] SAA test config inherited sections {inherit_keys} from {training_cfg_path}")
+    return config
+
+
 def run_agent(agent_folder, config_path):
     """
     This function dynamically loads and runs the specified agent with the given configuration based on the .py file.
@@ -46,6 +106,7 @@ def run_agent(agent_folder, config_path):
     module_name = py_files[0].rsplit(".", 1)[0]
     mod = importlib.import_module(f"src.agents.{agent_folder}.{module_name}")
     config = load_config(config_path)
+    config = _maybe_inherit_saa_training_config(config)
 
     # Load market data from CSV into dataframe
     market_data_path = config.get("market_data_path") or os.path.join(os.path.dirname(__file__), "src", "data", "enriched_financial_data.csv")

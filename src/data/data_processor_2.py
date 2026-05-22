@@ -828,6 +828,6 @@ class DataEnricher:
 
 # Execution
 data_process_and_enrichment = DataEnricher(
-    input_raw_indices_filepath = r"C:\dev\pytrade\src\data\processed_multi_index_data.csv",
+    input_raw_indices_filepath = r"src\data\processed_multi_index_data.csv",
     input_raw_fx_filepath = None
 )

@@ -1,13 +1,11 @@
 {
-  "_comment_design": "Test config for SAA portfolio inference. environment + saa_features blocks MUST match the SAA training config of the model being loaded (cache feature ordering and obs dim depend on these). The agent overrides execution_mode to 'simple' at runtime so the env accepts TradeInstruction lists.",
+  "_comment_design": "Minimal SAA-portfolio-inference test config. ALL data-/env-/training-/agent-related sections are inherited at runtime (by main._maybe_inherit_saa_training_config) from the training config that produced the SAA checkpoint at saa_model_run_dir. The corresponding VecNormalize stats file is derived from the .zip path by replacing '.zip' with '_vecnormalize.pkl'.",
 
   "test_agent": {
+    "saa_model_run_dir": "src\\agents\\RecurrPPO_target_position_agent\\saved_models\\00212_config_01044_26_05_11\\best_model_alpha_return_mean.zip",
+    "num_episodes": 5,
     "device": "cpu",
-    "saa_model_run_dir": "src/agents/RecurrPPO_target_position_agent/saved_models/00210_config_01043_26_05_10",
     "allocation_mode": "uniform",
-    "deterministic_saa": true,
-    "report_subdir": "reports",
-    "_comment_action_factor": "Multiplicative cap applied to each SAA scalar action prior to interpretation. Should match the action_limiting_factor_end used during the SAA training so test-time action distribution mirrors deployment.",
-    "action_limiting_factor": 0.05
+    "deterministic_saa": true
   }
 }
