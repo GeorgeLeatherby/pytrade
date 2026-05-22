@@ -2147,7 +2147,10 @@ class TradingEnv(gym.Env):
 
         MODES:
             Single_asset_target_pos mode:
-                Action is target position for selected asset only; execute trade to reach target
+                Action is a target_position_change (selected asset only). Meaning it is the requested
+                change of the action as a fraction of the total intial portfolio value.
+                E.g. a 0.2 action output results in a requested notional change of
+                0.2*initial_portfolio_value. This is translated into shares (positions).
                 Only the given asset is tradable; other assets are held but not traded. This allows 
                 for focused learning on single-asset dynamics and clearer attribution of rewards to actions.
             
@@ -2164,7 +2167,8 @@ class TradingEnv(gym.Env):
                         Must sum to 1.0, representing target portfolio weights
 
             Simple/Tranche mode:
-                Actions must be list[TradeInstruction|dict]; execute per-instruction
+                Actions must be list[TradeInstruction|dict]; execute per-instruction.
+                Attention with the hardcoded dynamics of these modes!
 
         Returns:
             tuple: (observation, reward, terminated, truncated, info)
@@ -3273,6 +3277,7 @@ class TradingEnv(gym.Env):
         # Guard: valid price
         px = float(current_prices[asset_index]) if asset_index < num_assets else ValueError("Asset index out of range")
         if not np.isfinite(px) or np.isnan(px) or px <= 0.0:
+            print(f"price is {px}. Excecution not conducted because nan, inf or <= 0")
             return ExecutionResult(
                 current_step=self.current_step,
                 trades_executed=np.zeros(num_assets, dtype=np.float32),
@@ -3285,8 +3290,7 @@ class TradingEnv(gym.Env):
             )
 
         # Convert desired change to dollar notional based on current total portfolio value
-        total_value = float(portfolio_state.get_total_value())
-        desired_notional_change = target_position_change * total_value  # +buy dollars, -sell dollars
+        desired_notional_change = target_position_change * self.initial_portfolio_value  # +buy dollars, -sell dollars
 
         # Shares to trade from desired notional
         shares_to_trade = float(desired_notional_change / px) if px > 0 else 0.0
@@ -3327,7 +3331,7 @@ class TradingEnv(gym.Env):
         traded_notional_per_asset = np.zeros(num_assets, dtype=np.float32)
         total_transaction_costs = 0.0
 
-        # Build a shares vector for tc calc. Contains all 0s
+        # Init a shares vector for transaction cost calculation
         shares_vec = np.zeros(num_assets, dtype=np.float32)
 
         # Since only a single asset is traded there needs to be no selling before buying
@@ -3352,6 +3356,7 @@ class TradingEnv(gym.Env):
                 scaled_shares = float(np.floor(max(0.0, available_cash / max(denom, 1e-8))))
                 if scaled_shares <= 0:
                     # Cannot buy any shares
+                    print(f"Buying stopped in exection. Scaled share <= 0")
                     return ExecutionResult(
                         current_step=self.current_step,
                         trades_executed=np.zeros(num_assets, dtype=np.float32),
@@ -3765,8 +3770,7 @@ class TradingEnv(gym.Env):
                     executed_qty = delta  # negative shares means sell
             else:
                 # Should not reach here in portfolio mode
-                delta = 0.0
-                executed_qty = 0.0
+                raise ValueError("Trade instruction mode in simple/tranch non existent.")
 
             # Cash sufficiency for BUY legs
             if executed_qty > 0:
