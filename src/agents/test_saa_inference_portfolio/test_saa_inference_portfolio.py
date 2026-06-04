@@ -29,24 +29,14 @@ Workflow:
        matplotlib reports for the five comparisons listed in the preamble.
 
 DESIGN NOTES:
-    - The test config is intentionally minimal. main._maybe_inherit_saa_training_config
-      reads the SAA training config that produced the checkpoint at
-      ``test_agent.saa_model_run_dir`` (a specific .zip path) and shallow-merges its
-      ``environment``, ``saa_features``, ``agent``, ``training`` and
-      ``market_data_path`` sections into the test config before cache build. The
-      VecNormalize file is derived by replacing ``.zip`` with ``_vecnormalize.pkl``.
-    - The test runner overrides three env keys after merge: ``execution_mode → tranche``
-      (so env.step accepts a TradeInstruction list), ``percentage_of_cash_only_starts
-      → 1.0`` (deterministic cash-only baseline), ``min_initial_cash_allocation → 1.0``
-      (only consulted if random init branch ran).
-    - ``action_limiting_factor`` is taken from ``agent.action_limiting_factor_end`` of
-      the inherited training config so test-time action scale matches deployment.
-    - Per-asset "sub-portfolio" bookkeeping is virtual and serves only to build SAA
-      observations consistent with training-time distribution. Real shares live in
-      env.portfolio_state.positions; real cash is a shared pool that we re-divide
-      equally each step (initial_pv / N) to reflect "uniform cash allocation".
-    - Random-allocation mode and minimum-cash-allocation are listed as TODOs in the
-      preamble; an explicit NotImplementedError is raised when requested.
+    - The SAA training config of the loaded model must be loaded to run inference
+    — cache feature ordering and obs dim
+      depend on them. The test runner overrides ``execution_mode`` → "tranche"
+      so env.step() accepts a list[TradeInstruction] across all assets.
+    - Per-asset "sub-portfolio" bookkeeping is virtual. Real shares
+      live in env.portfolio_state.positions; real cash is a shared pool
+    - Random-allocation mode and minimum-cash-allocation are listed as TODOs in
+      the preamble; explicit NotImplementedError raised when requested.
 
 End of preamble.
 """
@@ -213,7 +203,7 @@ def _load_saa_assets(
 # ================================
 class SAAPortfolioInferenceRunner:
     """
-    Drives validation-mode episodes through a TradingEnv (EXECUTION_SIMPLE) and
+    Drives validation-mode episodes through a TradingEnv (EXECUTION_TRANCHE) and
     queries N deep-copied SAA models for per-asset target position changes.
 
     Shapes (N = num_assets, F_saa = number of enabled saa_features):
@@ -293,11 +283,7 @@ class SAAPortfolioInferenceRunner:
             )
         print(f"[SAA-Test] Model obs_dim={expected_obs_dim} -> use_one_hot={self.use_one_hot}")
 
-        # Build env config with test-time overrides on top of inherited training env block:
-        #   - execution_mode -> "tranche" so list[TradeInstruction] is interpreted as
-        #     per-step signed quantity deltas (not absolute share targets)
-        #   - cash-only start (we want deterministic baseline; SAA decides allocation)
-        #   - min_initial_cash_allocation set to 1.0 (only consulted if random branch runs)
+        # Build env in EXECUTION_TRANCHE mode (overrides whatever the SAA training used).
         env_cfg = copy.deepcopy(self.config)
         env_cfg["environment"]["execution_mode"] = "tranche"
         env_cfg["environment"]["percentage_of_cash_only_starts"] = 1.0
@@ -394,8 +380,7 @@ class SAAPortfolioInferenceRunner:
         # After first step of an episode the flag flips to False.
         self.episode_start_flags[:] = False
         # Scale by action_limiting_factor (matches SingleAssetEpisodeAdapter.step).
-        scaled_actions = np.clip(raw_actions * self.action_limiting_factor, -1.0, 1.0).astype(np.float32)
-        return raw_actions, scaled_actions
+        return (actions * self.action_limiting_factor)
 
     def _compute_instructions(
         self,
@@ -415,13 +400,12 @@ class SAAPortfolioInferenceRunner:
             requested_delta_notional: (N,) — desired notional change before buy scaling
             executed_delta_notional: (N,) — post-scaling notional change used for execution
         """
-        # Per-asset target & delta in notional terms.
-        sub_pv = sub_cash + sub_shares * prices                # (N,)
-        target_notional = scaled_actions * sub_pv              # (N,)  ∈ [-sub_pv, sub_pv]
+        # Per-asset target & delta in notional terms. alf: action_limiting_factor
+        target_notional = scaled_actions * self.initial_pv     # (N,)  ∈ alf * [-init_pv, init_pv]
         current_notional = sub_shares * prices                 # (N,)
         delta_notional = target_notional - current_notional    # (N,)
 
-        # Bound: SELL cannot exceed currently held notional (no short).
+        # Bound: SELL cannot exceed currently held notional (no shorting).
         sell_cap = -current_notional                            # most negative allowed
         delta_notional = np.maximum(delta_notional, sell_cap)
 

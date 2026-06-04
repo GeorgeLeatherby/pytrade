@@ -193,8 +193,8 @@ def select_agent_and_configs_gui():
                 return
             selected["configs"] = [os.path.join(agent_dir, jsons[i]) for i in selc]
             cfg_win.destroy(); root.destroy()
-        Button(cfg_win, text="Start", command=on_start).pack(padx=30, pady=12)
-    Button(root, text="Select Agent", command=on_select_agent).pack(padx=30, pady=12)
+        Button(cfg_win, text="Start", command=on_start).pack(padx=36, pady=14)
+    Button(root, text="Select Agent", command=on_select_agent).pack(padx=36, pady=14)
     root.mainloop()
     return selected["agent"], selected["configs"]
 

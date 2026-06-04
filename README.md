@@ -1,4 +1,8 @@
-Python Multi-Asset Trading DRL Experiment. As part of a University project on on-policy hierarchical agents this project sets out to explore trainability in chaotic, low-signal-to-noise, partially observable environments like OHLCV-data.
+[![Status: Development](https://img.shields.io/badge/Status-Development-orange.svg)]()
+
+
+# Pytrade
+Python Multi-Asset Trading DRL Experiment. As part of a University project on on-policy hierarchical agents this project sets out to explore trainability in low-signal-to-noise, partially observable environments like OHLCV-stock market data on selected large-scale ETFs and popular futures.
 
 
 ## Idea
