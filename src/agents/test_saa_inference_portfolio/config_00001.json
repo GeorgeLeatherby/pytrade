@@ -2,8 +2,8 @@
   "_comment_design": "Minimal SAA-portfolio-inference test config. ALL data-/env-/training-/agent-related sections are inherited at runtime (by main._maybe_inherit_saa_training_config) from the training config that produced the SAA checkpoint at saa_model_run_dir. The corresponding VecNormalize stats file is derived from the .zip path by replacing '.zip' with '_vecnormalize.pkl'.",
 
   "test_agent": {
-    "saa_model_run_dir": "src\\agents\\RecurrPPO_target_position_agent\\saved_models\\00212_config_01044_26_05_11\\best_model_alpha_return_mean.zip",
-    "num_episodes": 5,
+    "saa_model_run_dir": "src\\agents\\RecurrPPO_target_position_agent\\saved_models\\00209_config_01043_26_05_07\\best_model.zip",
+    "num_episodes": 4,
     "device": "cpu",
     "allocation_mode": "uniform",
     "deterministic_saa": true

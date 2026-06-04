@@ -35,7 +35,7 @@ DESIGN NOTES:
       ``environment``, ``saa_features``, ``agent``, ``training`` and
       ``market_data_path`` sections into the test config before cache build. The
       VecNormalize file is derived by replacing ``.zip`` with ``_vecnormalize.pkl``.
-    - The test runner overrides three env keys after merge: ``execution_mode → simple``
+    - The test runner overrides three env keys after merge: ``execution_mode → tranche``
       (so env.step accepts a TradeInstruction list), ``percentage_of_cash_only_starts
       → 1.0`` (deterministic cash-only baseline), ``min_initial_cash_allocation → 1.0``
       (only consulted if random init branch ran).
@@ -294,11 +294,12 @@ class SAAPortfolioInferenceRunner:
         print(f"[SAA-Test] Model obs_dim={expected_obs_dim} -> use_one_hot={self.use_one_hot}")
 
         # Build env config with test-time overrides on top of inherited training env block:
-        #   - execution_mode -> "simple" so env.step() accepts List[TradeInstruction]
+        #   - execution_mode -> "tranche" so list[TradeInstruction] is interpreted as
+        #     per-step signed quantity deltas (not absolute share targets)
         #   - cash-only start (we want deterministic baseline; SAA decides allocation)
         #   - min_initial_cash_allocation set to 1.0 (only consulted if random branch runs)
         env_cfg = copy.deepcopy(self.config)
-        env_cfg["environment"]["execution_mode"] = "simple"
+        env_cfg["environment"]["execution_mode"] = "tranche"
         env_cfg["environment"]["percentage_of_cash_only_starts"] = 1.0
         env_cfg["environment"]["min_initial_cash_allocation"] = 1.0
         self._env_cfg = env_cfg
@@ -370,12 +371,14 @@ class SAAPortfolioInferenceRunner:
         one_hot = np.eye(self.num_assets, dtype=np.float32)  # (N, N)
         return np.concatenate([market_plus_port, one_hot], axis=-1)  # (N, F_saa+4+N)
 
-    def _saa_predict_actions(self, obs_per_asset: np.ndarray) -> np.ndarray:
+    def _saa_predict_actions(self, obs_per_asset: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
         Run N independent SAA predictions. obs_per_asset shape: (N, F_saa+4).
-        Returns scaled actions of shape (N,) in [-1, 1]*action_limiting_factor.
+        Returns:
+            raw_actions: (N,) clipped to [-1, 1]
+            scaled_actions: (N,) = raw_actions * action_limiting_factor
         """
-        actions = np.zeros(self.num_assets, dtype=np.float32)
+        raw_actions = np.zeros(self.num_assets, dtype=np.float32)
         for a in range(self.num_assets):
             single_obs = obs_per_asset[a:a + 1, :]  # (1, F_saa+4)
             single_obs = _normalize_obs(single_obs, self.vecnorm)
@@ -387,11 +390,12 @@ class SAAPortfolioInferenceRunner:
                     deterministic=self.deterministic,
                 )
             self.lstm_states[a] = state_out
-            actions[a] = float(np.clip(act[0, 0], -1.0, 1.0))
+            raw_actions[a] = float(np.clip(act[0, 0], -1.0, 1.0))
         # After first step of an episode the flag flips to False.
         self.episode_start_flags[:] = False
         # Scale by action_limiting_factor (matches SingleAssetEpisodeAdapter.step).
-        return np.clip(actions * self.action_limiting_factor, -1.0, 1.0).astype(np.float32)
+        scaled_actions = np.clip(raw_actions * self.action_limiting_factor, -1.0, 1.0).astype(np.float32)
+        return raw_actions, scaled_actions
 
     def _compute_instructions(
         self,
@@ -408,8 +412,8 @@ class SAAPortfolioInferenceRunner:
 
         Returns:
             instructions: List[TradeInstruction]
-            requested_delta_shares: (N,) — pre-scaling desired share delta (for diagnostics)
-            executed_delta_notional: (N,) — post-scaling desired notional (used for analysis)
+            requested_delta_notional: (N,) — desired notional change before buy scaling
+            executed_delta_notional: (N,) — post-scaling notional change used for execution
         """
         # Per-asset target & delta in notional terms.
         sub_pv = sub_cash + sub_shares * prices                # (N,)
@@ -421,9 +425,7 @@ class SAAPortfolioInferenceRunner:
         sell_cap = -current_notional                            # most negative allowed
         delta_notional = np.maximum(delta_notional, sell_cap)
 
-        # Diagnostic: requested share delta pre-scaling.
-        with np.errstate(divide="ignore", invalid="ignore"):
-            requested_delta_shares = np.where(prices > 0, delta_notional / prices, 0.0).astype(np.float32)
+        requested_delta_notional = delta_notional.astype(np.float32)
 
         # Estimate cash after sells (approx; transaction costs handled by env).
         sells_notional = np.where(delta_notional < 0, -delta_notional, 0.0)
@@ -437,33 +439,51 @@ class SAAPortfolioInferenceRunner:
             scale = max(0.0, cash_after_sells / total_buys)
         scaled_buys = buys_notional * scale
         executed_delta_notional = (scaled_buys - sells_notional).astype(np.float32)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            executed_delta_shares = np.where(prices > 0, executed_delta_notional / prices, 0.0).astype(np.float32)
 
         instructions: List[TradeInstruction] = []
         # Sells first so env.execute_instructions sees freed cash before buys.
         for i in range(self.num_assets):
-            if sells_notional[i] > 1e-6 and prices[i] > 0:
+            qty = -float(executed_delta_shares[i])
+            if qty > 1e-8:
                 instructions.append(TradeInstruction(
                     symbol=self.asset_names[i],
                     action="SELL",
-                    notional=float(sells_notional[i]),
+                    quantity=qty,
                 ))
         for i in range(self.num_assets):
-            if scaled_buys[i] > 1e-6 and prices[i] > 0:
+            qty = float(executed_delta_shares[i])
+            if qty > 1e-8:
                 instructions.append(TradeInstruction(
                     symbol=self.asset_names[i],
                     action="BUY",
-                    notional=float(scaled_buys[i]),
+                    quantity=qty,
                 ))
-        return instructions, requested_delta_shares, executed_delta_notional
+        return instructions, requested_delta_notional, executed_delta_notional
 
     # ---------- main loop ----------
 
-    def run_episode(self, episode_idx: int) -> Dict[str, Any]:
+    def run_episode(
+        self,
+        episode_idx: int,
+        block_id: str,
+        episode_start_step: int,
+        episode_length_days: int,
+    ) -> Dict[str, Any]:
         """Run a single validation episode and return its per-step records."""
         print(f"[SAA-Test]   building env (validation mode)...", flush=True)
-        env = TradingEnv(self._env_cfg, self.cache, mode="validation")
+        env_cfg = copy.deepcopy(self._env_cfg)
+        env_cfg["environment"]["episode_length_days"] = int(episode_length_days)
+        env = TradingEnv(env_cfg, self.cache, mode="validation")
         print(f"[SAA-Test]   resetting env with seed={self.seed + episode_idx}...", flush=True)
-        env.reset(seed=self.seed + episode_idx)
+        env.reset(
+            seed=self.seed + episode_idx,
+            option={
+                "block_id": block_id,
+                "episode_start_step": int(episode_start_step),
+            },
+        )
 
         self._reset_lstm_states()
         print(
@@ -482,16 +502,18 @@ class SAAPortfolioInferenceRunner:
         sub_daily_return = np.zeros(N, dtype=np.float32)
         prev_sub_pv = sub_cash + sub_shares * env.portfolio_state.prices  # (N,)
 
-        # Pre-allocate per-step buffers (max length = episode_length_days).
-        T_max = int(self.config["environment"]["episode_length_days"]) + 2
+        # Pre-allocate per-step buffers (max length = planned episode length).
+        T_max = int(episode_length_days) + 2
         rec_portfolio_value = np.zeros(T_max, dtype=np.float64)
         rec_benchmark_value = np.zeros(T_max, dtype=np.float64)
         rec_comparison_value = np.zeros(T_max, dtype=np.float64)
         rec_cash = np.zeros(T_max, dtype=np.float64)
         rec_positions = np.zeros((T_max, N), dtype=np.float32)
         rec_prices = np.zeros((T_max, N), dtype=np.float32)
+        rec_raw_actions = np.zeros((T_max, N), dtype=np.float32)
         rec_actions = np.zeros((T_max, N), dtype=np.float32)
         rec_target_notional = np.zeros((T_max, N), dtype=np.float32)
+        rec_requested_delta_notional = np.zeros((T_max, N), dtype=np.float32)
         rec_executed_delta = np.zeros((T_max, N), dtype=np.float32)
         rec_costs = np.zeros(T_max, dtype=np.float64)
         rec_dates: List[str] = []
@@ -529,12 +551,12 @@ class SAAPortfolioInferenceRunner:
             # Step (1): build per-asset SAA obs from CURRENT (pre-trade) state.
             obs_per_asset = self._build_saa_obs(env, sub_cash, sub_shares, sub_last_action, sub_daily_return)
 
-            # Step (2): SAA predictions (scaled by action_limiting_factor).
-            scaled_actions = self._saa_predict_actions(obs_per_asset)
+            # Step (2): SAA predictions (raw in [-1,1], then scaled by action_limiting_factor).
+            raw_actions, scaled_actions = self._saa_predict_actions(obs_per_asset)
 
             # Step (3): convert to TradeInstructions with shared-cash logic.
             prices = env.portfolio_state.prices.copy()
-            instructions, _req_dshares, exec_delta_notional = self._compute_instructions(
+            instructions, req_delta_notional, exec_delta_notional = self._compute_instructions(
                 scaled_actions=scaled_actions,
                 sub_cash=sub_cash,
                 sub_shares=sub_shares,
@@ -567,8 +589,10 @@ class SAAPortfolioInferenceRunner:
                 rec_cash[t] = env.portfolio_state.cash
                 rec_positions[t] = new_shares
                 rec_prices[t] = new_prices
+                rec_raw_actions[t] = raw_actions
                 rec_actions[t] = scaled_actions
                 rec_target_notional[t] = scaled_actions * (sub_cash + sub_shares * new_prices)
+                rec_requested_delta_notional[t] = req_delta_notional
                 rec_executed_delta[t] = exec_delta_notional
                 rec_costs[t] = float(info.get("transaction_cost", 0.0)) if isinstance(info, dict) else 0.0
                 rec_sub_pv[t] = new_sub_pv
@@ -587,7 +611,9 @@ class SAAPortfolioInferenceRunner:
         comparison_value = rec_comparison_value[:T]
         positions = rec_positions[:T]
         prices_hist = rec_prices[:T]
+        raw_actions = rec_raw_actions[:T]
         actions = rec_actions[:T]
+        requested_delta_notional = rec_requested_delta_notional[:T]
         returns = rec_returns[1:T]  # skip leading 0 from index 0
         costs = rec_costs[:T]
         sub_pv_hist = rec_sub_pv[:T]
@@ -615,19 +641,56 @@ class SAAPortfolioInferenceRunner:
             "returns": returns,
             "positions": positions,
             "prices": prices_hist,
+            "raw_actions": raw_actions,
             "actions": actions,
+            "requested_delta_notional": requested_delta_notional,
+            "executed_delta_notional": rec_executed_delta[:T],
             "costs": costs,
             "sub_pv": sub_pv_hist,
             "initial_pv": initial_pv,
+            "block_id": block_id,
+            "episode_start_step": int(episode_start_step),
+            "episode_length_days": int(episode_length_days),
             "info_terminal": info if isinstance(info, dict) else {},
         }
         return record
 
+    def _validation_episode_plan(self) -> List[Tuple[str, int, int]]:
+        """Create deterministic validation episodes: each block segment exactly once."""
+        plans: List[Tuple[str, int, int]] = []
+        base_len = int(self.cache.episode_length_days)
+        blocks = sorted(self.cache.validation_blocks, key=lambda b: b.start_date_idx)
+        for b in blocks:
+            n = max(1, int(b.max_episodes))
+            for k in range(n):
+                start = int(b.min_start_step + k * base_len)
+                if start >= int(b.end_date_idx):
+                    continue
+                # Last segment extends to block end (can be > base_len).
+                if k == n - 1:
+                    end = int(b.end_date_idx)
+                else:
+                    end = min(int(b.end_date_idx), start + base_len)
+                if end <= start:
+                    continue
+                plans.append((str(b.block_id), start, int(end - start)))
+        return plans
+
     def run(self) -> List[Dict[str, Any]]:
-        for ep in range(self.num_episodes):
-            print(f"\n[SAA-Test] === Episode {ep + 1}/{self.num_episodes} ===", flush=True)
+        plan = self._validation_episode_plan()
+        print(f"[SAA-Test] Deterministic validation plan size: {len(plan)} episodes", flush=True)
+        for ep, (block_id, start_step, ep_len) in enumerate(plan):
+            print(
+                f"\n[SAA-Test] === Episode {ep + 1}/{len(plan)} | block={block_id} start={start_step} len={ep_len} ===",
+                flush=True,
+            )
             try:
-                rec = self.run_episode(ep)
+                rec = self.run_episode(
+                    episode_idx=ep,
+                    block_id=block_id,
+                    episode_start_step=start_step,
+                    episode_length_days=ep_len,
+                )
             except Exception:
                 print(f"[SAA-Test] Episode {ep} failed:", flush=True)
                 traceback.print_exc()
@@ -726,20 +789,35 @@ def _plot_asset_panel(
     out_path: str,
     asset_name: str,
     prices: np.ndarray,        # (T,)
+    raw_actions: np.ndarray,   # (T,) raw SAA output in [-1, 1]
     actions: np.ndarray,       # (T,) scaled action sent
+    req_delta_notional: np.ndarray,   # (T,)
+    exec_delta_notional: np.ndarray,  # (T,)
     positions: np.ndarray,     # (T,) shares
 ) -> None:
-    """Three-panel diagnostic plot: price, action, position over time for one asset."""
-    fig, axes = plt.subplots(3, 1, figsize=(7.0, 6.2), sharex=True)
+    """Five-panel diagnostic plot: price, raw/scaled action, requested/executed notional, position."""
+    fig, axes = plt.subplots(5, 1, figsize=(7.2, 9.6), sharex=True)
     axes[0].plot(prices, color="black")
     axes[0].set_ylabel("Price (USD)")
-    axes[0].set_title(f"{asset_name}: price, SAA action, position")
-    axes[1].plot(actions, color="tab:blue")
+    axes[0].set_title(f"{asset_name}: price, SAA actions, requested/executed notionals, position")
+
+    axes[1].plot(raw_actions, color="tab:green")
     axes[1].axhline(0.0, color="grey", linestyle="--", linewidth=0.6)
-    axes[1].set_ylabel("Action (scaled)")
-    axes[2].plot(positions, color="tab:orange")
-    axes[2].set_ylabel("Position (shares)")
-    axes[2].set_xlabel("Trading day")
+    axes[1].set_ylabel("Action raw")
+
+    axes[2].plot(actions, color="tab:blue")
+    axes[2].axhline(0.0, color="grey", linestyle="--", linewidth=0.6)
+    axes[2].set_ylabel("Action scaled")
+
+    axes[3].plot(req_delta_notional, color="tab:purple", label="Requested")
+    axes[3].plot(exec_delta_notional, color="tab:red", alpha=0.8, label="Executed")
+    axes[3].axhline(0.0, color="grey", linestyle="--", linewidth=0.6)
+    axes[3].set_ylabel("Delta $")
+    axes[3].legend(loc="best", frameon=False)
+
+    axes[4].plot(positions, color="tab:orange")
+    axes[4].set_ylabel("Position (shares)")
+    axes[4].set_xlabel("Trading day")
     fig.tight_layout()
     fig.savefig(out_path)
     plt.close(fig)
@@ -766,7 +844,10 @@ def _generate_report(
         bh_per_asset = rec["bh_per_asset_value"]    # (T, N)
         sub_pv = rec["sub_pv"]                       # (T, N)
         prices = rec["prices"]                       # (T, N)
+        raw_actions = rec["raw_actions"]             # (T, N)
         actions = rec["actions"]                     # (T, N)
+        req_delta_notional = rec["requested_delta_notional"]  # (T, N)
+        exec_delta_notional = rec["executed_delta_notional"]  # (T, N)
         positions = rec["positions"]                 # (T, N)
 
         # --- Comparison 1: SAA portfolio vs benchmark (env's allocated benchmark) ---
@@ -808,7 +889,10 @@ def _generate_report(
                 out_path=os.path.join(fig_dir, f"ep{ep_idx:02d}_05_panel_{a_name}.pdf"),
                 asset_name=a_name,
                 prices=prices[:, a_idx],
+                raw_actions=raw_actions[:, a_idx],
                 actions=actions[:, a_idx],
+                req_delta_notional=req_delta_notional[:, a_idx],
+                exec_delta_notional=exec_delta_notional[:, a_idx],
                 positions=positions[:, a_idx],
             )
 
@@ -824,8 +908,12 @@ def _generate_report(
                 a_name: {
                     "saa_sub_portfolio": _curve_metrics(sub_pv[:, a_idx]),
                     "buy_and_hold": _curve_metrics(bh_per_asset[:, a_idx]),
+                    "raw_action_mean": float(raw_actions[:, a_idx].mean()),
+                    "raw_action_std": float(raw_actions[:, a_idx].std()),
                     "action_mean": float(actions[:, a_idx].mean()),
                     "action_std": float(actions[:, a_idx].std()),
+                    "requested_delta_notional_mean": float(req_delta_notional[:, a_idx].mean()),
+                    "executed_delta_notional_mean": float(exec_delta_notional[:, a_idx].mean()),
                     "trade_days": int(np.sum(np.abs(np.diff(positions[:, a_idx])) > 0)),
                 }
                 for a_idx, a_name in enumerate(asset_names)

@@ -1701,10 +1701,30 @@ class TradingEnv(gym.Env):
             else:
                 raise ValueError("In SINGLE_ASSET_TARGET_POS mode, 'asset' parameter must be specified in reset().")
 
-        # Step 1: Sample new episode start from appropriate blocks
-        self.current_block_id, self.current_episode_start_step = self.market_data_cache.sample_episode_start(
-            mode=self.mode, random_seed=seed
-        )
+        # Step 1: Select episode start.
+        # Deterministic path (used by SAA test runner): caller can provide a concrete
+        # absolute start index in `option["episode_start_step"]`.
+        forced_start = None if option is None else option.get("episode_start_step", None)
+        forced_block_id = None if option is None else option.get("block_id", None)
+
+        if forced_start is not None:
+            self.current_episode_start_step = int(forced_start)
+            if self.current_episode_start_step < 0 or self.current_episode_start_step >= self.market_data_cache.num_days:
+                raise ValueError(f"episode_start_step out of bounds: {self.current_episode_start_step}")
+
+            if forced_block_id is not None:
+                self.current_block_id = str(forced_block_id)
+            else:
+                blocks = self.market_data_cache.train_blocks if self.mode == 'train' else self.market_data_cache.validation_blocks
+                matched = [
+                    b for b in blocks
+                    if b.min_start_step <= self.current_episode_start_step <= b.max_start_step
+                ]
+                self.current_block_id = matched[0].block_id if matched else f"forced_{self.mode}"
+        else:
+            self.current_block_id, self.current_episode_start_step = self.market_data_cache.sample_episode_start(
+                mode=self.mode, random_seed=seed
+            )
 
         # Calculate absolute step in full dataset. Very important for correct market data retrieval!
         self.current_absolute_step = int(self.current_episode_start_step + self.current_step)
