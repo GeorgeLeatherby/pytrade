@@ -865,7 +865,7 @@ class MarketDataCache:
             maybe_provide_sequence=maybe_provide_sequence
         )
         
-        # NEW: Create time series blocks
+        # Create time series blocks
         instance._create_time_series_blocks(block_buffer_multiplier, test_val_split_ratio)
         
         return instance
@@ -1774,8 +1774,8 @@ class TradingEnv(gym.Env):
 
         # Single-asset target position mode: cash-only or random allocation between cash and assets
         if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
-            # Single asset tradable only! Other assets are initialised (including costs) but not traded!
-            # Uses perc_of_cash_only_starts (range: 0-1) to determine cash-only or random allocation start
+            # Single-asset-only setup: initialize in cash or selected-asset position.
+            # No non-selected asset may be held at episode start in this mode.
             if np.random.random() < self.perc_of_cash_only_starts:
                 # Cash-only start (no transaction costs)
                 initial_cash = self.initial_portfolio_value
@@ -1786,23 +1786,17 @@ class TradingEnv(gym.Env):
                 self.saa_selected_asset_value = 0.0
                 self.saa_initial_subportfolio_value = self.saa_initial_cash + self.saa_selected_asset_value
             else:
-                # Random allocation between cash and assets
-                rand_weights = np.random.dirichlet(np.ones(self.market_data_cache.num_assets + 1))
-                
-                # Calculate target positions
-                cash_weight = rand_weights[0]
-                assets_weights = rand_weights[1:] # weights for all assets
-                assets_notional = self.initial_portfolio_value * assets_weights # notional dollar vals
-
-                all_positive = (initial_prices > 0).all()
-                if all_positive:
-                    assets_shares = assets_notional / initial_prices
-                else:
+                # Random start between selected asset and cash only.
+                selected_asset_price = float(initial_prices[self.selected_asset_index])
+                if selected_asset_price <= 0:
                     raise ValueError(f"Initial price for selected asset index {self.selected_asset_index} is zero or negative.")
-                
-                # Build target positions vector
+
+                selected_asset_weight = float(np.random.random())
+                selected_asset_notional = self.initial_portfolio_value * selected_asset_weight
+
+                # Build selected-asset-only target positions vector [num_assets]
                 target_positions = np.zeros(num_assets, dtype=np.float32)
-                target_positions[:] = assets_shares # all assets
+                target_positions[self.selected_asset_index] = float(selected_asset_notional / selected_asset_price)
                 
                 # Apply transaction costs with iterative downscaling to prevent negative cash
                 initial_cash, initial_positions, total_init_tc = self._initialize_portfolio_with_costs(

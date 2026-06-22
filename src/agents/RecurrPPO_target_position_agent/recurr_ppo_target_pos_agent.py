@@ -64,7 +64,7 @@ import gymnasium as gym
 # Import the single-asset environment (reuses data containers/classes defined there)
 # The `cache` object passed by main.py comes from src.environment.single_asset_target_pos_drl_trading_env.MarketDataCache;
 # runtime type checks are duck-typed—if attributes match, it works.
-from src.environment.single_asset_target_pos_drl_trading_env import TradingEnv
+from environment.trading_environment import TradingEnv
 import json
 
 
@@ -768,6 +768,14 @@ def build_env(cache, config: Dict[str, Any], seed: Optional[int] = None, for_eva
     """
     mode = "validation" if for_eval else "train"
     env = TradingEnv(config, cache, mode=mode)
+
+    expected_mode = "single_asset_target_position"
+    configured_mode = str(config.get("environment", {}).get("execution_mode", ""))
+    if configured_mode != expected_mode:
+        raise ValueError(
+            f"RecurrPPO_target_position_agent requires environment.execution_mode='{expected_mode}', "
+            f"got '{configured_mode}'."
+        )
 
     # Action limiting factor schedule (multiplicative) — supports flat agent config keys
     agent_cfg = config.get("agent", {})

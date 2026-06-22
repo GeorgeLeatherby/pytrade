@@ -72,7 +72,7 @@ import matplotlib.pyplot as plt
 from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
 
-from src.environment.single_asset_target_pos_drl_trading_env import (
+from environment.trading_environment import (
     TradingEnv,
     MarketDataCache,
     TradeInstruction,

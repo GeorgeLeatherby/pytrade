@@ -3,7 +3,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
 import json, importlib
 import pandas as pd
 from tkinter import Tk, Listbox, SINGLE, MULTIPLE, Button, Label, END, Toplevel, messagebox
-from src.environment.single_asset_target_pos_drl_trading_env import MarketDataCache
+from environment.trading_environment import MarketDataCache
 
 AGENTS_DIR = os.path.join(os.path.dirname(__file__), "src", "agents")
 

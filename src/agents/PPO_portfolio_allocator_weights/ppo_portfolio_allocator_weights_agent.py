@@ -47,8 +47,8 @@ from stable_baselines3.common.evaluation import evaluate_policy
 
 import gymnasium as gym
 
-from src.environment.single_asset_target_pos_drl_trading_env import TradingEnv
-from src.environment.single_asset_target_pos_drl_trading_env import MarketDataCache
+from environment.trading_environment import TradingEnv
+from environment.trading_environment import MarketDataCache
 
 
 # ================================

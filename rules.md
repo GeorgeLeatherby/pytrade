@@ -1,24 +1,26 @@
 ## General rules of behaviour:
-Only implement what is requested.
+Only implement what is requested. You may state more findings but await user instructions to do so.
 Always reason and seek context of other code and conversation before implementing.
+Always make a plan before execution and carefully review this plan.
 If there is an unclarity, instead of providing code, ask questions to clarify.
 State all your assumptions. Explain why you implement each change. Explain why a proposed bug fix should help in context with the existing code and the error.
-Verify all handshakes. Verify all shapes of returned objects with the expected shapes.
+Verify all handshakes. Verify all shapes of returned objects and variables with the expected shapes.
+Follow a strict seperation of concerns! Assume that a production grade unit testing will follow on the implemented code.
 
 When working with environment incorporation, only introduce a wrapper if really necessary! If possible use or add to existing wrappers! Make sure to fully understand the relevant environment sections first, before starting to code. If there are unclarities, ask first.
 
-Apply computationally efficient code. Stay in torch native functions whenever possible. Avoid loops, when vectorized computation is possible.
+Apply computationally efficient code. Stay in torch native functions whenever possible. Avoid loops, when vectorized computation is possible. 
 
 Use in config file defined paramteres always! If a new variable needs to be introduced in the code, this needs to be clearly stated and explained in the answer. THis new variable needs to be added to the config!
 
-Always prefer simple implementations over complicated ones. 
+Always prefer simple implementations over complicated ones. Prefer and develop modular code.
 Write the intended/needed shape in commentary next to objects when initiating or returning.
 
 Always stick to already used nomenclature.
 
 Prefer sb3 and PyTorch onboard methods and functions.
 
-Search for documentation of used packages. Often these will have onboard solutions for problems.
+Search for documentation of used packages. Often these will have onboard solutions for problems and clear definitions of needed syntax.
 
 ## Conventions
 Cashweight is first element in vectors
@@ -26,10 +28,10 @@ Cashweight is first element in vectors
 In any Observations or Token creations the Asset Infor/Token comes first and the Portfolioinfo/Token comes Last (N+1 element)
 
 ## Project specific setup:
-DRL hierarchical on-policy agent(s) working with a custom Trading Environment to find portfolio allocation strategies. Step size is daily. Data is from 25 years of real markets of 11 assets. The data is loaded up into a cache object inside main.py and handed over to subsequent functions. The SAA is trained first, then used in inference mode (frozen). SAA is trained generally on all 11 assets rotating randomly. When using SAA in inference mode we need N copies of the SAA agent, each perceiving its specified observation for its assigned asset, due to the SAA being stateful. We then take the N outputs (actions) of the SAA and enrich each asset token of the PAA with their information. The PAA receives N asset tokens and 1 Portfolio Token. The PAA performes asset/portfolio self-attention. In Portfolio_weights execution mode it outputs N+1 weights which are interpreted by the TradingEnv as requested cash_weight + N asset_weights. Softmax Normalisation of PAA actions is performed inside the Environment.
+DRL hierarchical on-policy agent(s) working with a custom Trading Environment to find portfolio allocation strategies. Step size is daily. Data is from 25 years of real markets of 11 assets. The data is loaded up into a cache object inside main.py and handed over to subsequent functions. The SAA is trained first, then used in inference mode (frozen). SAA is trained generally on all 11 assets rotating randomly. When using SAA in inference mode we need N copies of the SAA agent, each perceiving its specified observation for its assigned asset, due to the SAA being stateful. We then take the N outputs (actions) of the SAA and enrich each asset token of the PAA with their information. The PAA receives N asset tokens and 1 Portfolio Token. The PAA performes asset/portfolio self-attention. In Portfolio_weights execution mode it outputs N+1 weights which are interpreted by the TradingEnv as requested cash_weight + N asset_weights. Softmax Normalisation of PAA actions is performed inside the Environment. In PAA cash is ultimately added as a relative metric - it is always added as a 0 to the softmax normalization. THis aims to prevent ambigous outputs by the PAA.
 
 N: # of assets (here 11)
-Single Env always only! No multiple Envs in training ever.
+Note that there exists and is used an implementation for multi env 
 
 # Simulation (single_asset_target_pos_drl_trading.env)
 2 different execution_mode: EXECUTION_SINGLE_ASSET_TARGET_POS & EXECUTION_PORTFOLIO_WEIGHTS
@@ -43,7 +45,7 @@ with weights[0] = cash_weight and len(weights)= N+1
 # SAA setup (recurr_ppo_target_pos_agent.py):
 SB3 Recurrent PPO, LSTM. Perceiving a randomly (by env) choosen asset each episode. Intended to find general patterns inside the time sequence data. 
 
-Action space: (1,) between -1 to 1. Is interpreted by TradingEnv as requested change in current position in magnitude of a percentage of total portfolio value. Gets directly executed if fitting to defined thresholds. Thresholds were defined to lower initial churn. 
+Action space: (1,) between -1 to 1. Is interpreted by TradingEnv as requested change in current position in magnitude of a percentage of total portfolio value or initial portfolio value. Gets directly executed if fitting to defined thresholds. Thresholds were defined to lower initial churn. 
 
 SAA observation: 
 Features to receive from the MarketDataCache object via TradingEnv are marked inside config key: saa_features. They have a boolean which is set to True.
@@ -54,12 +56,9 @@ form: (32,)
 # PAA setup (ppo_portfolio_allocator_weights_agent.py):
 SB3 PPO, Torch Transformer. Performs self-attention over asset tokens (and a single portfolio token). 
 
-Action space: (12,), between 0 to 1. Interpreted by the TradingEnv as requested cash_weight + N asset_weights. Softmax Normalisation of PAA actions is performed inside the Environment.
+Action space: (11,), between 0 to 1. N: 11 (number of assets). Interpreted by the TradingEnv as requested N asset_weights. The cash weight is added as permanent 0 to the softmax normalization to produce unambigous outputs. Softmax Normalisation of PAA actions is performed inside the Environment.
 
 PAA observation: 
-Features to receive from the MarketDataCache object via TradingEnv for asset tokens are marked inside config key: paa_asset_token_features. They have a boolean which is set to True.
-N Asset-tokens: 24 asset-specific (defined in paa_asset_token_features) + assets SAA signal + asset_weight
-form: (26,)
-
+(Undergoing changes!)
 Features to receive from the MarketDataCache object via TradingEnv for portfolio tokens are marked inside config key: paa_asset_portfolio_features. They have a boolean which is set to True.
 1 Portfolio Token: 6 time features (dow_sin, dow_cos, dom_sin, dom_cos, moy_sin, moy_cos), 8 portfolio-wide features: (cash_weight, differential_sharpe, max_drawdown_level_change, volatilty, turnover, effective_concentration (Inverse Herfindahl-Hirschman Index), vix (Volatility Index), alpha (to benchmark. Given as Differential Log return. Maybe one for 1-day one for 20-day))
