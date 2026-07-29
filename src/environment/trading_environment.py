@@ -3296,7 +3296,7 @@ class TradingEnv(gym.Env):
         saa_excess_log_return = saa_log_return - passive_log_return
 
         # Simple log return reward
-        saa_excess_return_scaled = 10 * saa_excess_log_return  # Scale factor to get reasonable reward magnitudes
+        saa_excess_return_scaled = 50 * saa_excess_log_return  # Scale factor to get reasonable reward magnitudes
 
         scaled_log_diff_sortino = 50 * log_diff_sortino_reward
 
@@ -3318,7 +3318,8 @@ class TradingEnv(gym.Env):
         # Calculate the continuous Gaussian reward
         # Peak of 'hold_reward_weight' at action=0, decaying as action moves away
         # action_holding_reward = self.action_hold_reward_weight_omega * np.exp(-(action**2) / (2 * (self.action_forgiveness_width_sigma**2)))
-        action_holding_reward = self.action_hold_reward_weight_omega * (1 - abs(action)**2)
+
+        # action_holding_reward = self.action_hold_reward_weight_omega * (1 - abs(action)**2)
 
         # Execution gap penalty: penalizes deviation between requested and executed action
         total_value_before = float(selected_asset_notional_before + saa_cash_before)
@@ -3326,9 +3327,9 @@ class TradingEnv(gym.Env):
         execution_gap_penalty = float(self.lambda_execution_gap * abs(action - action_executed))
         # 
 
-        saa_reward_raw = (saa_excess_return_scaled - max_drawdown_penalty - execution_gap_penalty)
+        saa_reward_raw = saa_excess_return_scaled - max_drawdown_penalty - execution_gap_penalty + scaled_log_diff_sortino
 
-        saa_reward = np.tanh(saa_reward_raw / 2.0) * 2.0 # Scale to [-2, 2] range
+        saa_reward = np.tanh(saa_reward_raw / 5.0) * 5.0 # Scale to [-5, 5] range
         
         # NOTE: Several values here get used to fill portfolio wide metrics in the episode buffer.
         saa_reward_parts = {
