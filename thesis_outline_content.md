@@ -58,6 +58,11 @@ I am testing whether a neural network can allocate assets more efficiently when 
 * **4.8 Control (Randomized signal):** The hierarchical setup but with the SAA signals replaced by structured noise, testing whether performance gains stem from actual historical information rather than mere architectural complexity.
 * **4.9 Monolithic Baseline (End-to-end memory):** A standard recurrent PPO allocator that must learn both temporal memory and cross-asset allocation simultaneously. Might introduce a 2-layer LSTM to the PAA before or after transformer?
 
+
+NOTE: Erst erklären was man vergleichen möchte und warum. Dann erst in einem nächsten Kapitel die Ergebnisse präsentieren. 
+
+Idee für baselines: Rule-based investment mit-checken. 
+
 ## 5. Conclusion & Future Work
 * **5.1 Summary of Findings:** Validating the hierarchical approach for Financial RL and the success of "Box-based" reward shaping in stabilizing SAA agents.
 * **5.2 Limitations:** Data frequency constraints, the impact of zero-friction training assumptions, and the "sim-to-real" gap.

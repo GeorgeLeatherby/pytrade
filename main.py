@@ -7,6 +7,9 @@ from environment.trading_environment import MarketDataCache
 
 AGENTS_DIR = os.path.join(os.path.dirname(__file__), "src", "agents")
 
+# Fix 
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
 def discover_agents():
     agents = []
     for entry in os.listdir(AGENTS_DIR):

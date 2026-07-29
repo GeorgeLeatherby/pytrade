@@ -220,12 +220,14 @@ class EpisodeBuffer:
     portfolio_positions: np.ndarray = field(init=False)         # [episode_buffer_length_days, num_assets] - number of shares held each step
     comparison_portfolio_value: np.ndarray = field(init=False)  # [episode_buffer_length_days] - comparison portfolio value each step
     benchmark_portfolio_value: np.ndarray = field(init=False)   # [episode_buffer_length_days] - benchmark portfolio value each step
+    selected_asset_bh_portfolio_value: np.ndarray = field(init=False)  # [episode_buffer_length_days] - selected asset buy-and-hold portfolio value (SAA mode only)
     alpha: np.ndarray = field(init=False)                       # [episode_buffer_length_days] - excess returns over benchmark
     returns: np.ndarray = field(init=False)                     # [episode_buffer_length_days] - daily returns
     saa_returns: np.ndarray = field(init=False)                 # [episode_buffer_length_days] - daily returns of single-asset-agent (cash + selected asset)
     rewards: np.ndarray = field(init=False)           # [episode_buffer_length_days] - RL allocator rewards
     actions: np.ndarray = field(init=False)                     # [episode_buffer_length_days, num_assets+1] - agent actions
-    transaction_costs: np.ndarray = field(init=False)           # [episode_buffer_length_days] - costs per step
+    transaction_costs: np.ndarray = field(init=False)           # [episode_buffer_length_days] - costs per step (agent/allocator)
+    selected_asset_bh_transaction_costs: np.ndarray = field(init=False)  # [episode_buffer_length_days] - costs for selected asset buy-and-hold (SAA mode only)
     sharpe_ratio: np.ndarray = field(init=False)                # [episode_buffer_length_days] - rolling sharpe ratio
     drawdown: np.ndarray = field(init=False)                    # [episode_buffer_length_days] - rolling max drawdown
     volatility: np.ndarray = field(init=False)                  # [episode_buffer_length_days] - rolling volatility
@@ -254,12 +256,14 @@ class EpisodeBuffer:
         self.portfolio_positions = np.zeros((self.episode_buffer_length_days, self.num_assets), dtype=dtype)
         self.comparison_portfolio_value = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         self.benchmark_portfolio_value = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.selected_asset_bh_portfolio_value = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         self.alpha = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         self.returns = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         self.saa_returns = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         self.rewards = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         self.actions = np.zeros((self.episode_buffer_length_days, self.num_assets + 1), dtype=dtype)
         self.transaction_costs = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.selected_asset_bh_transaction_costs = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         self.sharpe_ratio = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         self.drawdown = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         self.volatility = np.zeros(self.episode_buffer_length_days, dtype=dtype)
@@ -304,7 +308,8 @@ class EpisodeBuffer:
                    action_entropy: float = 0.0, saa_reward_parts: Optional[Dict[str, float]] = None,
                    reward_parts: Optional[Dict[str, float]] = None,
                    effective_asset_concentration_norm: float = 0.0, previous_sortino: float = 0.0, current_sortino: float = 0.0,
-                   running_mean_ema: float = 0.0, downside_var_sqrt: float = 0.0, previous_max_drawdown: float = 0.0) -> None:
+                   running_mean_ema: float = 0.0, downside_var_sqrt: float = 0.0, previous_max_drawdown: float = 0.0,
+                   selected_asset_bh_portfolio_value: float = 0.0, selected_asset_bh_transaction_cost: float = 0.0) -> None:
         
         """
         Record step data efficiently. external_step: 0-based episode day index (first real day = 0)
@@ -326,6 +331,7 @@ class EpisodeBuffer:
         self.rewards[internal_offset_step] = reward_to_record
         self.actions[internal_offset_step] = action
         self.transaction_costs[internal_offset_step] = transaction_cost
+        self.selected_asset_bh_transaction_costs[internal_offset_step] = selected_asset_bh_transaction_cost
         self.asset_prices[internal_offset_step] = prices
         self.sharpe_ratio[internal_offset_step] = sharpe_ratio
         self.drawdown[internal_offset_step] = drawdown
@@ -334,6 +340,7 @@ class EpisodeBuffer:
         self.alpha[internal_offset_step] = alpha
         self.comparison_portfolio_value[internal_offset_step] = comparison_portfolio_value
         self.benchmark_portfolio_value[internal_offset_step] = benchmark_portfolio_value
+        self.selected_asset_bh_portfolio_value[internal_offset_step] = selected_asset_bh_portfolio_value
         self.traded_dollar_volume[internal_offset_step] = float(traded_dollar_volume)
         self.traded_shares_total[internal_offset_step] = float(traded_shares_total)
         self.action_entropy[internal_offset_step] = float(action_entropy)
@@ -1526,6 +1533,17 @@ class TradingEnv(gym.Env):
             terminated=False             # Not terminated
         )
 
+        # Create selected asset buy-and-hold portfolio state (SAA mode only)
+        # Used to track a pure buy-and-hold strategy of the selected asset for comparison
+        self.selected_asset_bh_portfolio_state = PortfolioState(
+            cash=0.0,
+            positions=np.array([0.0] * self.market_data_cache.num_assets),
+            prices=np.array([0.0] * self.market_data_cache.num_assets),
+            step=0,
+            terminated=False
+        )
+        self.selected_asset_bh_init_transaction_cost = 0.0  # Track initialization cost for selected asset BH
+
         # Create EpisodeBuffer instance. Only pass required arguments; __post_init__ will handle array initialization.
         if self.maybe_provide_sequence:
             required_buffer_size_days = self.lookback_window + self.episode_length_days
@@ -1763,7 +1781,8 @@ class TradingEnv(gym.Env):
         self._ep_exposure_sum = 0.0
         self._ep_exposure_steps = 0
 
-        # Shadow (frictionless) portfolio mirrors live trades without costs
+        # Shadow (frictionless) portfolio mirrors live trades without costs. 
+        # Has nothing to do with the shadow portfolio technique used by the saa for isolation purpose!
         self.shadow_portfolio_state = PortfolioState(
             cash=self.initial_portfolio_value,
             positions=np.zeros(num_assets, dtype=np.float32),
@@ -1907,7 +1926,10 @@ class TradingEnv(gym.Env):
             terminated=False
         )
 
-        # update comparison portfolio in the same way to be able to verify if trades are giving alpha vs initialisation
+        # update comparison portfolio (buy-and-hold reference) with same initial state as main portfolio
+        # This allows measuring alpha: portfolio_return - comparison_return
+        # Note: comparison portfolio receives same positions & cash (after transaction costs paid)
+        # It then only receives price updates and cash drag, no trades
         init_cash_comparison = initial_cash
         init_positions_comparison = initial_positions.copy()
 
@@ -1974,6 +1996,44 @@ class TradingEnv(gym.Env):
             terminated=False
         )
 
+        # Initialize selected asset buy-and-hold portfolio (SAA mode only)
+        # This portfolio: 1) pays transaction costs to buy selected asset, 2) holds until episode end
+        if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
+            # Allocate 100% available cash (after benchmark costs) to selected asset
+            bh_available_value = self.initial_portfolio_value  # Start with full portfolio value
+            
+            # Build target: 100% into selected asset only
+            bh_target_positions = np.zeros(num_assets, dtype=np.float32)
+            bh_target_positions[self.selected_asset_index] = bh_available_value / initial_prices[self.selected_asset_index]
+            
+            # Apply transaction costs with auto-resizing
+            bh_cash, bh_positions, bh_init_tc = self._initialize_portfolio_with_costs(
+                target_positions=bh_target_positions,
+                initial_prices=initial_prices,
+                initial_value=bh_available_value,
+                allow_cash_residual=True,  # Allow small cash residual
+                max_iterations=10
+            )
+            
+            self.selected_asset_bh_portfolio_state.portfolio_reset(
+                cash=bh_cash,
+                positions=bh_positions,
+                prices=initial_prices,
+                step=self.current_step,
+                terminated=False
+            )
+            self.selected_asset_bh_init_transaction_cost = bh_init_tc
+        else:
+            # Non-SAA mode: initialize to empty
+            self.selected_asset_bh_portfolio_state.portfolio_reset(
+                cash=self.initial_portfolio_value,
+                positions=np.zeros(num_assets, dtype=np.float32),
+                prices=initial_prices,
+                step=self.current_step,
+                terminated=False
+            )
+            self.selected_asset_bh_init_transaction_cost = 0.0
+
         # Validate initial portfolio value matches configuration (allowing for small rounding)
         actual_initial_value = self.portfolio_state.get_total_value()
         if abs(actual_initial_value - self.initial_portfolio_value) > 100:  # $100 tolerance for TC rounding
@@ -2016,7 +2076,9 @@ class TradingEnv(gym.Env):
             alpha=0.0,
             benchmark_portfolio_value=self.benchmark_portfolio_state.get_total_value(),
             comparison_portfolio_value=self.comparison_portfolio_state.get_total_value(),
-            effective_asset_concentration_norm=effective_asset_concentration_norm
+            effective_asset_concentration_norm=effective_asset_concentration_norm,
+            selected_asset_bh_portfolio_value=self.selected_asset_bh_portfolio_state.get_total_value(),
+            selected_asset_bh_transaction_cost=self.selected_asset_bh_init_transaction_cost
         )
         
         # Seed per-asset SAA sub-portfolios for PORTFOLIO_WEIGHTS mode.
@@ -2406,9 +2468,13 @@ class TradingEnv(gym.Env):
         self.shadow_portfolio_state.prices[:] = new_prices
         self.shadow_portfolio_state.step = self.current_step
 
-        # Update comparison portfolio state
+        # Update comparison portfolio state (buy-and-hold reference)
         self.comparison_portfolio_state.prices[:] = new_prices # in-place update
         self.comparison_portfolio_state.step = self.current_step
+
+        # Update selected asset buy-and-hold portfolio state (SAA mode only)
+        self.selected_asset_bh_portfolio_state.prices[:] = new_prices
+        self.selected_asset_bh_portfolio_state.step = self.current_step
 
         # Update benchmark portfolio state
         self.benchmark_portfolio_state.prices[:] = new_prices # in-place update
@@ -2423,6 +2489,7 @@ class TradingEnv(gym.Env):
             self.comparison_portfolio_state.cash *= (1.0 - daily_decay_factor)
             self.benchmark_portfolio_state.cash *= (1.0 - daily_decay_factor)
             self.shadow_portfolio_state.cash *= (1.0 - daily_decay_factor)
+            self.selected_asset_bh_portfolio_state.cash *= (1.0 - daily_decay_factor)
         
         # --- SAA sub-portfolio MTM update (PORTFOLIO_WEIGHTS mode only) ---
         # Mirrors live-portfolio treatment: apply cash drag, then price-revalue. Records per-asset
@@ -2599,7 +2666,9 @@ class TradingEnv(gym.Env):
             current_sortino=reward_parts.get("current_sortino", None),
             running_mean_ema=reward_parts.get("running_mean_ema", None),
             downside_var_sqrt=reward_parts.get("downside_var_sqrt", None),
-            previous_max_drawdown=reward_parts.get("previous_max_drawdown", None)
+            previous_max_drawdown=reward_parts.get("previous_max_drawdown", None),
+            selected_asset_bh_portfolio_value=float(self.selected_asset_bh_portfolio_state.get_total_value()),
+            selected_asset_bh_transaction_cost=0.0  # No transaction costs after initialization (buy-and-hold)
         )
 
         # Check termination conditions -----------------------------------
@@ -3304,7 +3373,7 @@ class TradingEnv(gym.Env):
             )
 
         # Convert desired change to dollar notional based on current total portfolio value
-        desired_notional_change = target_position_change * self.initial_portfolio_value  # +buy dollars, -sell dollars
+        desired_notional_change = target_position_change * portfolio_state.get_total_value()  # +buy dollars, -sell dollars
 
         # Shares to trade from desired notional
         shares_to_trade = float(desired_notional_change / px) if px > 0 else 0.0
@@ -3367,10 +3436,12 @@ class TradingEnv(gym.Env):
                 available_cash = max(0.0, float(portfolio_state.cash))
                 # subtract a tc estimate; scale using initial tc_est to avoid iterative loops
                 denom = (px + (tc_est / max(shares_to_trade, 1e-8)))
-                scaled_shares = float(np.floor(max(0.0, available_cash / max(denom, 1e-8))))
-                if scaled_shares <= 0:
-                    # Cannot buy any shares
-                    print(f"Buying stopped in exection. Scaled share <= 0")
+                # Use fractional shares (positions are float throughout env) to avoid
+                # systematic floor-to-zero when affordable size is in (0, 1).
+                scaled_shares = float(max(0.0, available_cash / max(denom, 1e-8)))
+                if scaled_shares <= 0.0 or scaled_shares < share_eps:
+                    # Cannot buy meaningful size after affordability scaling.
+                    
                     return ExecutionResult(
                         current_step=self.current_step,
                         trades_executed=np.zeros(num_assets, dtype=np.float32),

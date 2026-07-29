@@ -1091,6 +1091,8 @@ def run(cache, config: Dict[str, Any]) -> Dict[str, Any]:
     
     # Build model
     model = build_model(vec_train, config)
+    print("\nModel successfully built with the following configuration:")
+    print(f"\nModel device: {next(model.policy.parameters()).device}")
 
     agent_dir = os.path.join(os.path.dirname(__file__))
 

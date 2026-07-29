@@ -9,6 +9,7 @@ runs/
 *.csv
 *.xlsx
 *.xls
+*.png
 
 # rules.md
 # thoughts.md
