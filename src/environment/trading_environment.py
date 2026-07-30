@@ -3296,9 +3296,9 @@ class TradingEnv(gym.Env):
         saa_excess_log_return = saa_log_return - passive_log_return
 
         # Simple log return reward
-        saa_excess_return_scaled = 50 * saa_excess_log_return  # Scale factor to get reasonable reward magnitudes
+        saa_excess_return_scaled = 60 * saa_excess_log_return  # Scale factor to get reasonable reward magnitudes
 
-        scaled_log_diff_sortino = 50 * log_diff_sortino_reward
+        scaled_log_diff_sortino = 40 * log_diff_sortino_reward
 
         # """Calculate dynamic risk window. Use self.reward_risk_window and the current step to produce
         # behaviour which starts at 2 raises with the steps up to maximum risk_reward_window"""
