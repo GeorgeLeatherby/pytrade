@@ -17,6 +17,7 @@
         "action_forgiveness_width_sigma": 0.25,
         "action_hold_reward_weight_omega": 0.01,
         "lambda_execution_gap": 0.05,
+        "saa_realized_exit_bonus_coeff": 8.0,
 
         "percentage_of_cash_only_starts": 0.10,
         "min_initial_cash_allocation": 0.1,

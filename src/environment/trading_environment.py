@@ -1452,6 +1452,7 @@ class TradingEnv(gym.Env):
         self.action_forgiveness_width_sigma = config["environment"].get("action_forgiveness_width_sigma", None)  # Width of forgiveness zone in terms of action space std dev
         self.action_hold_reward_weight_omega = config["environment"].get("action_hold_reward_weight_omega", None)  # Weight for holding action reward
         self.lambda_execution_gap = config["environment"].get("lambda_execution_gap", None)  # Penalty coefficient for execution gap (difference between target and executed weights)
+        self.saa_realized_exit_bonus_coeff = float(config["environment"].get("saa_realized_exit_bonus_coeff", 8.0))
 
         self.previous_max_drawdown = None
         self.saa_previous_max_drawdown = None
@@ -3328,8 +3329,7 @@ class TradingEnv(gym.Env):
         elif trade_shares < 0.0 and avg_entry_price is not None and pre_trade_shares > 0.0 and execution_price > 0.0:
             sold_shares = min(-trade_shares, pre_trade_shares)
             realized_positive_pnl = max(0.0, (execution_price - avg_entry_price) * sold_shares)
-            realized_exit_bonus_coeff = float(self.config['environment'].get('saa_realized_exit_bonus_coeff', 8.0))
-            realized_exit_bonus = float(realized_exit_bonus_coeff * (realized_positive_pnl / max(self.initial_portfolio_value, eps)))
+            realized_exit_bonus = float(self.saa_realized_exit_bonus_coeff * (realized_positive_pnl / max(self.initial_portfolio_value, eps)))
             if post_trade_shares <= 1e-8:
                 self.saa_average_entry_price = None
 
