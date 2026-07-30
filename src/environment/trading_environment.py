@@ -1501,6 +1501,11 @@ class TradingEnv(gym.Env):
         self.saa_running_mean_ema = None
         self.saa_running_downside_variance_ema = None
         self.previous_saa_sharpe_ratio = None
+        self.saa_average_entry_price = None
+        self.saa_realized_positive_pnl_cum = 0.0
+        self.saa_realized_exit_bonus_cum = 0.0
+        self.saa_last_realized_positive_pnl = 0.0
+        self.saa_last_realized_exit_bonus = 0.0
         
         # Initialize state variables
         self.current_step = None
@@ -1768,6 +1773,11 @@ class TradingEnv(gym.Env):
         self.previous_max_drawdown = float(0.0)
         self.saa_previous_max_drawdown = float(0.0)
         self.trans_act_pen = float(0.0)
+        self.saa_average_entry_price = None
+        self.saa_realized_positive_pnl_cum = 0.0
+        self.saa_realized_exit_bonus_cum = 0.0
+        self.saa_last_realized_positive_pnl = 0.0
+        self.saa_last_realized_exit_bonus = 0.0
 
         # Episode accumulators for diagnostics
         self._ep_turnover_notional = 0.0
@@ -1805,6 +1815,7 @@ class TradingEnv(gym.Env):
                 self.saa_initial_cash = initial_cash
                 self.saa_selected_asset_value = 0.0
                 self.saa_initial_subportfolio_value = self.saa_initial_cash + self.saa_selected_asset_value
+                self.saa_average_entry_price = None
             else:
                 # Random start between selected asset and cash only.
                 selected_asset_price = float(initial_prices[self.selected_asset_index])
@@ -1855,6 +1866,7 @@ class TradingEnv(gym.Env):
                 self.saa_initial_cash = initial_cash
                 self.saa_selected_asset_value = initial_positions[self.selected_asset_index] * initial_prices[self.selected_asset_index]
                 self.saa_initial_subportfolio_value = self.saa_initial_cash + self.saa_selected_asset_value
+                self.saa_average_entry_price = float(selected_asset_price) if initial_positions[self.selected_asset_index] > 0 else None
 
         # Portfolio mode: random weights across all assets + cash, ensuring minimum cash allocation
         else:
@@ -2701,6 +2713,14 @@ class TradingEnv(gym.Env):
         
         # Prepare info
         info = self._get_info()
+        if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
+            info.update({
+                "saa_average_entry_price": float(self.saa_average_entry_price) if self.saa_average_entry_price is not None else None,
+                "saa_realized_positive_pnl_cum": float(self.saa_realized_positive_pnl_cum),
+                "saa_realized_exit_bonus_cum": float(self.saa_realized_exit_bonus_cum),
+                "saa_last_realized_positive_pnl": float(self.saa_last_realized_positive_pnl),
+                "saa_last_realized_exit_bonus": float(self.saa_last_realized_exit_bonus),
+            })
         if self.execution_mode in {EXECUTION_SIMPLE, EXECUTION_TRANCHE}:
             info['trade_results'] = trade_results
         elif self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
@@ -2882,6 +2902,8 @@ class TradingEnv(gym.Env):
                     "saa_final_subportfolio_value": final_saa_subportfolio_value,
                     "saa_return_final": saa_return_final,
                     "saa_return_final_pct": saa_return_final_pct,
+                    "saa_realized_positive_pnl_cum": float(self.saa_realized_positive_pnl_cum),
+                    "saa_realized_exit_bonus_cum": float(self.saa_realized_exit_bonus_cum),
                 })
 
 
@@ -3286,6 +3308,36 @@ class TradingEnv(gym.Env):
         # SAA realized log return (portfolio-level, includes cash drag and TC)
         saa_log_return = np.log(max(next_value, eps)) - np.log(max(prev_value, eps))
 
+        # Realized-profit exit bonus: only pay on sell/reduction when the sell price is above
+        # the average buy price for the currently open position in this run.
+        realized_positive_pnl = 0.0
+        realized_exit_bonus = 0.0
+        avg_entry_price = self.saa_average_entry_price
+        trade_shares = float(execution_result.trades_executed[selected_asset_index])
+        execution_price = float(execution_result.executed_prices[selected_asset_index])
+        post_trade_shares = float(self.portfolio_state.positions[selected_asset_index])
+        pre_trade_shares = max(0.0, post_trade_shares - trade_shares)
+
+        if trade_shares > 0.0:
+            if avg_entry_price is None or pre_trade_shares <= 0.0:
+                self.saa_average_entry_price = execution_price
+            elif execution_price > 0.0:
+                self.saa_average_entry_price = (
+                    (avg_entry_price * pre_trade_shares) + (execution_price * trade_shares)
+                ) / max(pre_trade_shares + trade_shares, eps)
+        elif trade_shares < 0.0 and avg_entry_price is not None and pre_trade_shares > 0.0 and execution_price > 0.0:
+            sold_shares = min(-trade_shares, pre_trade_shares)
+            realized_positive_pnl = max(0.0, (execution_price - avg_entry_price) * sold_shares)
+            realized_exit_bonus_coeff = float(self.config['environment'].get('saa_realized_exit_bonus_coeff', 8.0))
+            realized_exit_bonus = float(realized_exit_bonus_coeff * (realized_positive_pnl / max(self.initial_portfolio_value, eps)))
+            if post_trade_shares <= 1e-8:
+                self.saa_average_entry_price = None
+
+        self.saa_last_realized_positive_pnl = float(realized_positive_pnl)
+        self.saa_last_realized_exit_bonus = float(realized_exit_bonus)
+        self.saa_realized_positive_pnl_cum += float(realized_positive_pnl)
+        self.saa_realized_exit_bonus_cum += float(realized_exit_bonus)
+
         # Single-asset passive benchmark: same-asset fully-invested buy-and-hold.
         # Rationale: the SAA chooses between "be in this asset" and "be in cash".
         # Benchmark is "always in this asset" — measures alpha of timing vs. always-on.
@@ -3304,9 +3356,9 @@ class TradingEnv(gym.Env):
         saa_excess_log_return = saa_log_return - passive_log_return
 
         # Simple log return reward
-        saa_excess_return_scaled = 60 * saa_excess_log_return  # Scale factor to get reasonable reward magnitudes
+        saa_excess_return_scaled = 30 * saa_excess_log_return  # Scale factor to get reasonable reward magnitudes
 
-        scaled_log_diff_sortino = 20 * log_diff_sortino_reward
+        scaled_log_diff_sortino = 10 * log_diff_sortino_reward
 
         # """Calculate dynamic risk window. Use self.reward_risk_window and the current step to produce
         # behaviour which starts at 2 raises with the steps up to maximum risk_reward_window"""
@@ -3355,7 +3407,7 @@ class TradingEnv(gym.Env):
             self.episode_peak_value = float(max(total_value_before, eps))
         peak_before = float(max(self.episode_peak_value, eps))
         current_drawdown_level = max(0.0, 1.0 - (float(next_value) / peak_before))
-        drawdown_level_penalty = 0.002 * current_drawdown_level
+        drawdown_level_penalty = 0.01 * current_drawdown_level
         self.episode_peak_value = float(max(peak_before, float(next_value)))
 
         saa_reward_raw = (
@@ -3363,10 +3415,11 @@ class TradingEnv(gym.Env):
             - max_drawdown_penalty
             - drawdown_level_penalty
             - execution_gap_penalty
+            + realized_exit_bonus
             + scaled_log_diff_sortino
         )
 
-        saa_reward = np.tanh(saa_reward_raw / 5.0) * 5.0 # Scale to [-5, 5] range
+        saa_reward = np.tanh(saa_reward_raw / 10.0) * 10.0 # Scale to [-5, 5] range
         
         # NOTE: Several values here get used to fill portfolio wide metrics in the episode buffer.
         saa_reward_parts = {
@@ -3385,6 +3438,10 @@ class TradingEnv(gym.Env):
             "drawdown_level": current_drawdown_level,
             "drawdown_level_penalty": drawdown_level_penalty,
             "execution_gap_penalty": execution_gap_penalty,
+            "realized_positive_pnl": realized_positive_pnl,
+            "realized_exit_bonus": realized_exit_bonus,
+            "realized_exit_bonus_cum": self.saa_realized_exit_bonus_cum,
+            "average_entry_price": float(self.saa_average_entry_price) if self.saa_average_entry_price is not None else 0.0,
             "no_penalty_gap": no_penalty_gap,
             "scaled_log_diff_sortino": scaled_log_diff_sortino,
             "log_diff_sortino_reward": log_diff_sortino_reward
