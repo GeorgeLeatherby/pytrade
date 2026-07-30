@@ -1455,6 +1455,7 @@ class TradingEnv(gym.Env):
 
         self.previous_max_drawdown = None
         self.saa_previous_max_drawdown = None
+        self.episode_peak_value = None
         self.trans_act_pen = None  # Initialize transaction action penalty variable
 
         # Store references
@@ -2097,6 +2098,9 @@ class TradingEnv(gym.Env):
 
         # Initialize previous portfolio value for return calculation
         self._previous_portfolio_value = actual_initial_value
+
+        # SAA drawdown level baseline (single-asset mode reward).
+        self.episode_peak_value = float(max(self.portfolio_state.get_total_value(), 1e-12))
         
         # Step 4: Get initial observation and info
         if self.maybe_provide_sequence:
@@ -3238,14 +3242,18 @@ class TradingEnv(gym.Env):
         saa_downside_var = max(self.saa_running_downside_variance_ema, downside_var_floor)
         current_sortino = self.saa_running_mean_ema / np.sqrt(saa_downside_var)
 
-        # 3. Calc Differential Sortino for reward
-        saa_sortino_reward = current_sortino - self.saa_previous_sortino
-        self.saa_previous_sortino = current_sortino
-
         eps = 1e-12
-        
-        # Calc logarithmic differential sortino reward
-        log_diff_sortino_reward = np.log(max(current_sortino, eps)) - np.log(max(self.saa_previous_sortino, eps))
+
+        # Delay Sortino reward contribution until EMAs have warmed up to avoid
+        # initialization spikes from previous_sortino=0.0.
+        sortino_warmup_steps = 10
+        if self.current_step < sortino_warmup_steps:
+            log_diff_sortino_reward = 0.0
+            self.saa_previous_sortino = current_sortino
+        else:
+            prev_sortino = self.saa_previous_sortino
+            log_diff_sortino_reward = np.log(max(current_sortino, eps)) - np.log(max(prev_sortino, eps))
+            self.saa_previous_sortino = current_sortino
 
         # Mix Sortino with other metrics to get risk-aware non-deterministic policy
         """Calculate dynamic risk window. Use self.reward_risk_window and the current step to produce
@@ -3298,7 +3306,7 @@ class TradingEnv(gym.Env):
         # Simple log return reward
         saa_excess_return_scaled = 60 * saa_excess_log_return  # Scale factor to get reasonable reward magnitudes
 
-        scaled_log_diff_sortino = 40 * log_diff_sortino_reward
+        scaled_log_diff_sortino = 20 * log_diff_sortino_reward
 
         # """Calculate dynamic risk window. Use self.reward_risk_window and the current step to produce
         # behaviour which starts at 2 raises with the steps up to maximum risk_reward_window"""
@@ -3321,13 +3329,42 @@ class TradingEnv(gym.Env):
 
         # action_holding_reward = self.action_hold_reward_weight_omega * (1 - abs(action)**2)
 
-        # Execution gap penalty: penalizes deviation between requested and executed action
+        # Execution gap penalty: asymmetric with a dynamic deadband so we do not
+        # penalize gaps caused by non-executed tiny trades (<~$50 + buffer).
         total_value_before = float(selected_asset_notional_before + saa_cash_before)
         action_executed = float(delta_selected_asset_notional / max(total_value_before, eps))
-        execution_gap_penalty = float(self.lambda_execution_gap * abs(action - action_executed))
-        # 
 
-        saa_reward_raw = saa_excess_return_scaled - max_drawdown_penalty - execution_gap_penalty + scaled_log_diff_sortino
+        min_trade_usd = float(self.config['environment'].get('execution_min_trade_value_threshold', 50.0))
+        min_trade_usd = max(min_trade_usd, 50.0)
+        small_trade_buffer_usd = float(self.config['environment'].get('saa_execution_gap_buffer_usd', 10.0))
+        action_limiter = float(self.action_limiting_factor_start) if self.action_limiting_factor_start is not None else 1.0
+        action_limiter = float(np.clip(action_limiter, 1e-6, 1.0))
+
+        no_penalty_gap = ((min_trade_usd + small_trade_buffer_usd) / max(total_value_before, eps)) / action_limiter
+        signed_gap = float(action - action_executed)
+        excess_gap = max(0.0, abs(signed_gap) - no_penalty_gap)
+
+        lambda_exec_gap = float(self.lambda_execution_gap) if self.lambda_execution_gap is not None else 0.0
+        under_exec_mult = float(self.config['environment'].get('saa_under_exec_penalty_mult', 0.75))
+        over_exec_mult = float(self.config['environment'].get('saa_over_exec_penalty_mult', 1.25))
+        penalty_mult = under_exec_mult if signed_gap > 0 else over_exec_mult
+        execution_gap_penalty = float(lambda_exec_gap * penalty_mult * excess_gap)
+
+        # Persistent drawdown-level signal: keeps penalizing while staying underwater.
+        if self.episode_peak_value is None:
+            self.episode_peak_value = float(max(total_value_before, eps))
+        peak_before = float(max(self.episode_peak_value, eps))
+        current_drawdown_level = max(0.0, 1.0 - (float(next_value) / peak_before))
+        drawdown_level_penalty = 0.002 * current_drawdown_level
+        self.episode_peak_value = float(max(peak_before, float(next_value)))
+
+        saa_reward_raw = (
+            saa_excess_return_scaled
+            - max_drawdown_penalty
+            - drawdown_level_penalty
+            - execution_gap_penalty
+            + scaled_log_diff_sortino
+        )
 
         saa_reward = np.tanh(saa_reward_raw / 5.0) * 5.0 # Scale to [-5, 5] range
         
@@ -3344,7 +3381,13 @@ class TradingEnv(gym.Env):
             "raw_portfolio_return": 0.0,
             "raw_benchmark_return": 0.0,
             "sharpe_ratio": 0.0,
-            "max_drawdown": saa_max_drawdown
+            "max_drawdown": saa_max_drawdown,
+            "drawdown_level": current_drawdown_level,
+            "drawdown_level_penalty": drawdown_level_penalty,
+            "execution_gap_penalty": execution_gap_penalty,
+            "no_penalty_gap": no_penalty_gap,
+            "scaled_log_diff_sortino": scaled_log_diff_sortino,
+            "log_diff_sortino_reward": log_diff_sortino_reward
         }
         
         return saa_reward, saa_reward_parts
