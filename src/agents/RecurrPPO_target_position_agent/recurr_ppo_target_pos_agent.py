@@ -179,10 +179,14 @@ class EpisodePortfolioSB3LoggerCallback(BaseCallback):
         "portfolio_final_value",
         "comparison_final_value",
         "benchmark_final_value",
+        "selected_asset_bh_final_value",
+        "pv_minus_selected_asset_bh_abs",
+        "pv_minus_selected_asset_bh_pct_base",
         "portfolio_return",
         "episode_sharpe",
         "episode_max_drawdown",
         "alpha_return",
+        "cumulative_reward",
         "saa_return_final",
         # Turnover / costs
         # NOTE: env emits "total_transaction_costs" (plural). The old callback
@@ -322,6 +326,9 @@ class ValidationMetricsCallback(BaseCallback):
         self.dd_buffer = []
         self.alpha_ret_buffer = []
         self.cum_reward_buffer = []
+        self.selected_asset_bh_final_value_buffer = []
+        self.pv_minus_selected_asset_bh_abs_buffer = []
+        self.pv_minus_selected_asset_bh_pct_base_buffer = []
         self.saa_subpf_buffer = []
         self.saa_return_after_rdn_portf_init_buffer = []
         # Action distribution stats per eval episode (raw target_position_change
@@ -353,6 +360,9 @@ class ValidationMetricsCallback(BaseCallback):
             dd = info.get("episode_max_drawdown", None)
             alpha_ret = info.get("alpha_return", None)
             cum_reward = info.get("cumulative_reward", None)
+            selected_asset_bh_final_value = info.get("selected_asset_bh_final_value", None)
+            pv_minus_selected_asset_bh_abs = info.get("pv_minus_selected_asset_bh_abs", None)
+            pv_minus_selected_asset_bh_pct_base = info.get("pv_minus_selected_asset_bh_pct_base", None)
             saa_subpf = info.get("saa_final_subportfolio_value", None)
             saa_return_after_rdn_portf_init = info.get("saa_return_final", None)
             
@@ -373,6 +383,12 @@ class ValidationMetricsCallback(BaseCallback):
                 self.alpha_ret_buffer.append(alpha_ret)
             if cum_reward is not None:
                 self.cum_reward_buffer.append(cum_reward)
+            if selected_asset_bh_final_value is not None:
+                self.selected_asset_bh_final_value_buffer.append(selected_asset_bh_final_value)
+            if pv_minus_selected_asset_bh_abs is not None:
+                self.pv_minus_selected_asset_bh_abs_buffer.append(pv_minus_selected_asset_bh_abs)
+            if pv_minus_selected_asset_bh_pct_base is not None:
+                self.pv_minus_selected_asset_bh_pct_base_buffer.append(pv_minus_selected_asset_bh_pct_base)
             if saa_subpf is not None:
                 self.saa_subpf_buffer.append(saa_subpf)
             if saa_return_after_rdn_portf_init is not None:
@@ -401,6 +417,9 @@ class ValidationMetricsCallback(BaseCallback):
                 ("dd", dd), 
                 ("alpha_ret", alpha_ret), 
                 ("cum_reward", cum_reward),
+                ("selected_asset_bh_final_value", selected_asset_bh_final_value),
+                ("pv_minus_selected_asset_bh_abs", pv_minus_selected_asset_bh_abs),
+                ("pv_minus_selected_asset_bh_pct_base", pv_minus_selected_asset_bh_pct_base),
                 ("saa_subpf", saa_subpf),
                 ("saa_return_after_rdn_portf_init", saa_return_after_rdn_portf_init)
             ]:
@@ -479,6 +498,30 @@ class ValidationMetricsCallback(BaseCallback):
             mean_cum_reward = float(np.mean(self.cum_reward_buffer))
             self.model.logger.record(f"{self.tag_prefix}/cumulative_reward_mean", mean_cum_reward, exclude=("stdout",))
 
+        if self.selected_asset_bh_final_value_buffer:
+            mean_selected_asset_bh = float(np.mean(self.selected_asset_bh_final_value_buffer))
+            self.model.logger.record(
+                f"{self.tag_prefix}/selected_asset_bh_final_value_mean",
+                mean_selected_asset_bh,
+                exclude=("stdout",),
+            )
+
+        if self.pv_minus_selected_asset_bh_abs_buffer:
+            mean_pv_minus_bh_abs = float(np.mean(self.pv_minus_selected_asset_bh_abs_buffer))
+            self.model.logger.record(
+                f"{self.tag_prefix}/pv_minus_selected_asset_bh_abs_mean",
+                mean_pv_minus_bh_abs,
+                exclude=("stdout",),
+            )
+
+        if self.pv_minus_selected_asset_bh_pct_base_buffer:
+            mean_pv_minus_bh_pct = float(np.mean(self.pv_minus_selected_asset_bh_pct_base_buffer))
+            self.model.logger.record(
+                f"{self.tag_prefix}/pv_minus_selected_asset_bh_pct_base_mean",
+                mean_pv_minus_bh_pct,
+                exclude=("stdout",),
+            )
+
         # Action distribution: emit mean (and std for action_mean only, since the
         # other percentile-buffers are already distributional summaries within
         # an episode; cross-episode mean of percentiles is the standard report).
@@ -540,6 +583,9 @@ class ValidationMetricsCallback(BaseCallback):
         self.dd_buffer = []
         self.alpha_ret_buffer = []
         self.cum_reward_buffer = []
+        self.selected_asset_bh_final_value_buffer = []
+        self.pv_minus_selected_asset_bh_abs_buffer = []
+        self.pv_minus_selected_asset_bh_pct_base_buffer = []
         self.eval_episode_count = 0
         self.saa_subpf_buffer = []
         self.saa_return_after_rdn_portf_init_buffer = []
