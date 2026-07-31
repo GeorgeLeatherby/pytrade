@@ -44,7 +44,7 @@ Envs differential Sortino reward is stepwise and benefits from longer n_steps to
 import os
 import time
 import numpy as np
-from typing import Callable, Dict, Any, Optional
+from typing import Callable, Dict, Any, Optional, List, Tuple
 from datetime import datetime
 
 
@@ -344,6 +344,7 @@ class ValidationMetricsCallback(BaseCallback):
         self.last_return_diff_total_mean = None
         self.last_return_diff_target_mean = None
         self.last_alpha_return_mean = None
+        self.last_pv_minus_selected_asset_bh_abs_mean = None
 
     def _on_step(self) -> bool:
         """Called during evaluation episodes (by EvalCallback)."""
@@ -513,6 +514,7 @@ class ValidationMetricsCallback(BaseCallback):
                 mean_pv_minus_bh_abs,
                 exclude=("stdout",),
             )
+            self.last_pv_minus_selected_asset_bh_abs_mean = mean_pv_minus_bh_abs
 
         if self.pv_minus_selected_asset_bh_pct_base_buffer:
             mean_pv_minus_bh_pct = float(np.mean(self.pv_minus_selected_asset_bh_pct_base_buffer))
@@ -572,6 +574,10 @@ class ValidationMetricsCallback(BaseCallback):
     def get_best_alpha_return_mean(self) -> Optional[float]:
         """Return the last computed alpha_return_mean."""
         return self.last_alpha_return_mean
+
+    def get_best_pv_minus_selected_asset_bh_abs_mean(self) -> Optional[float]:
+        """Return the last computed pv_minus_selected_asset_bh_abs_mean."""
+        return self.last_pv_minus_selected_asset_bh_abs_mean
     
     def _reset_buffers(self) -> None:
         """Reset all accumulation buffers at the end of an evaluation run."""
@@ -636,6 +642,7 @@ class EvalCallbackWithMetrics(BaseCallback):
         self.best_mean_reward = -np.inf
         self.best_return_diff = -np.inf # Track best last_return_diff_target_mean
         self.best_alpha_return_mean = -np.inf # Track best alpha_return_mean
+        self.best_pv_minus_selected_asset_bh_abs_mean = -np.inf
         self.n_eval_calls = 0
 
     def _init_callback(self) -> None:
@@ -643,6 +650,51 @@ class EvalCallbackWithMetrics(BaseCallback):
             os.makedirs(self.best_model_save_path, exist_ok=True)
         if self.eval_step_callback is not None:
             self.eval_step_callback.init_callback(self.model)
+
+    def _run_deterministic_validation_grid(self, step_cb) -> Tuple[List[float], List[int], int]:
+        """
+        Run one deterministic validation episode for every (asset, validation block)
+        pair, always starting from cash-only state. Returns rewards, lengths, count.
+        """
+        if not hasattr(self.eval_env, "env_method"):
+            return [], [], 0
+
+        plans_list = self.eval_env.env_method("get_validation_sweep_plan")
+        if not plans_list:
+            return [], [], 0
+
+        plans = plans_list[0] or []
+        if len(plans) == 0:
+            return [], [], 0
+
+        all_rewards: List[float] = []
+        all_lengths: List[int] = []
+
+        for plan in plans:
+            asset = str(plan["asset"])
+            block_id = str(plan["block_id"])
+            episode_start_step = int(plan["episode_start_step"])
+            forced_options = {
+                "block_id": block_id,
+                "episode_start_step": episode_start_step,
+                "force_cash_only_start": True,
+            }
+            self.eval_env.env_method("set_forced_episode_once", asset, forced_options)
+
+            ep_rewards, ep_lengths = evaluate_policy(
+                self.model,
+                self.eval_env,
+                n_eval_episodes=1,
+                deterministic=self.deterministic,
+                render=self.render,
+                return_episode_rewards=True,
+                warn=self.warn,
+                callback=step_cb,
+            )
+            all_rewards.extend([float(r) for r in ep_rewards])
+            all_lengths.extend([int(l) for l in ep_lengths])
+
+        return all_rewards, all_lengths, len(plans)
 
     def _on_step(self) -> bool:
         if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
@@ -653,7 +705,12 @@ class EvalCallbackWithMetrics(BaseCallback):
                 self.eval_step_callback.globals = globals_
                 return bool(self.eval_step_callback.on_step())
 
-            episode_rewards, episode_lengths = evaluate_policy(
+            # 0) Deterministic validation sweep: one run per asset per validation block,
+            #    forced cash-only starts. Mirrors shadow-portfolio inference setup.
+            det_rewards, det_lengths, n_det_episodes = self._run_deterministic_validation_grid(_step_cb)
+
+            # 1) Keep existing randomized validation episodes.
+            rand_rewards, rand_lengths = evaluate_policy(
                 self.model,
                 self.eval_env,
                 n_eval_episodes=self.n_eval_episodes,
@@ -663,11 +720,14 @@ class EvalCallbackWithMetrics(BaseCallback):
                 warn=self.warn,
                 callback=_step_cb,
             )
+            episode_rewards = det_rewards + [float(r) for r in rand_rewards]
+            episode_lengths = det_lengths + [int(l) for l in rand_lengths]
             self.n_eval_calls += 1
 
             # Flush aggregated validation metrics after all eval episodes complete
             if self.eval_step_callback is not None:
-                self.eval_step_callback.flush_metrics(self.n_eval_episodes)
+                total_eval_episodes = int(n_det_episodes + self.n_eval_episodes)
+                self.eval_step_callback.flush_metrics(total_eval_episodes)
                 
             # Log standard SB3 eval metrics
             mean_reward, std_reward = np.mean(episode_rewards), np.std(episode_rewards)
@@ -686,9 +746,11 @@ class EvalCallbackWithMetrics(BaseCallback):
             # Check if this is a new best model based on last_return_diff_target_mean
             current_return_diff_total_mean = None
             current_alpha_return_mean = None
+            current_pv_minus_selected_asset_bh_abs_mean = None
             if isinstance(self.eval_step_callback, ValidationMetricsCallback):
                 current_return_diff_total_mean = self.eval_step_callback.get_best_return_diff_total_mean()
                 current_alpha_return_mean = self.eval_step_callback.get_best_alpha_return_mean()
+                current_pv_minus_selected_asset_bh_abs_mean = self.eval_step_callback.get_best_pv_minus_selected_asset_bh_abs_mean()
             
             # Save based on return_diff_vs_init_total_mean
             if current_return_diff_total_mean is not None and current_return_diff_total_mean > self.best_return_diff:
@@ -714,6 +776,27 @@ class EvalCallbackWithMetrics(BaseCallback):
                     if isinstance(vec_env, VecNormalize):
                         vec_env.save(os.path.join(self.best_model_save_path, "best_model_alpha_return_mean_vecnormalize.pkl"))
                         print(f"New best alpha model saved! alpha_return_mean: {current_alpha_return_mean:.4f}")
+
+            # Save based on pv_minus_selected_asset_bh_abs_mean (primary goal metric)
+            if (
+                current_pv_minus_selected_asset_bh_abs_mean is not None
+                and current_pv_minus_selected_asset_bh_abs_mean > self.best_pv_minus_selected_asset_bh_abs_mean
+            ):
+                self.best_pv_minus_selected_asset_bh_abs_mean = current_pv_minus_selected_asset_bh_abs_mean
+                if self.best_model_save_path is not None:
+                    self.model.save(os.path.join(self.best_model_save_path, "best_model_pv_minus_selected_asset_bh_abs_mean"))
+                    vec_env = self.model.get_env()
+                    if isinstance(vec_env, VecNormalize):
+                        vec_env.save(
+                            os.path.join(
+                                self.best_model_save_path,
+                                "best_model_pv_minus_selected_asset_bh_abs_mean_vecnormalize.pkl",
+                            )
+                        )
+                        print(
+                            "New best model saved! pv_minus_selected_asset_bh_abs_mean: "
+                            f"{current_pv_minus_selected_asset_bh_abs_mean:.4f}"
+                        )
 
             if self.callback_after_eval is not None:
                 self.callback_after_eval.on_step()
@@ -764,15 +847,51 @@ class SingleAssetEpisodeAdapter(gym.Wrapper):
         self._selected_asset: Optional[str] = None
         self._action_factor_fn = action_factor_fn
         self._progress_remaining: float = 1.0  # start-of-training default
+        self._forced_asset_once: Optional[str] = None
+        self._forced_options_once: Optional[Dict[str, Any]] = None
+
+    def set_forced_episode_once(self, asset: str, options: Optional[Dict[str, Any]] = None) -> None:
+        """Force the next reset() to use a specific asset and reset options once."""
+        self._forced_asset_once = str(asset)
+        self._forced_options_once = dict(options) if options is not None else None
+
+    def get_validation_sweep_plan(self) -> List[Dict[str, Any]]:
+        """Return one deterministic validation run plan per (asset, validation block)."""
+        cache = self.env.market_data_cache
+        assets = [str(a) for a in cache.asset_names]
+        blocks = sorted(cache.validation_blocks, key=lambda b: b.start_date_idx)
+        plans: List[Dict[str, Any]] = []
+        for block in blocks:
+            start_step = int(block.min_start_step)
+            for asset in assets:
+                plans.append(
+                    {
+                        "asset": asset,
+                        "block_id": str(block.block_id),
+                        "episode_start_step": start_step,
+                    }
+                )
+        return plans
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
-        # Randomly choose asset per episode (uniform; extendable to weighted choice)
-        asset_universe = getattr(self.env.market_data_cache, "asset_names", None)
-        if not asset_universe:
-            raise RuntimeError("No assets available in market_data_cache.asset_names")
-        self._selected_asset = str(self._rng.choice(asset_universe))
+        reset_options = dict(options) if options is not None else {}
+
+        # If forced by validation callback, consume that override once.
+        if self._forced_asset_once is not None:
+            self._selected_asset = str(self._forced_asset_once)
+            if self._forced_options_once is not None:
+                reset_options.update(self._forced_options_once)
+            self._forced_asset_once = None
+            self._forced_options_once = None
+        else:
+            # Randomly choose asset per episode (uniform; extendable to weighted choice)
+            asset_universe = getattr(self.env.market_data_cache, "asset_names", None)
+            if not asset_universe:
+                raise RuntimeError("No assets available in market_data_cache.asset_names")
+            self._selected_asset = str(self._rng.choice(asset_universe))
+
         # Reset the underlying env, passing the selected asset
-        obs, info = self.env.reset(seed=seed, option=options, asset=self._selected_asset)
+        obs, info = self.env.reset(seed=seed, option=reset_options if reset_options else None, asset=self._selected_asset)
         # SB3-Contrib RecurrentPPO internally handles episode_starts; no explicit flag needed here.
         return obs, info
     

@@ -1453,6 +1453,14 @@ class TradingEnv(gym.Env):
         self.action_hold_reward_weight_omega = config["environment"].get("action_hold_reward_weight_omega", None)  # Weight for holding action reward
         self.lambda_execution_gap = config["environment"].get("lambda_execution_gap", None)  # Penalty coefficient for execution gap (difference between target and executed weights)
         self.saa_realized_exit_bonus_coeff = float(config["environment"].get("saa_realized_exit_bonus_coeff", 8.0))
+        # SAA reward scaling knobs (kept in config for easy objective tuning)
+        self.saa_excess_log_return_scale = float(config["environment"].get("saa_excess_log_return_scale", 30.0))
+        self.saa_log_diff_sortino_scale = float(config["environment"].get("saa_log_diff_sortino_scale", 10.0))
+        self.saa_drawdown_level_penalty_coeff = float(config["environment"].get("saa_drawdown_level_penalty_coeff", 0.015))
+        self.saa_reward_tanh_divisor = float(config["environment"].get("saa_reward_tanh_divisor", 5.0))
+        self.saa_reward_tanh_scale = float(config["environment"].get("saa_reward_tanh_scale", 5.0))
+        self.saa_sortino_warmup_steps = int(config["environment"].get("saa_sortino_warmup_steps", 10))
+        self.saa_min_trade_value_floor = float(config["environment"].get("saa_min_trade_value_floor", 50.0))
 
         self.previous_max_drawdown = None
         self.saa_previous_max_drawdown = None
@@ -1731,6 +1739,7 @@ class TradingEnv(gym.Env):
         # absolute start index in `option["episode_start_step"]`.
         forced_start = None if option is None else option.get("episode_start_step", None)
         forced_block_id = None if option is None else option.get("block_id", None)
+        force_cash_only_start = bool(option.get("force_cash_only_start", False)) if option is not None else False
 
         if forced_start is not None:
             self.current_episode_start_step = int(forced_start)
@@ -1807,7 +1816,7 @@ class TradingEnv(gym.Env):
         if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
             # Single-asset-only setup: initialize in cash or selected-asset position.
             # No non-selected asset may be held at episode start in this mode.
-            if np.random.random() < self.perc_of_cash_only_starts:
+            if force_cash_only_start or np.random.random() < self.perc_of_cash_only_starts:
                 # Cash-only start (no transaction costs)
                 initial_cash = self.initial_portfolio_value
                 initial_positions[:] = 0.0 # all assets zero
@@ -3279,7 +3288,7 @@ class TradingEnv(gym.Env):
 
         # Delay Sortino reward contribution until EMAs have warmed up to avoid
         # initialization spikes from previous_sortino=0.0.
-        sortino_warmup_steps = 10
+        sortino_warmup_steps = max(0, int(self.saa_sortino_warmup_steps))
         if self.current_step < sortino_warmup_steps:
             log_diff_sortino_reward = 0.0
             self.saa_previous_sortino = current_sortino
@@ -3366,9 +3375,9 @@ class TradingEnv(gym.Env):
         saa_excess_log_return = saa_log_return - passive_log_return
 
         # Simple log return reward
-        saa_excess_return_scaled = 30 * saa_excess_log_return  # Scale factor to get reasonable reward magnitudes
+        saa_excess_return_scaled = self.saa_excess_log_return_scale * saa_excess_log_return
 
-        scaled_log_diff_sortino = 10 * log_diff_sortino_reward
+        scaled_log_diff_sortino = self.saa_log_diff_sortino_scale * log_diff_sortino_reward
 
         # """Calculate dynamic risk window. Use self.reward_risk_window and the current step to produce
         # behaviour which starts at 2 raises with the steps up to maximum risk_reward_window"""
@@ -3397,7 +3406,7 @@ class TradingEnv(gym.Env):
         action_executed = float(delta_selected_asset_notional / max(total_value_before, eps))
 
         min_trade_usd = float(self.config['environment'].get('execution_min_trade_value_threshold', 50.0))
-        min_trade_usd = max(min_trade_usd, 50.0)
+        min_trade_usd = max(min_trade_usd, float(self.saa_min_trade_value_floor))
         small_trade_buffer_usd = float(self.config['environment'].get('saa_execution_gap_buffer_usd', 10.0))
         action_limiter = float(self.action_limiting_factor_start) if self.action_limiting_factor_start is not None else 1.0
         action_limiter = float(np.clip(action_limiter, 1e-6, 1.0))
@@ -3417,7 +3426,7 @@ class TradingEnv(gym.Env):
             self.episode_peak_value = float(max(total_value_before, eps))
         peak_before = float(max(self.episode_peak_value, eps))
         current_drawdown_level = max(0.0, 1.0 - (float(next_value) / peak_before))
-        drawdown_level_penalty = 0.015 * current_drawdown_level
+        drawdown_level_penalty = self.saa_drawdown_level_penalty_coeff * current_drawdown_level
         self.episode_peak_value = float(max(peak_before, float(next_value)))
 
         saa_reward_raw = (
@@ -3429,7 +3438,8 @@ class TradingEnv(gym.Env):
             + scaled_log_diff_sortino
         )
 
-        saa_reward = np.tanh(saa_reward_raw / 5.0) * 5.0 # Scale to [-5, 5] range
+        tanh_div = max(self.saa_reward_tanh_divisor, 1e-8)
+        saa_reward = np.tanh(saa_reward_raw / tanh_div) * self.saa_reward_tanh_scale
         
         # NOTE: Several values here get used to fill portfolio wide metrics in the episode buffer.
         saa_reward_parts = {

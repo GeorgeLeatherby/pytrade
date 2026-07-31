@@ -11,23 +11,24 @@
         "block_buffer_multiplier": 1.0,
         "test_val_split_ratio": 0.25,
 
-        "sortino_eta": 0.05,
-        "lambda_drawdown": 0.8,
+        "sortino_eta": 0.035,
+        "lambda_drawdown": 0.45,
         "sortino_net_reward_mix": 0.4,
         "action_forgiveness_width_sigma": 0.25,
         "action_hold_reward_weight_omega": 0.01,
-        "lambda_execution_gap": 0.08,
-        "saa_realized_exit_bonus_coeff": 12.0,
-        "saa_excess_log_return_scale": 30.0,
-        "saa_log_diff_sortino_scale": 10.0,
-        "saa_drawdown_level_penalty_coeff": 0.015,
-        "saa_reward_tanh_divisor": 5.0,
-        "saa_reward_tanh_scale": 5.0,
-        "saa_sortino_warmup_steps": 10,
-        "saa_min_trade_value_floor": 50.0,
-        "saa_execution_gap_buffer_usd": 10.0,
-        "saa_under_exec_penalty_mult": 0.75,
-        "saa_over_exec_penalty_mult": 1.25,
+        "lambda_execution_gap": 0.04,
+        "saa_realized_exit_bonus_coeff": 6.0,
+
+        "saa_excess_log_return_scale": 55.0,
+        "saa_log_diff_sortino_scale": 4.0,
+        "saa_drawdown_level_penalty_coeff": 0.007,
+        "saa_reward_tanh_divisor": 8.0,
+        "saa_reward_tanh_scale": 8.0,
+        "saa_sortino_warmup_steps": 8,
+        "saa_min_trade_value_floor": 25.0,
+        "saa_execution_gap_buffer_usd": 8.0,
+        "saa_under_exec_penalty_mult": 0.5,
+        "saa_over_exec_penalty_mult": 1.0,
 
         "percentage_of_cash_only_starts": 0.2,
         "min_initial_cash_allocation": 0.1,
@@ -114,7 +115,7 @@
         "vf_coef": 0.4,
         "max_grad_norm": 0.3,
         "target_kl": 0.01,
-        "normalize_advantage": true,        
+        "normalize_advantage": true,
 
         "learning_rate_start": 8.0e-5,
         "learning_rate_end": 8.0e-6,
@@ -153,8 +154,7 @@
         "n_eval_episodes": 50,
         "eval_deterministic": true,
         "progress_bar": true,
-        "config_id": 1048,
+        "config_id": 1049,
         "action_l2_penalty_coeff": 0.0
     }
-
 }
