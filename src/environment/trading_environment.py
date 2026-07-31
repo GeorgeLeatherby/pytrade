@@ -3429,7 +3429,7 @@ class TradingEnv(gym.Env):
             + scaled_log_diff_sortino
         )
 
-        saa_reward = np.tanh(saa_reward_raw / 10.0) * 10.0 # Scale to [-5, 5] range
+        saa_reward = np.tanh(saa_reward_raw / 4.0) * 4.0 # Scale to [-4, 4] range
         
         # NOTE: Several values here get used to fill portfolio wide metrics in the episode buffer.
         saa_reward_parts = {
