@@ -117,8 +117,8 @@
         "clip_schedule_warmup_pct": 0.4,
         "clip_schedule_ramping_pct": 1.0,
 
-        "ent_coef_start": 0.001,
-        "ent_coef_end": 0.00005,
+        "ent_coef_start": 0.0005,
+        "ent_coef_end": 0.00001,
         "ent_coef_schedule_type": "linear",
         "ent_coef_schedule_warmup_pct": 0.3,
         "ent_coef_schedule_ramping_pct": 1.0,
