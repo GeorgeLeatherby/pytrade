@@ -3407,7 +3407,7 @@ class TradingEnv(gym.Env):
             self.episode_peak_value = float(max(total_value_before, eps))
         peak_before = float(max(self.episode_peak_value, eps))
         current_drawdown_level = max(0.0, 1.0 - (float(next_value) / peak_before))
-        drawdown_level_penalty = 0.01 * current_drawdown_level
+        drawdown_level_penalty = 0.015 * current_drawdown_level
         self.episode_peak_value = float(max(peak_before, float(next_value)))
 
         saa_reward_raw = (
@@ -3419,7 +3419,7 @@ class TradingEnv(gym.Env):
             + scaled_log_diff_sortino
         )
 
-        saa_reward = np.tanh(saa_reward_raw / 4.0) * 4.0 # Scale to [-4, 4] range
+        saa_reward = np.tanh(saa_reward_raw / 5.0) * 5.0 # Scale to [-5, 5] range
         
         # NOTE: Several values here get used to fill portfolio wide metrics in the episode buffer.
         saa_reward_parts = {
