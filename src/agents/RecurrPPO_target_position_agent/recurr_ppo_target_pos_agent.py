@@ -105,6 +105,44 @@ def linear_three_phase_schedule(start: float, end: float, warmup_pct: float, ram
 
     return schedule
 
+
+def save_checkpoint_with_vecnormalize(
+    model: RecurrentPPO,
+    save_dir: str,
+    checkpoint_name: str,
+    require_vecnormalize: bool = True,
+) -> Tuple[str, Optional[str]]:
+    """
+    Save model checkpoint and matching VecNormalize stats for reload-safe artifacts.
+
+    Args:
+        model: SB3 model instance.
+        save_dir: Directory where artifacts are written.
+        checkpoint_name: Base file name without extension.
+        require_vecnormalize: Raise if env is not VecNormalize when True.
+
+    Returns:
+        Tuple of (model_zip_path, vecnormalize_pkl_path_or_none).
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    model_base_path = os.path.join(save_dir, checkpoint_name)
+    model.save(model_base_path)
+    model_zip_path = f"{model_base_path}.zip"
+
+    vec_env = model.get_env()
+    if isinstance(vec_env, VecNormalize):
+        vec_path = os.path.join(save_dir, f"{checkpoint_name}_vecnormalize.pkl")
+        vec_env.save(vec_path)
+        return model_zip_path, vec_path
+
+    if require_vecnormalize:
+        raise RuntimeError(
+            f"Checkpoint '{checkpoint_name}' saved model but VecNormalize env was not found."
+        )
+
+    return model_zip_path, None
+
 # entropy needs a class callback because SB3 does not support callable schedules for ent_coef
 class EntropyScheduleCallback(BaseCallback):
     """
@@ -784,19 +822,16 @@ class EvalCallbackWithMetrics(BaseCallback):
             ):
                 self.best_pv_minus_selected_asset_bh_abs_mean = current_pv_minus_selected_asset_bh_abs_mean
                 if self.best_model_save_path is not None:
-                    self.model.save(os.path.join(self.best_model_save_path, "best_model_pv_minus_selected_asset_bh_abs_mean"))
-                    vec_env = self.model.get_env()
-                    if isinstance(vec_env, VecNormalize):
-                        vec_env.save(
-                            os.path.join(
-                                self.best_model_save_path,
-                                "best_model_pv_minus_selected_asset_bh_abs_mean_vecnormalize.pkl",
-                            )
-                        )
-                        print(
-                            "New best model saved! pv_minus_selected_asset_bh_abs_mean: "
-                            f"{current_pv_minus_selected_asset_bh_abs_mean:.4f}"
-                        )
+                    save_checkpoint_with_vecnormalize(
+                        model=self.model,
+                        save_dir=self.best_model_save_path,
+                        checkpoint_name="best_model_pv_minus_selected_asset_bh_abs_mean",
+                        require_vecnormalize=True,
+                    )
+                    print(
+                        "New best model saved! pv_minus_selected_asset_bh_abs_mean: "
+                        f"{current_pv_minus_selected_asset_bh_abs_mean:.4f}"
+                    )
 
             if self.callback_after_eval is not None:
                 self.callback_after_eval.on_step()
@@ -1349,8 +1384,23 @@ def run(cache, config: Dict[str, Any]) -> Dict[str, Any]:
     # Endtime
     t1 = time.time()
 
-    # Save
-    model.save(model_path)
+    # Save primary run artifact and matching VecNormalize stats.
+    model_base_name = os.path.splitext(os.path.basename(model_path))[0]
+    model_dir = os.path.dirname(model_path)
+    save_checkpoint_with_vecnormalize(
+        model=model,
+        save_dir=model_dir,
+        checkpoint_name=model_base_name,
+        require_vecnormalize=True,
+    )
+
+    # Save a clearly labeled "last" checkpoint for this run.
+    final_model_path, final_vecnormalize_path = save_checkpoint_with_vecnormalize(
+        model=model,
+        save_dir=best_model_dir,
+        checkpoint_name="final_model_last",
+        require_vecnormalize=True,
+    )
 
     # Return summary (printed in main.py)
     agent_cfg = config.get("agent", {})
@@ -1360,6 +1410,8 @@ def run(cache, config: Dict[str, Any]) -> Dict[str, Any]:
         "total_timesteps": total_timesteps,
         "elapsed_sec": round(t1 - t0, 2),
         "model_path": model_path,
+        "final_model_path": final_model_path,
+        "final_vecnormalize_path": final_vecnormalize_path,
         "tb_log_name": tb_log_name,
         "run_id": run_id,
         "config_id": config_id,
@@ -1522,8 +1574,24 @@ def continue_run(cache, config: Dict[str, Any], model_path: str, saved_models_di
     # End time
     t1 = time.time()
 
-    # Save updated model (overwrite existing checkpoint)
-    model.save(model_path)
+    # Save updated model artifact and matching VecNormalize stats.
+    continued_model_base_name = os.path.splitext(os.path.basename(model_path))[0]
+    continued_model_dir = os.path.dirname(model_path)
+    save_checkpoint_with_vecnormalize(
+        model=model,
+        save_dir=continued_model_dir,
+        checkpoint_name=continued_model_base_name,
+        require_vecnormalize=True,
+    )
+
+    # Save a clearly labeled "last" checkpoint for the continued run.
+    final_model_dir = os.path.join(saved_models_dir, model_dir_name)
+    final_model_path, final_vecnormalize_path = save_checkpoint_with_vecnormalize(
+        model=model,
+        save_dir=final_model_dir,
+        checkpoint_name="final_model_last",
+        require_vecnormalize=True,
+    )
 
     # Return summary (printed in main.py)
     agent_cfg = config.get("agent", {})
@@ -1534,6 +1602,8 @@ def continue_run(cache, config: Dict[str, Any], model_path: str, saved_models_di
         "total_timesteps": total_timesteps,
         "elapsed_sec": round(t1 - t0, 2),
         "model_path": model_path,
+        "final_model_path": final_model_path,
+        "final_vecnormalize_path": final_vecnormalize_path,
         "tb_log_name": tb_log_name,
         "config_id": config.get("training", {}).get("config_id", "unknown"),
         "n_steps": int(agent_cfg.get("n_steps", 128)),
