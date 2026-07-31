@@ -2907,6 +2907,13 @@ class TradingEnv(gym.Env):
                     "saa_realized_exit_bonus_cum": float(self.saa_realized_exit_bonus_cum),
                 })
 
+            # Buy-and-hold comparison metrics (selected-asset B&H in SAA mode).
+            # Also emitted in other modes for logging consistency.
+            final_selected_asset_bh_value = float(self.selected_asset_bh_portfolio_state.get_total_value())
+            pv_minus_selected_asset_bh_abs = float(final_portfolio_value - final_selected_asset_bh_value)
+            bh_base = max(abs(final_selected_asset_bh_value), 1e-12)
+            pv_minus_selected_asset_bh_pct_base = float(pv_minus_selected_asset_bh_abs / bh_base)
+
 
             # Populate info dictionary with episode metrics
             info.update({
@@ -2921,6 +2928,9 @@ class TradingEnv(gym.Env):
                 "comparison_return": comparison_ret,
                 "alpha_return": alpha_ret,
                 "cumulative_reward": cumulative_reward,
+                "selected_asset_bh_final_value": final_selected_asset_bh_value,
+                "pv_minus_selected_asset_bh_abs": pv_minus_selected_asset_bh_abs,
+                "pv_minus_selected_asset_bh_pct_base": pv_minus_selected_asset_bh_pct_base,
                 "episode_max_drawdown": episode_max_dd,
                 "episode_sharpe": episode_sharpe,
                 "episode_volatility": episode_volatility,
