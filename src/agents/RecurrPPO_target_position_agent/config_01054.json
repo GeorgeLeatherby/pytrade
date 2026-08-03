@@ -25,7 +25,7 @@
         "saa_reward_tanh_divisor": 8.0,
         "saa_reward_tanh_scale": 8.0,
         "saa_sortino_warmup_steps": 8,
-        "saa_min_trade_value_floor": 25.0,
+        "saa_min_trade_value_floor": 50.0,
         "saa_execution_gap_buffer_usd": 8.0,
         "saa_under_exec_penalty_mult": 0.8,
         "saa_over_exec_penalty_mult": 1.0,
@@ -148,13 +148,13 @@
         "seed": 42,
         "n_envs": 8,
         "vec_env_start_method": "spawn",
-        "total_timesteps": 4000000,
+        "total_timesteps": 8000000,
         "train_log_freq": 1,
         "eval_freq": 12500,
         "n_eval_episodes": 50,
         "eval_deterministic": true,
         "progress_bar": true,
-        "config_id": 1049,
+        "config_id": 1054,
         "action_l2_penalty_coeff": 0.0
     }
 }

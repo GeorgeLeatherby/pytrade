@@ -25,7 +25,7 @@
         "saa_reward_tanh_divisor": 8.0,
         "saa_reward_tanh_scale": 8.0,
         "saa_sortino_warmup_steps": 8,
-        "saa_min_trade_value_floor": 25.0,
+        "saa_min_trade_value_floor": 50.0,
         "saa_execution_gap_buffer_usd": 8.0,
         "saa_under_exec_penalty_mult": 0.8,
         "saa_over_exec_penalty_mult": 1.0,
@@ -42,9 +42,9 @@
         "quantity_type": "shares",
 
         "fixed_fee_per_order": 0.0,
-        "commission_bps": 0.00002,
-        "half_spread_bps": 0.0001,
-        "impact_coeff": 0.0001,
+        "commission_bps": 0.0,
+        "half_spread_bps": 0.0,
+        "impact_coeff": 0.0,
         "adv_window": 21
     },
 
@@ -117,13 +117,13 @@
         "target_kl": 0.01,
         "normalize_advantage": true,
 
-        "learning_rate_start": 8.0e-5,
+        "learning_rate_start": 1.0e-4,
         "learning_rate_end": 8.0e-6,
         "lr_schedule_type": "linear",
-        "lr_schedule_warmup_pct": 0.4,
+        "lr_schedule_warmup_pct": 0.3,
         "lr_schedule_ramping_pct": 1.0,
 
-        "clip_range_start": 0.1,
+        "clip_range_start": 0.15,
         "clip_range_end": 0.05,
         "clip_schedule_warmup_pct": 0.4,
         "clip_schedule_ramping_pct": 1.0,
@@ -131,8 +131,8 @@
         "ent_coef_start": 0.0005,
         "ent_coef_end": 0.00001,
         "ent_coef_schedule_type": "linear",
-        "ent_coef_schedule_warmup_pct": 0.3,
-        "ent_coef_schedule_ramping_pct": 1.0,
+        "ent_coef_schedule_warmup_pct": 0.4,
+        "ent_coef_schedule_ramping_pct": 0.95,
 
         "action_limiting_factor_start": 0.3,
         "action_limiting_factor_end": 0.3,
@@ -148,13 +148,13 @@
         "seed": 42,
         "n_envs": 8,
         "vec_env_start_method": "spawn",
-        "total_timesteps": 4000000,
+        "total_timesteps": 8000000,
         "train_log_freq": 1,
         "eval_freq": 12500,
         "n_eval_episodes": 50,
         "eval_deterministic": true,
         "progress_bar": true,
-        "config_id": 1049,
+        "config_id": 1051,
         "action_l2_penalty_coeff": 0.0
     }
 }

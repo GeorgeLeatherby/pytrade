@@ -2506,16 +2506,19 @@ class TradingEnv(gym.Env):
         self.benchmark_portfolio_state.prices[:] = new_prices # in-place update
         self.benchmark_portfolio_state.step = self.current_step
 
-        # Apply daily cash decay (inflation/opportunity cost)
-        # cash_drag_rate is annual; convert to daily: (1 + rate)^(1/252) - 1
-        if self.cash_drag_rate_pa > 0:
-            daily_decay_factor = (1.0 + self.cash_drag_rate_pa) ** (1.0 / 252.0) - 1.0
-            # Reduce cash by decay (daily carrying cost)
-            self.portfolio_state.cash *= (1.0 - daily_decay_factor)
-            self.comparison_portfolio_state.cash *= (1.0 - daily_decay_factor)
-            self.benchmark_portfolio_state.cash *= (1.0 - daily_decay_factor)
-            self.shadow_portfolio_state.cash *= (1.0 - daily_decay_factor)
-            self.selected_asset_bh_portfolio_state.cash *= (1.0 - daily_decay_factor)
+        # Apply daily cash drag / carry on cash positions.
+        # Definition is counterintuitive:
+        #   * positive cash_drag_rate_pa => negative return on cash (cash is penalized)
+        #   * negative cash_drag_rate_pa => positive return on cash (cash earns yield)
+        # A zero rate leaves cash unchanged.
+        if self.cash_drag_rate_pa != 0.0:
+            daily_cash_return = (1.0 - self.cash_drag_rate_pa) ** (1.0 / 252.0) - 1.0
+            cash_multiplier = 1.0 + daily_cash_return
+            self.portfolio_state.cash *= cash_multiplier
+            self.comparison_portfolio_state.cash *= cash_multiplier
+            self.benchmark_portfolio_state.cash *= cash_multiplier
+            self.shadow_portfolio_state.cash *= cash_multiplier
+            self.selected_asset_bh_portfolio_state.cash *= cash_multiplier
         
         # --- SAA sub-portfolio MTM update (PORTFOLIO_WEIGHTS mode only) ---
         # Mirrors live-portfolio treatment: apply cash drag, then price-revalue. Records per-asset
@@ -2529,11 +2532,11 @@ class TradingEnv(gym.Env):
             # Cash before drag (snapshotted at start of this step, stored on env at reset/after last action)
             cash_before_drag = prev_cash.copy()
 
-            # Apply cash drag (matches live-portfolio decay on L2268)
-            if self.cash_drag_rate_pa > 0:
-                # daily_decay_factor is computed locally in the surrounding block; recompute here to keep this block self-contained
-                daily_decay_factor = (1.0 + self.cash_drag_rate_pa) ** (1.0 / 252.0) - 1.0
-                cash_after_drag = prev_cash * (1.0 - daily_decay_factor)
+            # Apply cash drag / carry with the same bidirectional convention as the main portfolio.
+            # Positive cash_drag_rate_pa penalizes cash; negative values reward cash.
+            if self.cash_drag_rate_pa != 0.0:
+                daily_cash_return = (1.0 - self.cash_drag_rate_pa) ** (1.0 / 252.0) - 1.0
+                cash_after_drag = prev_cash * (1.0 + daily_cash_return)
             else:
                 cash_after_drag = prev_cash.copy()
 
