@@ -1153,7 +1153,7 @@ class SAASignalWrapper(VecEnvWrapper):
         # Select the configured SAA market features.
         saa_market_feats = asset_feats[:, :, self.saa_idx]
 
-        # --- Build SAA per-asset obs EXACTLY like SAA training (num_saa_features + 4) ---
+        # --- Build SAA per-asset obs EXACTLY like SAA training (num_saa_features + 5) ---
         # Read per-asset hypothetical sub-portfolio state from each underlying env's buffer.
         num_envs = obs.shape[0]
         N = self.num_assets
@@ -1164,6 +1164,7 @@ class SAASignalWrapper(VecEnvWrapper):
         last_act_all = np.zeros((num_envs, N), dtype=np.float32)
         dret_all   = np.zeros((num_envs, N), dtype=np.float32)
         prices_all = np.zeros((num_envs, N), dtype=np.float32)
+        rf_z_all = np.zeros((num_envs, 1), dtype=np.float32)
 
         for b in range(num_envs):
             env_b = self._base_envs[b]
@@ -1173,6 +1174,7 @@ class SAASignalWrapper(VecEnvWrapper):
             last_act_all[b] = la
             dret_all[b]   = dr
             prices_all[b] = env_b.portfolio_state.prices
+            rf_z_all[b, 0] = env_b.market_data_cache.get_risk_free_rate_zscore_at_step(env_b.current_absolute_step)
 
         asset_notional = shares_all * prices_all                                                  # (B, N)
         # Log-ratios with gating at 0 (matches get_observation_single_step L3973-3976)
@@ -1180,16 +1182,17 @@ class SAASignalWrapper(VecEnvWrapper):
         cash_log_value  = np.where(cash_all        > 0, np.log(np.maximum(cash_all,        eps) / initial_pv), 0.0).astype(np.float32)
         asset_log_value = np.where(asset_notional  > 0, np.log(np.maximum(asset_notional,  eps) / initial_pv), 0.0).astype(np.float32)
 
-        # Stack into per-asset 4-feature memory block: (B, N, 4)
-        mem_block = np.stack([cash_log_value, asset_log_value, dret_all, last_act_all], axis=-1)  # (B, N, 4)
+        # Stack into per-asset 5-feature memory block: (B, N, 5)
+        rf_z_rep = np.repeat(rf_z_all, repeats=N, axis=1)
+        mem_block = np.stack([cash_log_value, asset_log_value, dret_all, last_act_all, rf_z_rep], axis=-1)  # (B, N, 5)
 
         # Combine with configured SAA market features
-        saa_obs = np.concatenate([saa_market_feats, mem_block], axis=-1)                          # (B, N, F_saa + 4)
+        saa_obs = np.concatenate([saa_market_feats, mem_block], axis=-1)                          # (B, N, F_saa + 5)
 
         # Collect SAA signals per asset using distinct models/states
         signals = []
         for a in range(self.num_assets):
-            asset_obs = saa_obs[:, a, :]  # (B, 32)
+            asset_obs = saa_obs[:, a, :]
             per_asset_obs = asset_obs
             if self.saa_vecnormalize is not None and hasattr(self.saa_vecnormalize, "obs_rms"):
                 rms = self.saa_vecnormalize.obs_rms

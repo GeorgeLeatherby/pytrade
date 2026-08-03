@@ -41,6 +41,7 @@ Function classes:
 
 # Imports
 from dataclasses import dataclass, field
+import importlib
 import numpy as np
 import pandas as pd
 import gymnasium as gym
@@ -245,6 +246,7 @@ class EpisodeBuffer:
     running_mean_ema: np.ndarray = field(init=False)  # [episode_buffer_length_days] - running mean EMA of returns for reward component
     downside_var_sqrt: np.ndarray = field(init=False)  # [episode_buffer_length_days] - sqrt of downside variance for Sortino ratio
     previous_max_drawdown: np.ndarray = field(init=False)  # [episode_buffer_length_days] - previous max drawdown for reward component
+    risk_free_rate_zscore_60d: np.ndarray = field(init=False)  # [episode_buffer_length_days] - aligned risk-free z-score feature
 
     # weights, alpha, sharpe_ratio, drawdown, volatility, turnover, allocator_rewards
 
@@ -274,7 +276,7 @@ class EpisodeBuffer:
         # If num_features is not available, set to 0
         num_features = getattr(self, "num_features", 0)
         self.current_step = 0
-        self.num_portfolio_features = self.num_assets + 1 + 11  # weights + 11 portfolio metrics used by get_observation_at_step
+        self.num_portfolio_features = self.num_assets + 1 + 12  # weights + 12 portfolio metrics used by get_observation_at_step
         self.action_entropy = np.zeros(self.episode_buffer_length_days, dtype=dtype) 
         # Reward component tracking (per-step)
         self.reward_alpha = np.zeros(self.episode_buffer_length_days, dtype=dtype)
@@ -290,6 +292,7 @@ class EpisodeBuffer:
         self.running_mean_ema = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         self.downside_var_sqrt = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         self.previous_max_drawdown = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.risk_free_rate_zscore_60d = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         # --- Per-asset hypothetical SAA sub-portfolio containers ---
         # Used ONLY in PORTFOLIO_WEIGHTS execution mode to feed frozen SAAs inside SAASignalWrapper.
         # One independent sub-portfolio per asset; each mimics SAA-training obs inputs.
@@ -309,6 +312,7 @@ class EpisodeBuffer:
                    reward_parts: Optional[Dict[str, float]] = None,
                    effective_asset_concentration_norm: float = 0.0, previous_sortino: float = 0.0, current_sortino: float = 0.0,
                    running_mean_ema: float = 0.0, downside_var_sqrt: float = 0.0, previous_max_drawdown: float = 0.0,
+                   risk_free_rate_zscore_60d: float = 0.0,
                    selected_asset_bh_portfolio_value: float = 0.0, selected_asset_bh_transaction_cost: float = 0.0) -> None:
         
         """
@@ -350,6 +354,7 @@ class EpisodeBuffer:
         self.running_mean_ema[internal_offset_step] = running_mean_ema
         self.downside_var_sqrt[internal_offset_step] = downside_var_sqrt
         self.previous_max_drawdown[internal_offset_step] = previous_max_drawdown
+        self.risk_free_rate_zscore_60d[internal_offset_step] = risk_free_rate_zscore_60d
         # Reward components
         if reward_parts is not None:
             self.reward_alpha[internal_offset_step] = reward_parts.get("alpha_component", 0.0)
@@ -547,7 +552,10 @@ class EpisodeBuffer:
     def get_observation_lookback(self) -> np.ndarray:
         """
         Get portfolio lookback for LSTM input computationally efficient.
-        Sequences of vars: weights, alpha, sharpe_ratio, drawdown, volatility, turnover, allocator_rewards
+        Sequences of vars:
+        weights, alpha, sharpe_ratio, drawdown, volatility, turnover,
+        effective concentration, previous/current sortino, running mean ema,
+        downside variance sqrt, previous max drawdown, risk-free z-score.
         - shape [lookback_window, num_portfolio_features]
         """
         # Determine start and end indices for lookback (handle circular buffer)
@@ -556,7 +564,7 @@ class EpisodeBuffer:
         actual_window = end_idx - start_idx + 1
 
         # Pre-allocate output array
-        num_portfolio_features = self.num_portfolio_features # 6 + self.portfolio_weights.shape[1]  # weights + alpha + sharpe + drawdown + volatility + turnover + allocator_rewards
+        num_portfolio_features = self.num_portfolio_features
         obs = np.zeros((self.lookback_window, num_portfolio_features), dtype=np.float32)
 
         # Gather sequences
@@ -567,11 +575,29 @@ class EpisodeBuffer:
         drawdown_seq = self.drawdown[start_idx:end_idx+1].reshape(-1, 1)
         volatility_seq = self.volatility[start_idx:end_idx+1].reshape(-1, 1)
         turnover_seq = self.turnover[start_idx:end_idx+1].reshape(-1, 1)
-        rewards_seq = self.rewards[start_idx:end_idx+1].reshape(-1, 1)
+        eff_conc_seq = self.effective_asset_concentration_norm[start_idx:end_idx+1].reshape(-1, 1)
+        prev_sortino_seq = self.previous_sortino[start_idx:end_idx+1].reshape(-1, 1)
+        curr_sortino_seq = self.current_sortino[start_idx:end_idx+1].reshape(-1, 1)
+        running_mean_ema_seq = self.running_mean_ema[start_idx:end_idx+1].reshape(-1, 1)
+        downside_var_sqrt_seq = self.downside_var_sqrt[start_idx:end_idx+1].reshape(-1, 1)
+        prev_max_dd_seq = self.previous_max_drawdown[start_idx:end_idx+1].reshape(-1, 1)
+        rf_zscore_seq = self.risk_free_rate_zscore_60d[start_idx:end_idx+1].reshape(-1, 1)
 
         # Concatenate all features along last axis
         features_seq = np.concatenate([
-            weights_seq, alpha_seq, sharpe_seq, drawdown_seq, volatility_seq, turnover_seq, rewards_seq
+            weights_seq,
+            alpha_seq,
+            sharpe_seq,
+            drawdown_seq,
+            volatility_seq,
+            turnover_seq,
+            eff_conc_seq,
+            prev_sortino_seq,
+            curr_sortino_seq,
+            running_mean_ema_seq,
+            downside_var_sqrt_seq,
+            prev_max_dd_seq,
+            rf_zscore_seq,
         ], axis=1)
 
         # Place into output array (pad at beginning if needed)
@@ -604,6 +630,7 @@ class EpisodeBuffer:
         running_mean_ema = self.running_mean_ema[internal_step]
         downside_var_sqrt = self.downside_var_sqrt[internal_step]
         previous_max_drawdown = self.previous_max_drawdown[internal_step]
+        risk_free_rate_zscore_60d = self.risk_free_rate_zscore_60d[internal_step]
 
         # rewards = self.allocator_rewards[internal_step] # Why feed reward.
         effective_asset_concentration_norm = self.effective_asset_concentration_norm[internal_step]
@@ -611,7 +638,7 @@ class EpisodeBuffer:
         observation = np.concatenate([
             weights,
             [alpha, sharpe, drawdown, volatility, turnover, effective_asset_concentration_norm, previous_sortino, 
-            current_sortino, running_mean_ema, downside_var_sqrt, previous_max_drawdown]
+            current_sortino, running_mean_ema, downside_var_sqrt, previous_max_drawdown, risk_free_rate_zscore_60d]
         ]).astype(np.float32)
 
         return observation
@@ -698,6 +725,12 @@ class MarketDataCache:
     
     # Pre-calculated features [num_days, num_assets, num_selected_features]
     features: np.ndarray                # Only selected technical indicators, ratios, etc.
+
+    # Daily risk-free series aligned to the env trading dates.
+    effr_raw_pct: np.ndarray            # [num_days] Effective Federal Funds Rate in percent
+    risk_free_rate_pa: np.ndarray       # [num_days] annualized decimal risk-free rate
+    risk_free_rate_daily: np.ndarray    # [num_days] daily decimal carry derived from EFFR
+    risk_free_rate_zscore_60d: np.ndarray  # [num_days] rolling 60-day z-score of annualized risk-free rate
     
     # Fast lookup tables
     date_to_index: Dict[str, int]       # Date -> array index mapping
@@ -767,6 +800,30 @@ class MarketDataCache:
         # Convert date column to datetime if it's not already
         if df['date'].dtype == 'object':
             df['date'] = pd.to_datetime(df['date'])
+        # Normalize timestamps so date-key joins are exact and timezone/time-of-day agnostic.
+        df['date'] = pd.to_datetime(df['date']).dt.tz_localize(None).dt.normalize()
+
+        # Attach dynamic EFFR-derived risk-free series aligned to the exact dates in this dataset.
+        # This keeps alignment robust when some market dates are intentionally missing.
+        unique_dates = sorted(df['date'].unique())
+        rf_df = cls._build_risk_free_features(pd.DatetimeIndex(unique_dates))
+        rf_map_effr_raw_pct = rf_df['effr_raw_pct'].to_dict()
+        rf_map_pa = rf_df['risk_free_rate_pa'].to_dict()
+        rf_map_daily = rf_df['risk_free_rate_daily'].to_dict()
+        rf_map_z60 = rf_df['risk_free_rate_zscore_60d'].to_dict()
+
+        df['effr_raw_pct'] = df['date'].map(rf_map_effr_raw_pct)
+        df['risk_free_rate_pa'] = df['date'].map(rf_map_pa)
+        df['risk_free_rate_daily'] = df['date'].map(rf_map_daily)
+        df['risk_free_rate_zscore_60d'] = df['date'].map(rf_map_z60)
+        rf_cols = ['effr_raw_pct', 'risk_free_rate_pa', 'risk_free_rate_daily', 'risk_free_rate_zscore_60d']
+        if df[rf_cols].isnull().any().any():
+            bad_mask = df[rf_cols].isnull().any(axis=1)
+            missing_dates = sorted(df.loc[bad_mask, 'date'].dt.strftime('%Y-%m-%d').unique().tolist())
+            raise ValueError(
+                "Failed to map EFFR-derived risk-free features to all market rows. "
+                f"Missing dates (sample): {missing_dates[:10]}"
+            )
         
         # Extract unique dates and assets
         unique_dates = sorted(df['date'].unique())
@@ -838,6 +895,24 @@ class MarketDataCache:
         features_nan_pct = np.isnan(features).mean() * 100
         print(f"Data quality: {nan_pct:.2f}% NaN in prices, {features_nan_pct:.2f}% NaN in features")
 
+        # Build date-aligned risk-free arrays directly from the aligned series.
+        effr_raw_pct = np.array(
+            [float(rf_map_effr_raw_pct[pd.Timestamp(d)]) for d in unique_dates],
+            dtype=np.float32,
+        )
+        risk_free_rate_pa = np.array(
+            [float(rf_map_pa[pd.Timestamp(d)]) for d in unique_dates],
+            dtype=np.float32,
+        )
+        risk_free_rate_daily = np.array(
+            [float(rf_map_daily[pd.Timestamp(d)]) for d in unique_dates],
+            dtype=np.float32,
+        )
+        risk_free_rate_zscore_60d = np.array(
+            [float(rf_map_z60[pd.Timestamp(d)]) for d in unique_dates],
+            dtype=np.float32,
+        )
+
 
         # Extract training parameters from config
         episode_length_days = config['environment']['episode_length_days']
@@ -856,6 +931,10 @@ class MarketDataCache:
             close_prices=close_prices,
             volumes=volumes,
             features=features,
+            effr_raw_pct=effr_raw_pct,
+            risk_free_rate_pa=risk_free_rate_pa,
+            risk_free_rate_daily=risk_free_rate_daily,
+            risk_free_rate_zscore_60d=risk_free_rate_zscore_60d,
             date_to_index={pd.Timestamp(d).strftime('%Y-%m-%d'): i for i, d in enumerate(unique_dates)},
             asset_to_index=asset_to_index,
             feature_to_index=feature_to_index,
@@ -876,6 +955,83 @@ class MarketDataCache:
         instance._create_time_series_blocks(block_buffer_multiplier, test_val_split_ratio)
         
         return instance
+
+    @staticmethod
+    def _build_risk_free_features(unique_dates: pd.DatetimeIndex) -> pd.DataFrame:
+        """
+        Fetch and align EFFR (FRED: DFF) to provided dates.
+
+                Alignment policy:
+                - Pull daily EFFR from FRED over an expanded date range that starts
+                    at least 60 days before the first required market date.
+        - Reindex to calendar days and forward-fill without limit up to the last needed date.
+        - If leading values remain NaN (rare), backfill once from first available observation.
+                - Compute rolling 60-day z-score on the full expanded timeline.
+                - Reindex the final series to exact dataset dates.
+        """
+        try:
+            web = importlib.import_module("pandas_datareader.data")
+        except ImportError as exc:
+            raise ImportError(
+                "pandas_datareader is required for dynamic EFFR fetching. "
+                "Install it with: pip install pandas_datareader"
+            ) from exc
+
+        if len(unique_dates) == 0:
+            raise ValueError("Cannot build risk-free features: unique_dates is empty.")
+
+        date_idx = pd.DatetimeIndex(pd.to_datetime(unique_dates)).tz_localize(None).normalize()
+        start_needed = date_idx.min()
+        end_needed = date_idx.max()
+
+        # Pull at least 60 prior days so rolling z-score is fully warmed from day 1
+        # of the market cache. Extra buffer helps with holidays/weekends/data gaps.
+        query_start = start_needed - pd.Timedelta(days=120)
+        query_end = end_needed
+
+        effr_df = web.DataReader('DFF', 'fred', query_start, query_end)
+        if effr_df.empty:
+            raise ValueError("FRED returned empty EFFR series for requested date range.")
+
+        effr_series = effr_df['DFF'].astype(float)
+        effr_series.index = pd.DatetimeIndex(effr_series.index).tz_localize(None).normalize()
+
+        full_calendar = pd.date_range(query_start, end_needed, freq='D')
+        effr_full = effr_series.reindex(full_calendar).ffill()
+        if effr_full.isna().any():
+            effr_full = effr_full.bfill()
+
+        effr_aligned = effr_full.reindex(date_idx)
+        if effr_aligned.isna().any():
+            missing_dates = [d.strftime('%Y-%m-%d') for d in effr_aligned.index[effr_aligned.isna()]]
+            raise ValueError(f"Failed to align EFFR for all required dates. Missing: {missing_dates[:10]}")
+
+        # Build annualized and daily rates on the full expanded timeline first.
+        risk_free_rate_pa_full = effr_full / 100.0
+        # Fed funds is conventionally an overnight annualized rate on ACT/360.
+        risk_free_rate_daily_full = risk_free_rate_pa_full / 360.0
+
+        # Compute rolling z-score on the expanded timeline so the first cache day
+        # can use a proper 60-day history.
+        rolling_mean_full = risk_free_rate_pa_full.rolling(window=60, min_periods=60).mean()
+        rolling_std_full = risk_free_rate_pa_full.rolling(window=60, min_periods=60).std(ddof=0)
+        z60_full = (risk_free_rate_pa_full - rolling_mean_full) / rolling_std_full
+        z60_full = z60_full.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+        # Align final series to the exact dataset dates.
+        risk_free_rate_pa = risk_free_rate_pa_full.reindex(date_idx)
+        risk_free_rate_daily = risk_free_rate_daily_full.reindex(date_idx)
+        z60 = z60_full.reindex(date_idx)
+
+        return pd.DataFrame(
+            {
+                'effr_raw_pct': effr_aligned.values,
+                'risk_free_rate_pa': risk_free_rate_pa.values,
+                'risk_free_rate_daily': risk_free_rate_daily.values,
+                'risk_free_rate_zscore_60d': z60.values,
+            },
+            index=date_idx,
+        )
 
     def _create_time_series_blocks(self, block_buffer_multiplier, test_val_split_ratio):
         """
@@ -1335,6 +1491,22 @@ class MarketDataCache:
             'assets_with_gaps': [asset for asset, comp in asset_completeness.items() if comp < 95.0],
             'feature_selection': self.get_feature_selection_summary()
         }
+
+    def get_risk_free_rate_daily_at_step(self, step_idx: int) -> float:
+        """Get date-aligned daily risk-free carry for a given absolute step."""
+        if step_idx < 0:
+            step_idx = 0
+        elif step_idx >= self.num_days:
+            step_idx = self.num_days - 1
+        return float(self.risk_free_rate_daily[step_idx])
+
+    def get_risk_free_rate_zscore_at_step(self, step_idx: int) -> float:
+        """Get date-aligned 60-day z-score of the annualized risk-free rate for a given absolute step."""
+        if step_idx < 0:
+            step_idx = 0
+        elif step_idx >= self.num_days:
+            step_idx = self.num_days - 1
+        return float(self.risk_free_rate_zscore_60d[step_idx])
     
     def sample_episode_start(self, mode: str = 'train', random_seed: Optional[int] = None) -> Tuple[str, int]:
         """
@@ -1603,7 +1775,7 @@ class TradingEnv(gym.Env):
 
         if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
             asset_obs_size = num_features # Single step asset features for selected asset
-            portfolio_obs_size = 4 # log cash ratio, log asset ratio, day return just agent relevant, last_action
+            portfolio_obs_size = 5 # log cash ratio, log asset ratio, agent return, last_action, risk_free_rate_zscore_60d
 
         else:
             if self.maybe_provide_sequence:
@@ -2100,6 +2272,7 @@ class TradingEnv(gym.Env):
             benchmark_portfolio_value=self.benchmark_portfolio_state.get_total_value(),
             comparison_portfolio_value=self.comparison_portfolio_state.get_total_value(),
             effective_asset_concentration_norm=effective_asset_concentration_norm,
+            risk_free_rate_zscore_60d=float(self.market_data_cache.get_risk_free_rate_zscore_at_step(self.current_absolute_step)),
             selected_asset_bh_portfolio_value=self.selected_asset_bh_portfolio_state.get_total_value(),
             selected_asset_bh_transaction_cost=self.selected_asset_bh_init_transaction_cost
         )
@@ -2506,19 +2679,14 @@ class TradingEnv(gym.Env):
         self.benchmark_portfolio_state.prices[:] = new_prices # in-place update
         self.benchmark_portfolio_state.step = self.current_step
 
-        # Apply daily cash drag / carry on cash positions.
-        # Definition is counterintuitive:
-        #   * positive cash_drag_rate_pa => negative return on cash (cash is penalized)
-        #   * negative cash_drag_rate_pa => positive return on cash (cash earns yield)
-        # A zero rate leaves cash unchanged.
-        if self.cash_drag_rate_pa != 0.0:
-            daily_cash_return = (1.0 - self.cash_drag_rate_pa) ** (1.0 / 252.0) - 1.0
-            cash_multiplier = 1.0 + daily_cash_return
-            self.portfolio_state.cash *= cash_multiplier
-            self.comparison_portfolio_state.cash *= cash_multiplier
-            self.benchmark_portfolio_state.cash *= cash_multiplier
-            self.shadow_portfolio_state.cash *= cash_multiplier
-            self.selected_asset_bh_portfolio_state.cash *= cash_multiplier
+        # Apply dynamic risk-free cash carry from the date-aligned EFFR series.
+        daily_cash_return = self.market_data_cache.get_risk_free_rate_daily_at_step(self.current_absolute_step)
+        cash_multiplier = 1.0 + daily_cash_return
+        self.portfolio_state.cash *= cash_multiplier
+        self.comparison_portfolio_state.cash *= cash_multiplier
+        self.benchmark_portfolio_state.cash *= cash_multiplier
+        self.shadow_portfolio_state.cash *= cash_multiplier
+        self.selected_asset_bh_portfolio_state.cash *= cash_multiplier
         
         # --- SAA sub-portfolio MTM update (PORTFOLIO_WEIGHTS mode only) ---
         # Mirrors live-portfolio treatment: apply cash drag, then price-revalue. Records per-asset
@@ -2532,13 +2700,8 @@ class TradingEnv(gym.Env):
             # Cash before drag (snapshotted at start of this step, stored on env at reset/after last action)
             cash_before_drag = prev_cash.copy()
 
-            # Apply cash drag / carry with the same bidirectional convention as the main portfolio.
-            # Positive cash_drag_rate_pa penalizes cash; negative values reward cash.
-            if self.cash_drag_rate_pa != 0.0:
-                daily_cash_return = (1.0 - self.cash_drag_rate_pa) ** (1.0 / 252.0) - 1.0
-                cash_after_drag = prev_cash * (1.0 + daily_cash_return)
-            else:
-                cash_after_drag = prev_cash.copy()
+            # Apply the same dynamic risk-free cash carry used by the live portfolio.
+            cash_after_drag = prev_cash * (1.0 + daily_cash_return)
 
             # Revalue at new prices
             notional_after   = prev_shares * new_prices                                      # [N]
@@ -2696,6 +2859,7 @@ class TradingEnv(gym.Env):
             running_mean_ema=reward_parts.get("running_mean_ema", None),
             downside_var_sqrt=reward_parts.get("downside_var_sqrt", None),
             previous_max_drawdown=reward_parts.get("previous_max_drawdown", None),
+            risk_free_rate_zscore_60d=float(self.market_data_cache.get_risk_free_rate_zscore_at_step(self.current_absolute_step)),
             selected_asset_bh_portfolio_value=float(self.selected_asset_bh_portfolio_state.get_total_value()),
             selected_asset_bh_transaction_cost=0.0  # No transaction costs after initialization (buy-and-hold)
         )
@@ -4405,8 +4569,21 @@ class TradingEnv(gym.Env):
             # Last agents action
             last_action = float(self.episode_buffer.actions[internal_step, asset_index + 1])
             
-            # Build minimal portfolio features for single-asset mode
-            portfolio_features = np.array([cash_log_value, asset_log_value, daily_agent_return, last_action], dtype=np.float32)
+            risk_free_rate_zscore_60d = float(
+                self.market_data_cache.get_risk_free_rate_zscore_at_step(self.current_absolute_step)
+            )
+
+            # Build minimal portfolio features for single-asset mode.
+            portfolio_features = np.array(
+                [
+                    cash_log_value,
+                    asset_log_value,
+                    daily_agent_return,
+                    last_action,
+                    risk_free_rate_zscore_60d,
+                ],
+                dtype=np.float32,
+            )
 
             # Verify that all values contain numeric values before concatenation and guard!
             if not np.all(np.isfinite(features)):
