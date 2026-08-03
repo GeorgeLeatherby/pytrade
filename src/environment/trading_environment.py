@@ -1302,9 +1302,10 @@ class MarketDataCache:
                     # Track which sections define the same feature
                     if feat_name not in duplicates_found:
                         duplicates_found[feat_name] = [feature_origin[feat_name]]
+                    if section_name not in duplicates_found[feat_name]:
                         duplicates_found[feat_name].append(section_name)
-            else:
-                feature_origin[feat_name] = section_name
+                else:
+                    feature_origin[feat_name] = section_name
         
         # Inform user about duplicates but don't raise error
         if duplicates_found:
@@ -1325,15 +1326,23 @@ class MarketDataCache:
             for feat_name, enabled in section.items():
                 combined_flags[feat_name] = bool(enabled)
 
-        selected_features: List[str] = []
-        for feature_name in available_features:
-            if feature_name in combined_flags:
-                if combined_flags[feature_name]:
-                    selected_features.append(feature_name)
-            else:
-                print(
-                    f"Warning: Feature '{feature_name}' not found in provided feature sections in config. Skipping."
-                )
+        # Warn only when a feature is explicitly enabled in config but absent in data.
+        missing_requested = sorted(
+            feat_name
+            for feat_name, enabled in combined_flags.items()
+            if enabled and feat_name not in available_features
+        )
+        if missing_requested:
+            raise ValueError(
+                "The following enabled features are missing in the loaded market data: "
+                f"{missing_requested}"
+            )
+
+        selected_features: List[str] = [
+            feature_name
+            for feature_name in available_features
+            if bool(combined_flags.get(feature_name, False))
+        ]
         
         if not selected_features:
             raise ValueError("No features selected. Please enable at least one feature in the config sections.")
