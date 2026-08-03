@@ -247,6 +247,7 @@ class EpisodeBuffer:
     downside_var_sqrt: np.ndarray = field(init=False)  # [episode_buffer_length_days] - sqrt of downside variance for Sortino ratio
     previous_max_drawdown: np.ndarray = field(init=False)  # [episode_buffer_length_days] - previous max drawdown for reward component
     risk_free_rate_zscore_60d: np.ndarray = field(init=False)  # [episode_buffer_length_days] - aligned risk-free z-score feature
+    risk_free_rate_daily: np.ndarray = field(init=False)  # [episode_buffer_length_days] - aligned daily risk-free carry feature
 
     # weights, alpha, sharpe_ratio, drawdown, volatility, turnover, allocator_rewards
 
@@ -276,7 +277,7 @@ class EpisodeBuffer:
         # If num_features is not available, set to 0
         num_features = getattr(self, "num_features", 0)
         self.current_step = 0
-        self.num_portfolio_features = self.num_assets + 1 + 12  # weights + 12 portfolio metrics used by get_observation_at_step
+        self.num_portfolio_features = self.num_assets + 1 + 13  # weights + 13 portfolio metrics used by get_observation_at_step
         self.action_entropy = np.zeros(self.episode_buffer_length_days, dtype=dtype) 
         # Reward component tracking (per-step)
         self.reward_alpha = np.zeros(self.episode_buffer_length_days, dtype=dtype)
@@ -293,6 +294,7 @@ class EpisodeBuffer:
         self.downside_var_sqrt = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         self.previous_max_drawdown = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         self.risk_free_rate_zscore_60d = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.risk_free_rate_daily = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         # --- Per-asset hypothetical SAA sub-portfolio containers ---
         # Used ONLY in PORTFOLIO_WEIGHTS execution mode to feed frozen SAAs inside SAASignalWrapper.
         # One independent sub-portfolio per asset; each mimics SAA-training obs inputs.
@@ -313,6 +315,7 @@ class EpisodeBuffer:
                    effective_asset_concentration_norm: float = 0.0, previous_sortino: float = 0.0, current_sortino: float = 0.0,
                    running_mean_ema: float = 0.0, downside_var_sqrt: float = 0.0, previous_max_drawdown: float = 0.0,
                    risk_free_rate_zscore_60d: float = 0.0,
+                   risk_free_rate_daily: float = 0.0,
                    selected_asset_bh_portfolio_value: float = 0.0, selected_asset_bh_transaction_cost: float = 0.0) -> None:
         
         """
@@ -355,6 +358,7 @@ class EpisodeBuffer:
         self.downside_var_sqrt[internal_offset_step] = downside_var_sqrt
         self.previous_max_drawdown[internal_offset_step] = previous_max_drawdown
         self.risk_free_rate_zscore_60d[internal_offset_step] = risk_free_rate_zscore_60d
+        self.risk_free_rate_daily[internal_offset_step] = risk_free_rate_daily
         # Reward components
         if reward_parts is not None:
             self.reward_alpha[internal_offset_step] = reward_parts.get("alpha_component", 0.0)
@@ -582,6 +586,7 @@ class EpisodeBuffer:
         downside_var_sqrt_seq = self.downside_var_sqrt[start_idx:end_idx+1].reshape(-1, 1)
         prev_max_dd_seq = self.previous_max_drawdown[start_idx:end_idx+1].reshape(-1, 1)
         rf_zscore_seq = self.risk_free_rate_zscore_60d[start_idx:end_idx+1].reshape(-1, 1)
+        rf_daily_seq = self.risk_free_rate_daily[start_idx:end_idx+1].reshape(-1, 1)
 
         # Concatenate all features along last axis
         features_seq = np.concatenate([
@@ -598,6 +603,7 @@ class EpisodeBuffer:
             downside_var_sqrt_seq,
             prev_max_dd_seq,
             rf_zscore_seq,
+            rf_daily_seq,
         ], axis=1)
 
         # Place into output array (pad at beginning if needed)
@@ -631,6 +637,7 @@ class EpisodeBuffer:
         downside_var_sqrt = self.downside_var_sqrt[internal_step]
         previous_max_drawdown = self.previous_max_drawdown[internal_step]
         risk_free_rate_zscore_60d = self.risk_free_rate_zscore_60d[internal_step]
+        risk_free_rate_daily = self.risk_free_rate_daily[internal_step]
 
         # rewards = self.allocator_rewards[internal_step] # Why feed reward.
         effective_asset_concentration_norm = self.effective_asset_concentration_norm[internal_step]
@@ -638,7 +645,7 @@ class EpisodeBuffer:
         observation = np.concatenate([
             weights,
             [alpha, sharpe, drawdown, volatility, turnover, effective_asset_concentration_norm, previous_sortino, 
-            current_sortino, running_mean_ema, downside_var_sqrt, previous_max_drawdown, risk_free_rate_zscore_60d]
+            current_sortino, running_mean_ema, downside_var_sqrt, previous_max_drawdown, risk_free_rate_zscore_60d, risk_free_rate_daily]
         ]).astype(np.float32)
 
         return observation
@@ -1013,10 +1020,11 @@ class MarketDataCache:
 
         # Compute rolling z-score on the expanded timeline so the first cache day
         # can use a proper 60-day history.
+        z_eps = 1e-8
         rolling_mean_full = risk_free_rate_pa_full.rolling(window=60, min_periods=60).mean()
         rolling_std_full = risk_free_rate_pa_full.rolling(window=60, min_periods=60).std(ddof=0)
-        z60_full = (risk_free_rate_pa_full - rolling_mean_full) / rolling_std_full
-        z60_full = z60_full.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        z60_full = (risk_free_rate_pa_full - rolling_mean_full) / (rolling_std_full + z_eps)
+        z60_full = z60_full.replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=-3.0, upper=3.0)
 
         # Align final series to the exact dataset dates.
         risk_free_rate_pa = risk_free_rate_pa_full.reindex(date_idx)
@@ -1775,7 +1783,7 @@ class TradingEnv(gym.Env):
 
         if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
             asset_obs_size = num_features # Single step asset features for selected asset
-            portfolio_obs_size = 5 # log cash ratio, log asset ratio, agent return, last_action, risk_free_rate_zscore_60d
+            portfolio_obs_size = 6 # log cash ratio, log asset ratio, agent return, last_action, risk_free_rate_zscore_60d, risk_free_rate_daily
 
         else:
             if self.maybe_provide_sequence:
@@ -2273,6 +2281,7 @@ class TradingEnv(gym.Env):
             comparison_portfolio_value=self.comparison_portfolio_state.get_total_value(),
             effective_asset_concentration_norm=effective_asset_concentration_norm,
             risk_free_rate_zscore_60d=float(self.market_data_cache.get_risk_free_rate_zscore_at_step(self.current_absolute_step)),
+            risk_free_rate_daily=float(self.market_data_cache.get_risk_free_rate_daily_at_step(self.current_absolute_step)),
             selected_asset_bh_portfolio_value=self.selected_asset_bh_portfolio_state.get_total_value(),
             selected_asset_bh_transaction_cost=self.selected_asset_bh_init_transaction_cost
         )
@@ -2860,6 +2869,7 @@ class TradingEnv(gym.Env):
             downside_var_sqrt=reward_parts.get("downside_var_sqrt", None),
             previous_max_drawdown=reward_parts.get("previous_max_drawdown", None),
             risk_free_rate_zscore_60d=float(self.market_data_cache.get_risk_free_rate_zscore_at_step(self.current_absolute_step)),
+            risk_free_rate_daily=float(self.market_data_cache.get_risk_free_rate_daily_at_step(self.current_absolute_step)),
             selected_asset_bh_portfolio_value=float(self.selected_asset_bh_portfolio_state.get_total_value()),
             selected_asset_bh_transaction_cost=0.0  # No transaction costs after initialization (buy-and-hold)
         )
@@ -4572,6 +4582,9 @@ class TradingEnv(gym.Env):
             risk_free_rate_zscore_60d = float(
                 self.market_data_cache.get_risk_free_rate_zscore_at_step(self.current_absolute_step)
             )
+            risk_free_rate_daily = float(
+                self.market_data_cache.get_risk_free_rate_daily_at_step(self.current_absolute_step)
+            )
 
             # Build minimal portfolio features for single-asset mode.
             portfolio_features = np.array(
@@ -4581,6 +4594,7 @@ class TradingEnv(gym.Env):
                     daily_agent_return,
                     last_action,
                     risk_free_rate_zscore_60d,
+                    risk_free_rate_daily,
                 ],
                 dtype=np.float32,
             )
