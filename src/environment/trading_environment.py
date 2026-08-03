@@ -1614,7 +1614,7 @@ class TradingEnv(gym.Env):
         self.lookback_window = config["environment"]["lookback_window"]
         self.initial_portfolio_value = config["environment"]["initial_portfolio_value"]
         self.early_stopping_threshold = config["environment"]["early_stopping_threshold"]
-        self.cash_drag_rate_pa = config["environment"]["cash_drag_rate_pa"]
+        #self.cash_drag_rate_pa = config["environment"]["cash_drag_rate_pa"]
         
         self.seed = config["environment"]["seed"]
         # Execution parameters
