@@ -1631,7 +1631,7 @@ class TradingEnv(gym.Env):
         self.execution_min_trade_value_threshold = config["environment"]["execution_min_trade_value_threshold"]
         self.execution_min_days_between_trades = config["environment"]["execution_min_days_between_trades"]              # e.g., 0.0005
         self.maybe_provide_sequence = config['environment']['maybe_provide_sequence']  # Whether to provide sequence data in observations
-        self.sortino_net_reward_mix = config["environment"]["sortino_net_reward_mix"]
+        self.log_sortino_net_reward_mix = config["environment"]["log_sortino_net_reward_mix"]
         self.lambda_drawdown = config["environment"]["lambda_drawdown"]
         # Portfolio concentration control coefficient used in allocator reward.
         # Applied to normalized executed weights as:
@@ -1645,6 +1645,7 @@ class TradingEnv(gym.Env):
         # SAA reward scaling knobs (kept in config for easy objective tuning)
         self.saa_excess_log_return_scale = float(config["environment"].get("saa_excess_log_return_scale", 30.0))
         self.saa_log_diff_sortino_scale = float(config["environment"].get("saa_log_diff_sortino_scale", 10.0))
+        self.saa_linear_sortino_net_reward_scale = float(config["environment"].get("saa_linear_sortino_net_reward_scale", 10.0))
         self.saa_drawdown_level_penalty_coeff = float(config["environment"].get("saa_drawdown_level_penalty_coeff", 0.015))
         self.saa_reward_tanh_divisor = float(config["environment"].get("saa_reward_tanh_divisor", 5.0))
         self.saa_reward_tanh_scale = float(config["environment"].get("saa_reward_tanh_scale", 5.0))
@@ -1898,13 +1899,13 @@ class TradingEnv(gym.Env):
         self.current_episode = (self.current_episode + 1) if self.current_episode is not None else 0
         
         self.previous_sortino = 0.0
-        self.running_mean_ema = 1e-4
+        self.running_mean_ema = 1e-6
         self.running_downside_variance_ema = 2.5e-5
         self.previous_saa_sharpe_ratio = 0.0
 
         # Sortino SAA reward metrics
         self.saa_previous_sortino = 0.0
-        self.saa_running_mean_ema = 1e-4
+        self.saa_running_mean_ema = 1e-6
         self.saa_running_downside_variance_ema = 2.5e-5
 
         # Init & reset episode accumulators for sortino diagnostics
@@ -3472,16 +3473,26 @@ class TradingEnv(gym.Env):
 
         eps = 1e-12
 
-        # Delay Sortino reward contribution until EMAs have warmed up to avoid
-        # initialization spikes from previous_sortino=0.0.
-        sortino_warmup_steps = max(0, int(self.saa_sortino_warmup_steps))
-        if self.current_step < sortino_warmup_steps:
-            log_diff_sortino_reward = 0.0
+        # Clean Classic Differential Sortino
+        sortino_warmup = max(2, int(self.saa_sortino_warmup_steps))
+        if self.current_step < sortino_warmup:
+            delta_sortino_linear = 0.0
             self.saa_previous_sortino = current_sortino
         else:
-            prev_sortino = self.saa_previous_sortino
-            log_diff_sortino_reward = np.log(max(current_sortino, eps)) - np.log(max(prev_sortino, eps))
+            delta_sortino_linear = current_sortino - self.saa_previous_sortino
             self.saa_previous_sortino = current_sortino
+        scaled_delta_sortino_linear = float(self.saa_linear_sortino_net_reward_scale * delta_sortino_linear)
+
+        # # Delay log Sortino reward contribution until EMAs have warmed up to avoid
+        # # initialization spikes from previous_sortino=0.0.
+        # sortino_warmup_steps = max(0, int(self.saa_sortino_warmup_steps))
+        # if self.current_step < sortino_warmup_steps:
+        #     log_diff_sortino_reward = 0.0
+        #     self.saa_previous_sortino = current_sortino
+        # else:
+        #     prev_sortino = self.saa_previous_sortino
+        #     log_diff_sortino_reward = np.log(max(current_sortino, eps)) - np.log(max(prev_sortino, eps))
+        #     self.saa_previous_sortino = current_sortino
 
         # Mix Sortino with other metrics to get risk-aware non-deterministic policy
         """Calculate dynamic risk window. Use self.reward_risk_window and the current step to produce
@@ -3563,7 +3574,7 @@ class TradingEnv(gym.Env):
         # Simple log return reward
         saa_excess_return_scaled = self.saa_excess_log_return_scale * saa_excess_log_return
 
-        scaled_log_diff_sortino = self.saa_log_diff_sortino_scale * log_diff_sortino_reward
+        # scaled_log_diff_sortino = self.saa_log_diff_sortino_scale * log_diff_sortino_reward
 
         # """Calculate dynamic risk window. Use self.reward_risk_window and the current step to produce
         # behaviour which starts at 2 raises with the steps up to maximum risk_reward_window"""
@@ -3621,7 +3632,8 @@ class TradingEnv(gym.Env):
             - drawdown_level_penalty
             - execution_gap_penalty
             + realized_exit_bonus
-            + scaled_log_diff_sortino
+            # + scaled_log_diff_sortino
+            + scaled_delta_sortino_linear
         )
 
         tanh_div = max(self.saa_reward_tanh_divisor, 1e-8)
@@ -3648,9 +3660,9 @@ class TradingEnv(gym.Env):
             "realized_exit_bonus": realized_exit_bonus,
             "realized_exit_bonus_cum": self.saa_realized_exit_bonus_cum,
             "average_entry_price": float(self.saa_average_entry_price) if self.saa_average_entry_price is not None else 0.0,
-            "no_penalty_gap": no_penalty_gap,
-            "scaled_log_diff_sortino": scaled_log_diff_sortino,
-            "log_diff_sortino_reward": log_diff_sortino_reward
+            "no_penalty_gap": no_penalty_gap
+            # "scaled_log_diff_sortino": scaled_log_diff_sortino,
+            #"log_diff_sortino_reward": log_diff_sortino_reward
         }
         
         return saa_reward, saa_reward_parts
