@@ -1165,7 +1165,7 @@ class SAASignalWrapper(VecEnvWrapper):
         dret_all   = np.zeros((num_envs, N), dtype=np.float32)
         prices_all = np.zeros((num_envs, N), dtype=np.float32)
         rf_z_all = np.zeros((num_envs, 1), dtype=np.float32)
-        rf_daily_all = np.zeros((num_envs, 1), dtype=np.float32)
+        alpha_rf_all = np.zeros((num_envs, N), dtype=np.float32)
 
         for b in range(num_envs):
             env_b = self._base_envs[b]
@@ -1176,7 +1176,9 @@ class SAASignalWrapper(VecEnvWrapper):
             dret_all[b]   = dr
             prices_all[b] = env_b.portfolio_state.prices
             rf_z_all[b, 0] = env_b.market_data_cache.get_risk_free_rate_zscore_at_step(env_b.current_absolute_step)
-            rf_daily_all[b, 0] = env_b.market_data_cache.get_risk_free_rate_daily_at_step(env_b.current_absolute_step)
+            alpha_rf_all[b] = env_b.market_data_cache.get_all_assets_excess_log_return_over_rf_at_step(
+                env_b.current_absolute_step
+            )
 
         asset_notional = shares_all * prices_all                                                  # (B, N)
         # Log-ratios with gating at 0 (matches get_observation_single_step L3973-3976)
@@ -1186,8 +1188,7 @@ class SAASignalWrapper(VecEnvWrapper):
 
         # Stack into per-asset 6-feature memory block: (B, N, 6)
         rf_z_rep = np.repeat(rf_z_all, repeats=N, axis=1)
-        rf_daily_rep = np.repeat(rf_daily_all, repeats=N, axis=1)
-        mem_block = np.stack([cash_log_value, asset_log_value, dret_all, last_act_all, rf_z_rep, rf_daily_rep], axis=-1)  # (B, N, 6)
+        mem_block = np.stack([cash_log_value, asset_log_value, dret_all, last_act_all, rf_z_rep, alpha_rf_all], axis=-1)  # (B, N, 6)
 
         # Combine with configured SAA market features
         saa_obs = np.concatenate([saa_market_feats, mem_block], axis=-1)                          # (B, N, F_saa + 6)

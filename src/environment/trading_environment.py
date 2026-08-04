@@ -247,7 +247,7 @@ class EpisodeBuffer:
     downside_var_sqrt: np.ndarray = field(init=False)  # [episode_buffer_length_days] - sqrt of downside variance for Sortino ratio
     previous_max_drawdown: np.ndarray = field(init=False)  # [episode_buffer_length_days] - previous max drawdown for reward component
     risk_free_rate_zscore_60d: np.ndarray = field(init=False)  # [episode_buffer_length_days] - aligned risk-free z-score feature
-    risk_free_rate_daily: np.ndarray = field(init=False)  # [episode_buffer_length_days] - aligned daily risk-free carry feature
+    risk_free_rate_daily: np.ndarray = field(init=False)  # [episode_buffer_length_days] - portfolio excess log return over daily risk-free
 
     # weights, alpha, sharpe_ratio, drawdown, volatility, turnover, allocator_rewards
 
@@ -1517,6 +1517,53 @@ class MarketDataCache:
             step_idx = self.num_days - 1
         return float(self.risk_free_rate_daily[step_idx])
 
+    def get_log_risk_free_rate_daily_at_step(self, step_idx: int) -> float:
+        """Get daily log risk-free rate from EFFR for a given absolute step."""
+        if step_idx < 0:
+            step_idx = 0
+        elif step_idx >= self.num_days:
+            step_idx = self.num_days - 1
+        effr_pa = float(self.effr_raw_pct[step_idx]) / 100.0
+        # Convert annualized EFFR to a daily log rate for return-space subtraction.
+        return float(np.log1p(max(effr_pa / 252.0, -0.999999)))
+
+    def get_asset_excess_log_return_over_rf_at_step(self, step_idx: int, asset_idx: int) -> float:
+        """Get asset log return minus daily log risk-free rate for one asset at a given step."""
+        if asset_idx < 0 or asset_idx >= self.num_assets:
+            raise IndexError(f"Asset index {asset_idx} out of bounds [0, {self.num_assets - 1}]")
+        if step_idx <= 0:
+            return 0.0
+        if step_idx >= self.num_days:
+            step_idx = self.num_days - 1
+
+        prev_idx = step_idx - 1
+        px_now = float(self.close_prices[step_idx, asset_idx])
+        px_prev = float(self.close_prices[prev_idx, asset_idx])
+        if px_now <= 0.0 or px_prev <= 0.0:
+            return 0.0
+
+        asset_log_return = float(np.log(px_now) - np.log(px_prev))
+        rf_daily_log = self.get_log_risk_free_rate_daily_at_step(step_idx)
+        return float(asset_log_return - rf_daily_log)
+
+    def get_all_assets_excess_log_return_over_rf_at_step(self, step_idx: int) -> np.ndarray:
+        """Vectorized asset log returns minus daily log risk-free rate for all assets at a given step."""
+        if step_idx <= 0:
+            return np.zeros(self.num_assets, dtype=np.float32)
+        if step_idx >= self.num_days:
+            step_idx = self.num_days - 1
+
+        prev_idx = step_idx - 1
+        px_now = self.close_prices[step_idx]
+        px_prev = self.close_prices[prev_idx]
+        valid = (px_now > 0.0) & (px_prev > 0.0)
+        asset_log_returns = np.zeros(self.num_assets, dtype=np.float32)
+        asset_log_returns[valid] = (np.log(px_now[valid]) - np.log(px_prev[valid])).astype(np.float32)
+
+        rf_daily_log = np.float32(self.get_log_risk_free_rate_daily_at_step(step_idx))
+        excess = asset_log_returns - rf_daily_log
+        return np.nan_to_num(excess, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
     def get_risk_free_rate_zscore_at_step(self, step_idx: int) -> float:
         """Get date-aligned 60-day z-score of the annualized risk-free rate for a given absolute step."""
         if step_idx < 0:
@@ -1793,7 +1840,7 @@ class TradingEnv(gym.Env):
 
         if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
             asset_obs_size = num_features # Single step asset features for selected asset
-            portfolio_obs_size = 6 # log cash ratio, log asset ratio, agent return, last_action, risk_free_rate_zscore_60d, risk_free_rate_daily
+            portfolio_obs_size = 6 # log cash ratio, log asset ratio, agent return, last_action, risk_free_rate_zscore_60d, daily_asset_alpha_risk_free
 
         else:
             if self.maybe_provide_sequence:
@@ -2291,7 +2338,7 @@ class TradingEnv(gym.Env):
             comparison_portfolio_value=self.comparison_portfolio_state.get_total_value(),
             effective_asset_concentration_norm=effective_asset_concentration_norm,
             risk_free_rate_zscore_60d=float(self.market_data_cache.get_risk_free_rate_zscore_at_step(self.current_absolute_step)),
-            risk_free_rate_daily=float(self.market_data_cache.get_risk_free_rate_daily_at_step(self.current_absolute_step)),
+            risk_free_rate_daily=0.0,
             selected_asset_bh_portfolio_value=self.selected_asset_bh_portfolio_state.get_total_value(),
             selected_asset_bh_transaction_cost=self.selected_asset_bh_init_transaction_cost
         )
@@ -2823,6 +2870,8 @@ class TradingEnv(gym.Env):
         # Record step data ---------------------------------------
         current_weights_after_execution = self.portfolio_state.get_weights()
         daily_return = (portfolio_value_after / portfolio_value_before - 1.0 if portfolio_value_before > 0 else 0.0)
+        rf_daily_log = float(self.market_data_cache.get_log_risk_free_rate_daily_at_step(self.current_absolute_step))
+        portfolio_excess_log_return_over_rf = float(np.log1p(max(daily_return, -0.999999)) - rf_daily_log)
         
         sum_sq = float(np.sum(current_weights_after_execution[1:] ** 2))
         if sum_sq < 1e-8:
@@ -2879,7 +2928,7 @@ class TradingEnv(gym.Env):
             downside_var_sqrt=reward_parts.get("downside_var_sqrt", None),
             previous_max_drawdown=reward_parts.get("previous_max_drawdown", None),
             risk_free_rate_zscore_60d=float(self.market_data_cache.get_risk_free_rate_zscore_at_step(self.current_absolute_step)),
-            risk_free_rate_daily=float(self.market_data_cache.get_risk_free_rate_daily_at_step(self.current_absolute_step)),
+            risk_free_rate_daily=portfolio_excess_log_return_over_rf,
             selected_asset_bh_portfolio_value=float(self.selected_asset_bh_portfolio_state.get_total_value()),
             selected_asset_bh_transaction_cost=0.0  # No transaction costs after initialization (buy-and-hold)
         )
@@ -4603,8 +4652,11 @@ class TradingEnv(gym.Env):
             risk_free_rate_zscore_60d = float(
                 self.market_data_cache.get_risk_free_rate_zscore_at_step(self.current_absolute_step)
             )
-            risk_free_rate_daily = float(
-                self.market_data_cache.get_risk_free_rate_daily_at_step(self.current_absolute_step)
+            daily_asset_alpha_risk_free = float(
+                self.market_data_cache.get_asset_excess_log_return_over_rf_at_step(
+                    self.current_absolute_step,
+                    asset_index,
+                )
             )
 
             # Build minimal portfolio features for single-asset mode.
@@ -4615,7 +4667,7 @@ class TradingEnv(gym.Env):
                     daily_agent_return,
                     last_action,
                     risk_free_rate_zscore_60d,
-                    risk_free_rate_daily,
+                    daily_asset_alpha_risk_free,
                 ],
                 dtype=np.float32,
             )
