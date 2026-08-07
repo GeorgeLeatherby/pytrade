@@ -14,3 +14,6 @@ What to try:    - keep more meaningful data wihtin features
 - z_fisher_corr_spy
 - z_market_dispersion
 - z_beta_spy
+
+
+Which to use: data_processor_2.py is the recommended one — it's the more recent iteration. It replaces the large duplicated risk-metric blocks (which were commented out anyway) with theoretically sounder features: the intraday OHLC features and the FFD feature (norm_ffd_feature) are meaningful improvements. The dropped cross-asset relationship metrics (spillovers, leadership) were computationally expensive and largely redundant with the Fisher-Z/beta features that remain.
