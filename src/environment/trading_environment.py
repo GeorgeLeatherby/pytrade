@@ -747,6 +747,7 @@ class MarketDataCache:
     # Time series splitting infrastructure
     train_blocks: List[DataBlock]       # Training data blocks
     validation_blocks: List[DataBlock]  # Validation data blocks
+    test_blocks: List[DataBlock]        # Out-of-sample test blocks (held out at range end)
     block_sampling_weights: Dict[str, np.ndarray]  # Sampling weights per block type
 
     # Metadata
@@ -759,6 +760,7 @@ class MarketDataCache:
     episode_length_days: int
     lookback_window: int
     test_val_split_ratio: float
+    purge_length_days: int
 
     # Settings
     maybe_provide_sequence: bool
@@ -925,6 +927,7 @@ class MarketDataCache:
         episode_length_days = config['environment']['episode_length_days']
         test_val_split_ratio = config['environment']['test_val_split_ratio']
         block_buffer_multiplier = config['environment']['block_buffer_multiplier']
+        purge_length_days = int(config['environment'].get('purge_length_days', 60))
 
         # Create instance first, then add splitting
         instance = cls(
@@ -951,10 +954,12 @@ class MarketDataCache:
             num_available_features=len(available_feature_cols),
             train_blocks=[],
             validation_blocks=[],
-            block_sampling_weights={'train': np.array([]), 'validation': np.array([])},
+            test_blocks=[],
+            block_sampling_weights={'train': np.array([]), 'validation': np.array([]), 'test': np.array([])},
             episode_length_days=episode_length_days,
             lookback_window=lookback_window,
             test_val_split_ratio=test_val_split_ratio,
+            purge_length_days=purge_length_days,
             maybe_provide_sequence=maybe_provide_sequence
         )
         
@@ -1043,17 +1048,16 @@ class MarketDataCache:
 
     def _create_time_series_blocks(self, block_buffer_multiplier, test_val_split_ratio):
         """
-        Create train/validation blocks using group time series splitting.
-        A timeframe contains enough days to generate a test and a validation block.
-        
-        Strategy:
-        1. Calculate required_timeframe_size based on provided test_val_split_ratio, lookback_window, 
-           episode_length multiplied with buffer. Ensure enough days for BOTH training and validation block
-            NOTE: Buffer is needed to ensure random starting points within a block. (E.g. buffer = *2)
-        2. Split full available data into x timeframes. If last timeframe is smaller then required_timeframe_size, 
-           simply add date range to prior timeframe.
-        3. Out of each timeframe create one train and one validation block.
-        
+        Create purged train/validation cycles plus one end-of-range OOS test block.
+
+        Layout:
+        [train_00][purge][val_00][train_01][purge][val_01]...[purge][test_00]
+
+        Rules:
+        - Purge is applied between train and validation inside every cycle.
+        - No purge is inserted between a validation block and the following training block.
+        - A purge is always inserted between the final validation block and the test block.
+        - Test block is held out from the end of the available date range (OOS).
         """
         print("\n" + "="*60)
         print("CREATING TIME SERIES BLOCKS")
@@ -1064,10 +1068,14 @@ class MarketDataCache:
             min_episode_requirement = self.lookback_window + self.episode_length_days
         else: 
             min_episode_requirement = self.episode_length_days
-        min_viable_train_block = min_episode_requirement * block_buffer_multiplier
+        min_viable_train_block = int(min_episode_requirement * block_buffer_multiplier)
 
         # Minimum viable block size for validation
-        min_viable_val_block = min_episode_requirement
+        min_viable_val_block = int(min_episode_requirement)
+        purge_days = int(max(0, self.purge_length_days))
+
+        if test_val_split_ratio <= 0.0 or test_val_split_ratio >= 1.0:
+            raise ValueError("test_val_split_ratio must be in (0, 1).")
 
         # Calculate required timeframe size ensuring BOTH blocks are viable
         # Using the constraint: train_size + val_size = timeframe_size
@@ -1080,8 +1088,23 @@ class MarketDataCache:
         # Ensure training block is large enough  
         min_timeframe_for_train = min_viable_train_block / (1 - test_val_split_ratio)
         
-        # Take the larger requirement
-        required_timeframe_size = int(max(min_timeframe_for_val, min_timeframe_for_train))
+        # Take the larger requirement, then derive concrete block sizes for a cycle.
+        required_timeframe_size = int(np.ceil(max(min_timeframe_for_val, min_timeframe_for_train)))
+        train_days_base = int(np.floor(required_timeframe_size * (1.0 - test_val_split_ratio)))
+        val_days_base = int(required_timeframe_size - train_days_base)
+
+        # Enforce minimum viable block sizes.
+        if train_days_base < min_viable_train_block:
+            train_days_base = int(min_viable_train_block)
+        if val_days_base < min_viable_val_block:
+            val_days_base = int(min_viable_val_block)
+
+        train_val_cycle_days = int(train_days_base + purge_days + val_days_base)
+
+        # End-of-range OOS test size: default equals base validation size unless overridden.
+        test_days_cfg = int(self.config['environment'].get('oos_test_block_size_days', val_days_base))
+        test_days = int(max(min_viable_val_block, test_days_cfg))
+        holdout_tail_days = int(purge_days + test_days)
 
 
         print(f"Episode requirements:")
@@ -1093,121 +1116,143 @@ class MarketDataCache:
         print(f"  Min viable validation block: {min_viable_val_block} days")
         print(f"  Min timeframe for validation: {min_timeframe_for_val:.0f} days")
         print(f"  Min timeframe for training: {min_timeframe_for_train:.0f} days")
-        print(f"  Required timeframe size: {required_timeframe_size} days")
+        print(f"  Required train+val timeframe size: {required_timeframe_size} days")
+        print(f"  Purge length (config): {purge_days} days")
+        print(f"  Base train days per cycle: {train_days_base}")
+        print(f"  Base validation days per cycle: {val_days_base}")
+        print(f"  Train+purge+val cycle size: {train_val_cycle_days} days")
+        print(f"  OOS test days at range end: {test_days}")
+        print(f"  Tail holdout (purge+test): {holdout_tail_days} days")
         print(f"  Total available days: {self.num_days:,}")
         print(f"  Target validation ratio: {self.test_val_split_ratio:.1%}")
 
-        # Possible amount of blocks based on required_size and available days
-        possible_timeframe_amount = self.num_days // required_timeframe_size
-        if possible_timeframe_amount < 3:
-            print(f"Error: Not enough data to create the min required 3 train/validation blocks with the given parameters!")
-            print(f"  Required timeframe size: {required_timeframe_size} days")
-            print(f"  Available days: {self.num_days} days")
-            raise ValueError("Insufficient data for creating time series blocks.")
-        
-        print(f"  Possible timeframes: {possible_timeframe_amount} (based on integer division)")
+        available_for_cycles = int(self.num_days - holdout_tail_days)
+        if available_for_cycles <= 0:
+            raise ValueError(
+                "Insufficient data after reserving purge+test holdout. "
+                f"Need > {holdout_tail_days} days, have {self.num_days}."
+            )
 
-        # Create all timeframes and split into train/validation blocks using test_val_split_ratio. Ensure all data is used
-        timeframes = []
-        for i in range(possible_timeframe_amount):
-            start_idx = i * required_timeframe_size
-            end_idx = start_idx + required_timeframe_size
-            
-            # Handle last timeframe to include all remaining data
-            if i == possible_timeframe_amount - 1:
-                end_idx = self.num_days
-            
-            # If last timeframe is smaller than required size, merge with prior timeframe
-            if (end_idx - start_idx) < required_timeframe_size and i > 0:
-                timeframes[-1]['end_idx'] = end_idx
-                timeframes[-1]['end_date'] = self.dates[end_idx - 1]
-                timeframes[-1]['num_days'] = end_idx - timeframes[-1]['start_idx']
-                print(f"Merging last small timeframe into prior one. New end date: {timeframes[-1]['end_date']}")
-            else:
-                timeframes.append({
-                    'start_idx': start_idx,
-                    'end_idx': end_idx,
-                    'start_date': self.dates[start_idx],
-                    'end_date': self.dates[end_idx - 1],
-                    'num_days': end_idx - start_idx
-                })
+        possible_cycle_count = int(available_for_cycles // train_val_cycle_days)
+        if possible_cycle_count < 1:
+            raise ValueError(
+                "Insufficient data for even one train/purge/validation cycle. "
+                f"Required cycle size: {train_val_cycle_days}, available for cycles: {available_for_cycles}."
+            )
 
-        # Create train/validation blocks from timeframes with all required fields by DataBlock
-        train_block_counter = 0
-        val_block_counter = 0
-        
-        for timeframe_idx, timeframe in enumerate(timeframes):
-            # Calculate split point within timeframe
-            train_days = int(timeframe['num_days'] * (1 - test_val_split_ratio))
-            val_days = timeframe['num_days'] - train_days
-            
-            # Create training block
-            train_start_idx = timeframe['start_idx']
-            train_end_idx = train_start_idx + train_days
-            
-            # Calculate episode constraints for training block
+        print(f"  Available days for train/val cycles: {available_for_cycles}")
+        print(f"  Possible full train/purge/val cycles: {possible_cycle_count}")
+
+        # Reset lists in case this method is called repeatedly.
+        self.train_blocks = []
+        self.validation_blocks = []
+        self.test_blocks = []
+
+        def _build_block(block_id: str, block_type: str, start_idx: int, end_idx: int) -> DataBlock:
+            num_days = int(max(0, end_idx - start_idx))
             if self.maybe_provide_sequence:
-                train_min_start_step = train_start_idx + self.lookback_window
+                min_start_step = int(start_idx + self.lookback_window)
             else:
-                train_min_start_step = train_start_idx
-            train_max_start_step = train_end_idx - self.episode_length_days
-            train_max_consecutive_episodes = max(0, (train_end_idx - train_min_start_step) // self.episode_length_days)
-            
-            train_block = DataBlock(
-                block_id=f"train_{train_block_counter:02d}",
-                block_type='train',  # FIXED: Added missing field
-                start_date_idx=train_start_idx,
-                end_date_idx=train_end_idx,
-                start_date=self.dates[train_start_idx],
-                end_date=self.dates[train_end_idx - 1],
-                num_days=train_days,
-                max_episodes=train_max_consecutive_episodes,  # FIXED: Added missing field
-                min_start_step=train_min_start_step,  # FIXED: Added missing field
-                max_start_step=train_max_start_step   # FIXED: Added missing field
+                min_start_step = int(start_idx)
+            max_start_step = int(end_idx - self.episode_length_days)
+            max_consecutive_episodes = int(max(0, (end_idx - min_start_step) // self.episode_length_days))
+            end_for_label = max(start_idx, end_idx - 1)
+            return DataBlock(
+                block_id=block_id,
+                block_type=block_type,
+                start_date_idx=int(start_idx),
+                end_date_idx=int(end_idx),
+                start_date=self.dates[start_idx],
+                end_date=self.dates[end_for_label],
+                num_days=num_days,
+                max_episodes=max_consecutive_episodes,
+                min_start_step=min_start_step,
+                max_start_step=max_start_step,
             )
-            
-            # Create validation block
-            val_start_idx = train_end_idx
-            val_end_idx = timeframe['end_idx']
-            
-            # Calculate episode constraints for validation block
-            val_min_start_step = val_start_idx + self.lookback_window
-            val_max_start_step = val_end_idx - self.episode_length_days
-            val_max_consecutive_episodes = max(0, (val_end_idx - val_min_start_step) // self.episode_length_days)
-            
-            val_block = DataBlock(
-                block_id=f"val_{val_block_counter:02d}",
-                block_type='validation',  # FIXED: Added missing field
-                start_date_idx=val_start_idx,
-                end_date_idx=val_end_idx,
-                start_date=self.dates[val_start_idx],
-                end_date=self.dates[val_end_idx - 1],
-                num_days=val_days,
-                max_episodes=val_max_consecutive_episodes,  # FIXED: Added missing field
-                min_start_step=val_min_start_step,  # FIXED: Added missing field
-                max_start_step=val_max_start_step   # FIXED: Added missing field
+
+        consumed_by_cycles = int(possible_cycle_count * train_val_cycle_days)
+        cycle_remainder_days = int(max(0, available_for_cycles - consumed_by_cycles))
+
+        cursor = 0
+        for cycle_idx in range(possible_cycle_count):
+            extra_days = cycle_remainder_days if cycle_idx == (possible_cycle_count - 1) else 0
+
+            train_start_idx = int(cursor)
+            train_end_idx = int(train_start_idx + train_days_base)
+            purge_start_idx = int(train_end_idx)
+            purge_end_idx = int(purge_start_idx + purge_days)
+            val_start_idx = int(purge_end_idx)
+            val_end_idx = int(val_start_idx + val_days_base + extra_days)
+
+            train_block = _build_block(
+                block_id=f"train_{cycle_idx:02d}",
+                block_type='train',
+                start_idx=train_start_idx,
+                end_idx=train_end_idx,
             )
-            
-            # Add to lists
+            val_block = _build_block(
+                block_id=f"val_{cycle_idx:02d}",
+                block_type='validation',
+                start_idx=val_start_idx,
+                end_idx=val_end_idx,
+            )
+
             self.train_blocks.append(train_block)
             self.validation_blocks.append(val_block)
-            
-            train_block_counter += 1
-            val_block_counter += 1
-            
-            # Print block information
-            print(f"\nTimeframe {timeframe_idx + 1}:")
+
+            print(f"\nCycle {cycle_idx + 1}:")
             print(f"  Training block: {train_block.block_id}")
             print(f"    Date range: {train_block.start_date} to {train_block.end_date}")
             print(f"    Days: {train_block.num_days:,}")
             print(f"    Episodes: {train_block.max_episodes:,}")
             print(f"    Episode start range: [{train_block.min_start_step}, {train_block.max_start_step}]")
-            
+
+            print(f"  Purge window: train->{val_block.block_id}")
+            if purge_days > 0:
+                print(f"    Index range: [{purge_start_idx}, {purge_end_idx - 1}] ({purge_days} days)")
+                print(f"    Date range: {self.dates[purge_start_idx]} to {self.dates[purge_end_idx - 1]}")
+            else:
+                print("    Disabled (0 days)")
+
             print(f"  Validation block: {val_block.block_id}")
             print(f"    Date range: {val_block.start_date} to {val_block.end_date}")
             print(f"    Days: {val_block.num_days:,}")
             print(f"    Episodes: {val_block.max_episodes:,}")
             print(f"    Episode start range: [{val_block.min_start_step}, {val_block.max_start_step}]")
+
+            cursor = val_end_idx
+
+        # End-of-range OOS holdout: purge then test block.
+        final_purge_start_idx = int(cursor)
+        final_purge_end_idx = int(final_purge_start_idx + purge_days)
+        test_start_idx = int(final_purge_end_idx)
+        test_end_idx = int(self.num_days)
+
+        if test_end_idx <= test_start_idx:
+            raise ValueError(
+                "Computed empty test block. Increase dataset length or reduce holdout settings."
+            )
+
+        test_block = _build_block(
+            block_id="test_00",
+            block_type='test',
+            start_idx=test_start_idx,
+            end_idx=test_end_idx,
+        )
+        self.test_blocks.append(test_block)
+
+        print("\nFinal OOS holdout:")
+        print("  Purge window: last_validation->test_00")
+        if purge_days > 0:
+            print(f"    Index range: [{final_purge_start_idx}, {final_purge_end_idx - 1}] ({purge_days} days)")
+            print(f"    Date range: {self.dates[final_purge_start_idx]} to {self.dates[final_purge_end_idx - 1]}")
+        else:
+            print("    Disabled (0 days)")
+        print(f"  Test block: {test_block.block_id}")
+        print(f"    Date range: {test_block.start_date} to {test_block.end_date}")
+        print(f"    Days: {test_block.num_days:,}")
+        print(f"    Episodes: {test_block.max_episodes:,}")
+        print(f"    Episode start range: [{test_block.min_start_step}, {test_block.max_start_step}]")
         
         # Calculate and store sampling weights
         self._calculate_sampling_weights()
@@ -1215,15 +1260,21 @@ class MarketDataCache:
         # Print summary
         total_train_episodes = sum(block.max_episodes for block in self.train_blocks)
         total_val_episodes = sum(block.max_episodes for block in self.validation_blocks)
+        total_test_episodes = sum(block.max_episodes for block in self.test_blocks)
         
         print("\n" + "="*60)
         print("TIME SERIES SPLITTING COMPLETE")
         print("="*60)
         print(f"Training blocks: {len(self.train_blocks)}")
         print(f"Validation blocks: {len(self.validation_blocks)}")
+        print(f"Test blocks: {len(self.test_blocks)}")
         print(f"Total training episodes: {total_train_episodes:,}")
         print(f"Total validation episodes: {total_val_episodes:,}")
-        print(f"Actual validation ratio: {total_val_episodes/(total_train_episodes + total_val_episodes):.1%}")
+        print(f"Total test episodes: {total_test_episodes:,}")
+        if (total_train_episodes + total_val_episodes) > 0:
+            print(f"Actual validation ratio: {total_val_episodes/(total_train_episodes + total_val_episodes):.1%}")
+        else:
+            print("Actual validation ratio: n/a (no train/validation episodes)")
         print("="*60)
 
     def _calculate_sampling_weights(self):
@@ -1247,15 +1298,27 @@ class MarketDataCache:
                 val_weights = np.ones(len(self.validation_blocks), dtype=np.float32) / len(self.validation_blocks)
         else:
             val_weights = np.array([], dtype=np.float32)
+
+        # Test weights
+        if self.test_blocks:
+            test_days = np.array([block.num_days for block in self.test_blocks], dtype=np.float32)
+            if test_days.sum() > 0:
+                test_weights = test_days / test_days.sum()
+            else:
+                test_weights = np.ones(len(self.test_blocks), dtype=np.float32) / len(self.test_blocks)
+        else:
+            test_weights = np.array([], dtype=np.float32)
         
         self.block_sampling_weights = {
             'train': train_weights,
-            'validation': val_weights
+            'validation': val_weights,
+            'test': test_weights,
         }
         
         print(f"\nSampling weights calculated:")
         print(f"  Training weights: {train_weights}")
         print(f"  Validation weights: {val_weights}")
+        print(f"  Test weights: {test_weights}")
     
     @staticmethod
     def _select_features_from_config(available_features: List[str], config: Dict[str, Any]) -> List[str]:
@@ -1577,7 +1640,7 @@ class MarketDataCache:
         Sample a random episode start from appropriate blocks.
         
         Args:
-            mode: 'train' or 'validation'
+            mode: 'train', 'validation', or 'test'
             random_seed: Optional random seed for reproducibility
             
         Returns:
@@ -1585,8 +1648,16 @@ class MarketDataCache:
         """
         rng = np.random.default_rng(random_seed) if random_seed is not None else np.random.default_rng()
         
-        blocks = self.train_blocks if mode == 'train' else self.validation_blocks
-        weights = self.block_sampling_weights[mode]
+        if mode == 'train':
+            blocks = self.train_blocks
+        elif mode == 'validation':
+            blocks = self.validation_blocks
+        elif mode == 'test':
+            blocks = self.test_blocks
+        else:
+            raise ValueError(f"Invalid mode '{mode}'. Expected one of: train, validation, test")
+
+        weights = self.block_sampling_weights.get(mode, np.array([], dtype=np.float32))
         
         if len(blocks) == 0:
             raise ValueError(f"No {mode} blocks available")
@@ -1660,7 +1731,7 @@ class TradingEnv(gym.Env):
         Args:
             config: Configuration dictionary with environment parameters
             market_data_cache: Pre-built MarketDataCache instance with time series blocks
-            mode: 'train' or 'validation' - determines which blocks to sample from
+            mode: 'train', 'validation', or 'test' - determines which blocks to sample from
         """
         super(TradingEnv, self).__init__()
         
@@ -1707,7 +1778,9 @@ class TradingEnv(gym.Env):
         # Store references
         self.market_data_cache = market_data_cache
         self.config = config
-        self.mode = mode  # 'train' or 'validation'
+        self.mode = mode  # 'train' | 'validation' | 'test'
+        if self.mode not in {'train', 'validation', 'test'}:
+            raise ValueError(f"Invalid mode '{self.mode}'. Expected one of: train, validation, test")
         self.threshold_val = self.initial_portfolio_value * self.early_stopping_threshold
 
         # Execution-mode config (backwards compatible defaults)
@@ -1986,7 +2059,12 @@ class TradingEnv(gym.Env):
             if forced_block_id is not None:
                 self.current_block_id = str(forced_block_id)
             else:
-                blocks = self.market_data_cache.train_blocks if self.mode == 'train' else self.market_data_cache.validation_blocks
+                if self.mode == 'train':
+                    blocks = self.market_data_cache.train_blocks
+                elif self.mode == 'validation':
+                    blocks = self.market_data_cache.validation_blocks
+                else:
+                    blocks = self.market_data_cache.test_blocks
                 matched = [
                     b for b in blocks
                     if b.min_start_step <= self.current_episode_start_step <= b.max_start_step
