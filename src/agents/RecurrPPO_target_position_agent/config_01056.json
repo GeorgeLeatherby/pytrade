@@ -8,7 +8,7 @@
         "seed": 42,
         "maybe_provide_sequence": false,
         "block_buffer_multiplier": 1.0,
-        "test_val_split_ratio": 0.25,
+        "test_val_split_ratio": 0.217,
 
         "sortino_eta": 0.035,
         "lambda_drawdown": 0.15,
@@ -155,7 +155,7 @@
         "n_eval_episodes": 50,
         "eval_deterministic": true,
         "progress_bar": true,
-        "config_id": 1054,
+        "config_id": 1056,
         "action_l2_penalty_coeff": 0.0
     }
 }
