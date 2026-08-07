@@ -379,8 +379,8 @@ class DataEnricher:
             symbol_data['bb_width_reworked'] = ((rolling_mean + rolling_std * 2) - (rolling_mean - rolling_std * 2)) / (rolling_mean + 1e-8)  # Width as percentage of price
             
             # Apply Z-score normalization to Bollinger Band width and clip to avoid extreme values
-            bb_width_mean = symbol_data['bb_width_reworked'].rolling(window=self.max_norm_horizon).mean()
-            bb_width_std = symbol_data['bb_width_reworked'].rolling(window=self.max_norm_horizon).std()
+            bb_width_mean = symbol_data['bb_width_reworked'].rolling(window=self.max_norm_horizon, min_periods=5).mean()
+            bb_width_std = symbol_data['bb_width_reworked'].rolling(window=self.max_norm_horizon, min_periods=5).std()
             symbol_data['bb_width_reworked'] = ((symbol_data['bb_width_reworked'] - bb_width_mean) / (bb_width_std + 1e-8)).clip(-3, 3)
 
             # Add Bollinger Band width to correct symbol and date in enriched_data
@@ -402,7 +402,7 @@ class DataEnricher:
             atr = true_range.rolling(window=self.max_norm_horizon).mean()
 
             # Z-score the ATR to normalize it, then clip to avoid extreme values
-            atr_zscore = (atr - atr.rolling(window=self.max_norm_horizon).mean()) / (atr.rolling(window=self.max_norm_horizon).std() + 1e-8)
+            atr_zscore = (atr - atr.rolling(window=self.max_norm_horizon, min_periods=5).mean()) / (atr.rolling(window=self.max_norm_horizon, min_periods=5).std() + 1e-8)
             symbol_data['atr_z_norm'] = atr_zscore.clip(-3, 3)
 
             # Add ATR to correct symbol and date in enriched_data
@@ -464,8 +464,8 @@ class DataEnricher:
         df['market_dispersion'] = df['Date'].map(np.log(dispersion + 1e-8))
         
         # Z-score the dispersion to make it stationary
-        df['z_market_dispersion'] = (df['market_dispersion'] - df['market_dispersion'].rolling(window=self.max_norm_horizon).mean()) / \
-                                    (df['market_dispersion'].rolling(window=self.max_norm_horizon).std() + 1e-8)
+        df['z_market_dispersion'] = (df['market_dispersion'] - df['market_dispersion'].rolling(window=self.max_norm_horizon, min_periods=5).mean()) / \
+                                    (df['market_dispersion'].rolling(window=self.max_norm_horizon, min_periods=5).std() + 1e-8)
 
         # --- 4. Rolling Beta (FIXED) ---
         def calc_beta(group):
@@ -488,7 +488,7 @@ class DataEnricher:
         
         # Final Z-score for Beta to normalize across assets
         df['z_beta_spy'] = df.groupby('Symbol')['beta_spy'].transform(
-            lambda x: (x - x.rolling(window=self.max_norm_horizon).mean()) / (x.rolling(window=self.max_norm_horizon).std() + 1e-8)
+            lambda x: (x - x.rolling(window=self.max_norm_horizon, min_periods=5).mean()) / (x.rolling(window=self.max_norm_horizon, min_periods=5).std() + 1e-8)
         )
 
         # Add the new features to enriched_data at correct symbol and time alignment
@@ -613,8 +613,8 @@ class DataEnricher:
             # C. Normalized Volume Feature (Z-Score + Tanh)
             # We normalize the intensity using the max_norm_horizon
             group_v = df.groupby('Symbol')[f'rel_volume_intensity_{period}d']
-            v_mean = group_v.transform(lambda x: x.rolling(window=self.max_norm_horizon).mean())
-            v_std = group_v.transform(lambda x: x.rolling(window=self.max_norm_horizon).std())
+            v_mean = group_v.transform(lambda x: x.rolling(window=self.max_norm_horizon, min_periods=5).mean())
+            v_std = group_v.transform(lambda x: x.rolling(window=self.max_norm_horizon, min_periods=5).std())
             
             z_vol = (df[f'rel_volume_intensity_{period}d'] - v_mean) / (v_std + 1e-8)
             
@@ -651,20 +651,20 @@ class DataEnricher:
             print(f"Shape of enriched data: {self.enriched_data.shape}")
             print(self.enriched_data.head(300))
 
+    # Threshold controls FFD window length: 5e-5 → ~350 weights; 1e-3 → ~65 weights
+    FFD_THRESHOLD = 1e-3
+    FFD_MAX_WINDOW = 120  # hard cap at ~6 months regardless of threshold
+
     def _get_global_ffd_weights(self, d, threshold):
-        """Calculates weights until the threshold is strictly met. No max_len."""
+        """Calculates weights until the threshold is met or max window is reached."""
         w = [1.0]
         k = 1
         while True:
             w_k = -w[-1] * (d - k + 1) / k
-            if abs(w_k) < threshold:
+            if abs(w_k) < threshold or k >= self.FFD_MAX_WINDOW:
                 break
             w.append(w_k)
             k += 1
-            # Safety break to prevent infinite loops in extreme edge cases
-            if k > 10000:
-                print(f"Warning: FFD weight calculation hit 10,000 days at d={d}. Truncating.")
-                break
                 
         # Return flipped weights for convolution
         return np.array(w[::-1]).reshape(-1, 1)
@@ -707,7 +707,9 @@ class DataEnricher:
         
         return global_golden_d
 
-    def find_golden_d(self, sample_series, start_d=0.4, end_d=0.8, step=0.05, threshold=5e-5):
+    def find_golden_d(self, sample_series, start_d=0.4, end_d=0.8, step=0.05, threshold=None):
+        if threshold is None:
+            threshold = self.FFD_THRESHOLD
         """Iteratively finds the minimum d that achieves stationarity."""
         print(f"Searching for Golden d in range [{start_d}, {end_d}]...")
         golden_d = end_d
@@ -742,8 +744,7 @@ class DataEnricher:
         print(f"Applying Golden d={golden_d:.2f} to all assets.")
 
         # 1. Calculate the weights exactly ONCE globally
-        # We use the threshold you defined (e.g., 5e-5)
-        global_weights = self._get_global_ffd_weights(golden_d, threshold=5e-5)
+        global_weights = self._get_global_ffd_weights(golden_d, threshold=self.FFD_THRESHOLD)
         window_size = len(global_weights)
         print(f"Global FFD window size established at {window_size} days.")
 
@@ -759,8 +760,8 @@ class DataEnricher:
         
         # 3. Final Normalization (Z-Score + Tanh)
         group_v = df.groupby('Symbol')['ffd_close']
-        v_mean = group_v.transform(lambda x: x.rolling(window=self.max_norm_horizon).mean())
-        v_std = group_v.transform(lambda x: x.rolling(window=self.max_norm_horizon).std())
+        v_mean = group_v.transform(lambda x: x.rolling(window=self.max_norm_horizon, min_periods=5).mean())
+        v_std = group_v.transform(lambda x: x.rolling(window=self.max_norm_horizon, min_periods=5).std())
         
         z_ffd = (df['ffd_close'] - v_mean) / (v_std + 1e-8)
         df['norm_ffd_feature'] = np.tanh(z_ffd)
