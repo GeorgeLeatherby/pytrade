@@ -684,7 +684,7 @@ class DataEnricher:
         # Return as series with aligned index (the first 'width-1' days are dropped)
         return pd.Series(output, index=series.index[width-1:])
 
-    def find_multi_asset_golden_d(self, df, start_d=0.4, end_d=0.8, step=0.05):
+    def find_multi_asset_golden_d(self, df, start_d=0.45, end_d=0.8, step=0.05):
         """Iteratively finds the minimum d that achieves stationarity."""
         print(f"Searching for Golden d in range [{start_d}, {end_d}]...")
 
