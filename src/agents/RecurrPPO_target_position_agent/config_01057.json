@@ -8,7 +8,7 @@
         "seed": 42,
         "maybe_provide_sequence": false,
         "block_buffer_multiplier": 1.0,
-        "test_val_split_ratio": 0.217,
+        "test_val_split_ratio": 0.10,
         "purge_length_days": 60,
 
         "sortino_eta": 0.035,
@@ -24,8 +24,8 @@
         "saa_excess_log_return_scale": 50.0,
         "saa_log_diff_sortino_scale": 0.0,
         "saa_drawdown_level_penalty_coeff": 0.0,
-        "saa_reward_tanh_divisor": 8.0,
-        "saa_reward_tanh_scale": 8.0,
+        "saa_reward_tanh_divisor": 7.5,
+        "saa_reward_tanh_scale": 7.5,
         "saa_sortino_warmup_steps": 8,
         "saa_min_trade_value_floor": 50.0,
         "saa_execution_gap_buffer_usd": 10.0,
@@ -156,7 +156,7 @@
         "n_eval_episodes": 50,
         "eval_deterministic": true,
         "progress_bar": true,
-        "config_id": 1056,
+        "config_id": 1057,
         "action_l2_penalty_coeff": 0.0
     }
 }

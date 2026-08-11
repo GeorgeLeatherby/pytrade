@@ -1102,8 +1102,8 @@ class MarketDataCache:
         train_val_cycle_days = int(train_days_base + purge_days + val_days_base)
 
         # End-of-range OOS test size: default equals base validation size unless overridden.
-        test_days_cfg = int(self.config['environment'].get('oos_test_block_size_days', val_days_base))
-        test_days = int(max(min_viable_val_block, test_days_cfg))
+        #test_days_cfg = int(self.config['environment'].get('oos_test_block_size_days', val_days_base))
+        test_days = min_viable_val_block
         holdout_tail_days = int(purge_days + test_days)
 
 
