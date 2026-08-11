@@ -695,7 +695,7 @@ class EpisodeBuffer:
 class DataBlock:
     """Represents a continuous data block for time series splitting."""
     block_id: str
-    block_type: str  # 'train' or 'validation'
+    block_type: str  # 'train', 'validation', or 'test'
     start_date_idx: int  # Index in the full dataset
     end_date_idx: int    # Index in the full dataset (exclusive)
     start_date: str      # Human readable date
@@ -759,7 +759,7 @@ class MarketDataCache:
     # Training parameters (stored for block calculations)
     episode_length_days: int
     lookback_window: int
-    test_val_split_ratio: float
+    train_val_split_ratio: float
     purge_length_days: int
 
     # Settings
@@ -925,7 +925,13 @@ class MarketDataCache:
 
         # Extract training parameters from config
         episode_length_days = config['environment']['episode_length_days']
-        test_val_split_ratio = config['environment']['test_val_split_ratio']
+        if 'train_val_split_ratio' in config['environment']:
+            train_val_split_ratio = float(config['environment']['train_val_split_ratio'])
+        elif 'test_val_split_ratio' in config['environment']:
+            # Backward compatibility for legacy config key.
+            train_val_split_ratio = float(config['environment']['test_val_split_ratio'])
+        else:
+            raise KeyError("Missing environment ratio key. Use 'train_val_split_ratio'.")
         block_buffer_multiplier = config['environment']['block_buffer_multiplier']
         purge_length_days = int(config['environment'].get('purge_length_days', 60))
 
@@ -958,13 +964,13 @@ class MarketDataCache:
             block_sampling_weights={'train': np.array([]), 'validation': np.array([]), 'test': np.array([])},
             episode_length_days=episode_length_days,
             lookback_window=lookback_window,
-            test_val_split_ratio=test_val_split_ratio,
+            train_val_split_ratio=train_val_split_ratio,
             purge_length_days=purge_length_days,
             maybe_provide_sequence=maybe_provide_sequence
         )
         
         # Create time series blocks
-        instance._create_time_series_blocks(block_buffer_multiplier, test_val_split_ratio)
+        instance._create_time_series_blocks(block_buffer_multiplier, train_val_split_ratio)
         
         return instance
 
@@ -1046,7 +1052,7 @@ class MarketDataCache:
             index=date_idx,
         )
 
-    def _create_time_series_blocks(self, block_buffer_multiplier, test_val_split_ratio):
+    def _create_time_series_blocks(self, block_buffer_multiplier, train_val_split_ratio):
         """
         Create purged train/validation cycles plus one end-of-range OOS test block.
 
@@ -1063,7 +1069,7 @@ class MarketDataCache:
         print("CREATING TIME SERIES BLOCKS")
         print("="*60)
         
-        # Calculate minimum viable block size for training
+        # Calculate minimum viable block sizes for train/validation slices.
         if self.maybe_provide_sequence:
             min_episode_requirement = self.lookback_window + self.episode_length_days
         else: 
@@ -1074,35 +1080,19 @@ class MarketDataCache:
         min_viable_val_block = int(min_episode_requirement)
         purge_days = int(max(0, self.purge_length_days))
 
-        if test_val_split_ratio <= 0.0 or test_val_split_ratio >= 1.0:
-            raise ValueError("test_val_split_ratio must be in (0, 1).")
+        if train_val_split_ratio <= 0.0 or train_val_split_ratio >= 1.0:
+            raise ValueError("train_val_split_ratio must be in (0, 1).")
 
-        # Calculate required timeframe size ensuring BOTH blocks are viable
-        # Using the constraint: train_size + val_size = timeframe_size
-        # And: train_size = timeframe_size * (1 - test_val_split_ratio)
-        # And: val_size = timeframe_size * test_val_split_ratio
-        
-        # Ensure validation block is large enough
-        min_timeframe_for_val = min_viable_val_block / test_val_split_ratio
-        
-        # Ensure training block is large enough  
-        min_timeframe_for_train = min_viable_train_block / (1 - test_val_split_ratio)
-        
-        # Take the larger requirement, then derive concrete block sizes for a cycle.
-        required_timeframe_size = int(np.ceil(max(min_timeframe_for_val, min_timeframe_for_train)))
-        train_days_base = int(np.floor(required_timeframe_size * (1.0 - test_val_split_ratio)))
-        val_days_base = int(required_timeframe_size - train_days_base)
-
-        # Enforce minimum viable block sizes.
-        if train_days_base < min_viable_train_block:
-            train_days_base = int(min_viable_train_block)
-        if val_days_base < min_viable_val_block:
-            val_days_base = int(min_viable_val_block)
-
-        train_val_cycle_days = int(train_days_base + purge_days + val_days_base)
+        # Compute minimum viable super-block size (train+validation, excluding purge)
+        # so the ratio is feasible while satisfying both minimum block constraints.
+        min_super_for_val = min_viable_val_block / train_val_split_ratio
+        min_super_for_train = min_viable_train_block / (1.0 - train_val_split_ratio)
+        min_super_block_days = int(np.ceil(max(min_super_for_val, min_super_for_train)))
+        min_cycle_days = int(min_super_block_days + purge_days)
 
         # End-of-range OOS test size: default equals base validation size unless overridden.
-        test_days_cfg = int(self.config['environment'].get('oos_test_block_size_days', val_days_base))
+        default_test_days = int(max(min_viable_val_block, int(round(min_super_block_days * train_val_split_ratio))))
+        test_days_cfg = int(self.config['environment'].get('oos_test_block_size_days', default_test_days))
         test_days = int(max(min_viable_val_block, test_days_cfg))
         holdout_tail_days = int(purge_days + test_days)
 
@@ -1114,17 +1104,15 @@ class MarketDataCache:
         print(f"  Buffer multiplier: {block_buffer_multiplier}x")
         print(f"  Min viable train block: {min_viable_train_block} days")
         print(f"  Min viable validation block: {min_viable_val_block} days")
-        print(f"  Min timeframe for validation: {min_timeframe_for_val:.0f} days")
-        print(f"  Min timeframe for training: {min_timeframe_for_train:.0f} days")
-        print(f"  Required train+val timeframe size: {required_timeframe_size} days")
+        print(f"  Min super-block for validation feasibility: {min_super_for_val:.0f} days")
+        print(f"  Min super-block for training feasibility: {min_super_for_train:.0f} days")
+        print(f"  Chosen minimum super-block size: {min_super_block_days} days")
         print(f"  Purge length (config): {purge_days} days")
-        print(f"  Base train days per cycle: {train_days_base}")
-        print(f"  Base validation days per cycle: {val_days_base}")
-        print(f"  Train+purge+val cycle size: {train_val_cycle_days} days")
+        print(f"  Minimum train+purge+validation cycle size: {min_cycle_days} days")
         print(f"  OOS test days at range end: {test_days}")
         print(f"  Tail holdout (purge+test): {holdout_tail_days} days")
         print(f"  Total available days: {self.num_days:,}")
-        print(f"  Target validation ratio: {self.test_val_split_ratio:.1%}")
+        print(f"  Target validation ratio (train_val_split_ratio): {self.train_val_split_ratio:.1%}")
 
         available_for_cycles = int(self.num_days - holdout_tail_days)
         if available_for_cycles <= 0:
@@ -1133,11 +1121,11 @@ class MarketDataCache:
                 f"Need > {holdout_tail_days} days, have {self.num_days}."
             )
 
-        possible_cycle_count = int(available_for_cycles // train_val_cycle_days)
+        possible_cycle_count = int(available_for_cycles // min_cycle_days)
         if possible_cycle_count < 1:
             raise ValueError(
                 "Insufficient data for even one train/purge/validation cycle. "
-                f"Required cycle size: {train_val_cycle_days}, available for cycles: {available_for_cycles}."
+                f"Required cycle size: {min_cycle_days}, available for cycles: {available_for_cycles}."
             )
 
         print(f"  Available days for train/val cycles: {available_for_cycles}")
@@ -1170,19 +1158,85 @@ class MarketDataCache:
                 max_start_step=max_start_step,
             )
 
-        consumed_by_cycles = int(possible_cycle_count * train_val_cycle_days)
-        cycle_remainder_days = int(max(0, available_for_cycles - consumed_by_cycles))
+        # Keep all super-blocks as equal as possible.
+        # We reserve one purge per cycle and split the remaining non-purge days nearly evenly.
+        total_purge_days = int(possible_cycle_count * purge_days)
+        total_super_days = int(available_for_cycles - total_purge_days)
+        if total_super_days < possible_cycle_count * min_super_block_days:
+            raise ValueError(
+                "Insufficient non-purge days to satisfy minimum super-block size constraints. "
+                f"Need at least {possible_cycle_count * min_super_block_days}, got {total_super_days}."
+            )
+
+        super_base = int(total_super_days // possible_cycle_count)
+        super_remainder = int(total_super_days % possible_cycle_count)
+        super_sizes = [
+            int(super_base + (1 if i < super_remainder else 0))
+            for i in range(possible_cycle_count)
+        ]
+
+        # Allocate validation days per cycle so global validation share over
+        # non-test train/validation subset matches target as closely as possible.
+        target_total_val = int(round(train_val_split_ratio * total_super_days))
+        min_total_val = int(possible_cycle_count * min_viable_val_block)
+        max_total_val = int(sum(s - min_viable_train_block for s in super_sizes))
+        target_total_val = int(np.clip(target_total_val, min_total_val, max_total_val))
+
+        val_sizes = []
+        for s in super_sizes:
+            v = int(round(train_val_split_ratio * s))
+            v = int(np.clip(v, min_viable_val_block, s - min_viable_train_block))
+            val_sizes.append(v)
+
+        current_total_val = int(sum(val_sizes))
+        delta = int(target_total_val - current_total_val)
+
+        if delta > 0:
+            idx_order = np.argsort([-s for s in super_sizes]).tolist()
+            while delta > 0:
+                progressed = False
+                for idx in idx_order:
+                    max_v = super_sizes[idx] - min_viable_train_block
+                    if val_sizes[idx] < max_v:
+                        val_sizes[idx] += 1
+                        delta -= 1
+                        progressed = True
+                        if delta == 0:
+                            break
+                if not progressed:
+                    break
+        elif delta < 0:
+            idx_order = np.argsort(super_sizes).tolist()
+            while delta < 0:
+                progressed = False
+                for idx in idx_order:
+                    min_v = min_viable_val_block
+                    if val_sizes[idx] > min_v:
+                        val_sizes[idx] -= 1
+                        delta += 1
+                        progressed = True
+                        if delta == 0:
+                            break
+                if not progressed:
+                    break
+
+        train_sizes = [int(s - v) for s, v in zip(super_sizes, val_sizes)]
+
+        achieved_total_val = int(sum(val_sizes))
+        achieved_ratio = (achieved_total_val / total_super_days) if total_super_days > 0 else 0.0
+        print(f"  Total super-block days (train+validation, no purge): {total_super_days}")
+        print(f"  Achieved validation share over super-block subset: {achieved_ratio:.2%}")
 
         cursor = 0
         for cycle_idx in range(possible_cycle_count):
-            extra_days = cycle_remainder_days if cycle_idx == (possible_cycle_count - 1) else 0
-
+            train_days = train_sizes[cycle_idx]
+            val_days = val_sizes[cycle_idx]
             train_start_idx = int(cursor)
-            train_end_idx = int(train_start_idx + train_days_base)
+            train_end_idx = int(train_start_idx + train_days)
             purge_start_idx = int(train_end_idx)
             purge_end_idx = int(purge_start_idx + purge_days)
             val_start_idx = int(purge_end_idx)
-            val_end_idx = int(val_start_idx + val_days_base + extra_days)
+            val_end_idx = int(val_start_idx + val_days)
 
             train_block = _build_block(
                 block_id=f"train_{cycle_idx:02d}",
@@ -1206,6 +1260,7 @@ class MarketDataCache:
             print(f"    Days: {train_block.num_days:,}")
             print(f"    Episodes: {train_block.max_episodes:,}")
             print(f"    Episode start range: [{train_block.min_start_step}, {train_block.max_start_step}]")
+            print(f"    Super-block size (train+val): {train_days + val_days}")
 
             print(f"  Purge window: train->{val_block.block_id}")
             if purge_days > 0:
