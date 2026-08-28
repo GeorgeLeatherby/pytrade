@@ -17,7 +17,7 @@
 General introduction of the concept used in PyTrade.
 * **3.1 Markov Decision Process (MDP):** Formal definition of State $\mathcal{S}$, Action $\mathcal{A}$, Transition $\mathcal{P}$, and Reward $\mathcal{R}$ of the SAA and the PAA.
 * **3.2 State Space Representation:** Mathematical derivation of stationary features from raw OHLCV. Introduction of memory preserving features (Lopez de Prado). Why just adding more data is not helpful and finding the right input data is so hard. Why Feature Engineering is essential and seen as even more important then backtesting.
-* **3.3 Action Space:** For SAA: continous weights indicating the change in position as 
+* **3.3 Action Space:** For SAA: continous weights indicating the change in position as a fraction of the total portfolio value. The fraction is a fixed number such as 0.2 meaning that an SAA ouput of 1 will lead to the agent buying 20% of portfolio value in the step, if enough cash is available. An output of -0.5 would lead to selling 10% of portfolio value, if possible with current asset inventory. 
 For PAA: continuous portfolio weight targets $w \in \Delta^n$, executed in enclosing steps by the env based on the real current portfolio weights. For the SAA module, the action is a single scalar which is defined as the requested change in position relative to the current portfolio notional.
 * **3.4 Reward Shaping:**
     * **3.4.1 Multi-Objective Reward Composition:** 
