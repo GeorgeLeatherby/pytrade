@@ -1091,8 +1091,8 @@ class MarketDataCache:
         min_cycle_days = int(min_super_block_days + purge_days)
 
         # End-of-range OOS test size: default equals base validation size unless overridden.
-        default_test_days = int(max(min_viable_val_block, int(round(min_super_block_days * train_val_split_ratio))))
-        test_days_cfg = int(self.config['environment'].get('oos_test_block_size_days', default_test_days))
+        default_test_days = int(min_viable_val_block)
+        test_days_cfg = default_test_days
         test_days = int(max(min_viable_val_block, test_days_cfg))
         holdout_tail_days = int(purge_days + test_days)
 
@@ -3446,7 +3446,7 @@ class TradingEnv(gym.Env):
         # Alternative: use squared downside returns
         downside_sq = (min(portfolio_return_absolut, 0.0))**2
         self.running_downside_variance_ema += self.sortino_eta * (downside_sq - self.running_downside_variance_ema)
-        downside_var_floor = 1e-6
+        downside_var_floor = 0.005
         downside_var = max(self.running_downside_variance_ema, downside_var_floor)
         current_sortino = self.running_mean_ema / np.sqrt(downside_var)
 
@@ -3649,9 +3649,17 @@ class TradingEnv(gym.Env):
         # Alternative: use squared downside returns
         saa_downside_sq = (min(saa_portfolio_return_absolut, 0.0))**2
         self.saa_running_downside_variance_ema += self.sortino_eta * (saa_downside_sq - self.saa_running_downside_variance_ema)
-        downside_var_floor = 1e-6
-        saa_downside_var = max(self.saa_running_downside_variance_ema, downside_var_floor)
-        current_sortino = self.saa_running_mean_ema / np.sqrt(saa_downside_var)
+        # downside_var_floor = 0.000025
+        #saa_downside_var = max(self.saa_running_downside_variance_ema, downside_var_floor)
+        #current_sortino = self.saa_running_mean_ema / np.sqrt(saa_downside_var)
+
+        # 3. Calculate downside standard deviation and apply floor directly at 50 bps (0.005)
+        downside_std_floor = 0.005
+        raw_downside_std = np.sqrt(max(0.0, self.saa_running_downside_variance_ema))
+        saa_downside_std = max(raw_downside_std, downside_std_floor)
+
+        # 4. Compute current Sortino
+        current_sortino = self.saa_running_mean_ema / saa_downside_std
 
         eps = 1e-12
 

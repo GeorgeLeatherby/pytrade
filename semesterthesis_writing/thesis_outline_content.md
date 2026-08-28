@@ -1,26 +1,31 @@
-# Thesis Structure: Hierarchical Reinforcement Learning for Multi-Asset Trading
-**Topic:** Separating Temporal Extraction from Cross-Sectional Allocation in DRL for portfolio allocation problems \
+# Semesterthesis: Hierarchical Reinforcement Learning for Multi-Asset Trading
+**Topic:** Separating single asset temporal signal extraction from multi-asset attention for dynamic allocation in DRL for portfolio allocation problems \
 **Environment:** Custom coded env called PyTrade
 
 ## 1. Introduction
-* **1.1 Motivation:** Financial markets represent highly volatile and complex decision-making environments in artificial intelligence. Research in this domain explores the boundaries of how reinforcement learning agents handle extreme noise, non-stationarity, and multi-layered problem spaces. Then proceed to explain: Why buying and holding ETFs might not be the most efficient strategy with the given amount of data and tools available. Transitioning from static forecasting to sequential decision-making in non-stationary markets. Why DRL is good at sequential decisions.
-* **1.2 Problem Description:** The challenge of high-dimensional continuous action spaces and the low signal-to-noise ratio in financial data.
+* **1.1 Motivation:** Financial markets represent highly volatile and complex decision-making environments in artificial intelligence. Research in this domain explores the boundaries of how reinforcement learning agents handle noise, non-stationarity, and multi-layered problem spaces. This thesis objective is not to claim novel alpha, but to explore a new architecture for continous multi-asset trading agents using a hierarchical DRL approach. Finance serves as an interesting and challenging topic for this thesis, not as the primary driver. Then proceed to explain: Why buying and holding ETFs might not be the most efficient strategy with the given amount of data and tools available. Transitioning from static forecasting to sequential decision-making in non-stationary markets. Why DRL is good at sequential decisions.
+* **1.2 Problem Description:** The challenge of high-dimensional continuous action spaces and the low signal-to-noise ratio in financial data. 
 * **1.3 Research Question:** Does modularizing temporal (Single-Asset) and cross-sectional (Portfolio-Level) functions improve stability and efficiency?
 
-## 2. Literature Review
-* **2.1 DRL in Quantitative Finance:** Evolution from DQN to PPO in portfolio management.
-* **2.2 Temporal Memory in Financial Series:** Comparison of RNNs, LSTMs, and TCNs for state representation.
-* **2.3 Attention Mechanisms:** The shift toward modeling time-varying dependencies across assets.
-* **2.4 Hierarchical & Modular RL:** Theoretical basis for decomposing complex policies into specialized modules.
+## 2. Literature Review (Citations needed! Description of the state of the art)
+* **2.1 Quantitative Finance and Deep Reinforcement Learning:** A brief paragraph on the major develoment steps of modern quantitative finance. Using literature this section explains which methods and technologies have been tried. E.g.: the evolution from DQN to PPO in portfolio management. Differences between 3-barrier method with discrete trades (Lopez de Prado) and continous trading setup, such as the architecture proposed in this paper.
+* **2.2 Temporal Memory in Financial Series:** Comparison of RNNs, LSTMs, and TCNs for state representation using literature. Should also cover temporal memory in price series and why integer differentiation looses memory while producing stationarity. Mention that the solution to this issue is adressed in section 3 and that it is possible to produce stationary, memory preserving features.
+* **2.3 Attention Mechanisms:** Section explaining how attention has been used in quantitative finance so far. Explain how attention is used for temporal signals such as a sequence of words in LLMs. Also give other examples if fitting papers are provided or found. 
+* **2.4 Hierarchical & Modular RL:** Theoretical basis for decomposing complex policies into specialized modules. Showcase of what has been tried in this domain so far, especially in quantitative finance.
 
 ## 3. System Design & Methodology
-* **3.1 Markov Decision Process (MDP):** Formal definition of State $\mathcal{S}$, Action $\mathcal{A}$, Transition $\mathcal{P}$, and Reward $\mathcal{R}$.
-* **3.2 State Space Representation:** Mathematical derivation of stationary features from raw OHLCV. Introduction of memory preserving features (Lopez and de Prado). Why just adding more data is not helpful and finding the right input data is so hard.
-* **3.3 Action Space:** For PAA: continuous portfolio weight targets $w \in \Delta^n$, executed in enclosing steps by the env based on the real current portfolio weights. For the SAA module, the action is a single scalar which is defined as the requested change in position relative to the current portfolio notional.
-* **3.4 Reward Shaping for Single Asset Agent (SAA):**
-    * **3.4.1 Multi-Objective Reward Composition:** Decomposing rewards into the "Nested Box" framework. Learning the hard limitations within a portfolio first (execution gap), followed by generating returns (beta), and finally generating alpha within the single instrument. Basically curriculum learning.
+General introduction of the concept used in PyTrade.
+* **3.1 Markov Decision Process (MDP):** Formal definition of State $\mathcal{S}$, Action $\mathcal{A}$, Transition $\mathcal{P}$, and Reward $\mathcal{R}$ of the SAA and the PAA.
+* **3.2 State Space Representation:** Mathematical derivation of stationary features from raw OHLCV. Introduction of memory preserving features (Lopez de Prado). Why just adding more data is not helpful and finding the right input data is so hard. Why Feature Engineering is essential and seen as even more important then backtesting.
+* **3.3 Action Space:** For SAA: continous weights indicating the change in position as 
+For PAA: continuous portfolio weight targets $w \in \Delta^n$, executed in enclosing steps by the env based on the real current portfolio weights. For the SAA module, the action is a single scalar which is defined as the requested change in position relative to the current portfolio notional.
+* **3.4 Reward Shaping:**
+    * **3.4.1 Multi-Objective Reward Composition:** 
+    SAA: Decomposing rewards into the "Nested Box" framework. Learning the hard limitations within a portfolio first (execution gap), followed by generating returns (beta), and finally generating alpha within the single instrument. Basically curriculum learning. RecurrentPPO is very sensitive to changes  in the composition of the individual elements.
+    PAA: PAA Reward composition
     * **3.4.2 The Execution Gap:** Mathematical formulation of penalties for requested actions exceeding available cash or portfolio constraints.
     * **3.4.3 Risk-Adjusted Alpha:** Use of SAA Excess Log Return vs simple all-hold baseline (alpha) and Differential Sortino ratios (volatility vs returns) as the core performance signals. The main question to answer here is how not to reward the agent with market beta, since markets on a large scale have generally been moving up.
+    PAA: 
 * **3.5 Layer 1: Temporal Extraction Module (Single Asset Agent):** 
     * **3.5.1 Dual-Recursion Logic:** Utilizing sb3-contrib RecurrentPPO to manage temporal state transitions alongside a 2-layer LSTM architecture for hierarchical feature extraction (Noise filtering through LSTM vs. Regime detection through recurrent algorithm). The SAA is trained on randomly rotating assets but with a learned small asset-id embedding. In later use the single trained agent is copied per asset. This is necessary due to the statefulness of recurrent agents.
     * **3.5.2 Training Dynamics and Stability:** Analysis of hyperparameter sensitivity, specifically the relationship between high Entropy (exploration) and Learning Rate decay in preventing policy collapse (Long-only/Short-only traps). A key architectural challenge in modular DRL frameworks is avoiding the transition dynamics mismatch when moving from single-agent training to multi-agent deployment. If the temporal extractor (Layer 1) is exposed to global portfolio states like shared cash, this is fine in individual training. But when moving to wiring the individual agents together their recurrent memory (LSTM) becomes susceptible to non-stationary feedback loops caused by exogenous agent actions. This is essentially a domain shift: changing the environment in a way that was not seen during training. The solution for this is adressed in layer 2 description (3.6).
