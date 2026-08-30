@@ -2529,20 +2529,27 @@ class TradingEnv(gym.Env):
             )
             self.selected_asset_bh_init_transaction_cost = 0.0
 
-        # Validate initial portfolio value matches configuration (allowing for small rounding)
+        # Validate initial portfolio value matches configuration net of the transaction costs
+        # actually paid at init (those are an expected deduction, not an error).
+        init_tc_tolerance = 25.0  # allows for float rounding across the cost breakdown terms
+        expected_initial_value = self.initial_portfolio_value - total_init_tc
         actual_initial_value = self.portfolio_state.get_total_value()
-        if abs(actual_initial_value - self.initial_portfolio_value) > 100:  # $100 tolerance for TC rounding
-            print(f"\nPortfolio initialization error: {actual_initial_value} != {self.initial_portfolio_value}")
+        if abs(actual_initial_value - expected_initial_value) > init_tc_tolerance:
+            print(f"\nPortfolio initialization error: {actual_initial_value} != {expected_initial_value} "
+                  f"(target {self.initial_portfolio_value}, init_tc {total_init_tc})")
 
-        # Validate comparison portfolio value matches configuration (allowing for small rounding)
+        # Validate comparison portfolio value (same cash/positions as portfolio_state after init TC)
         actual_initial_value = self.comparison_portfolio_state.get_total_value()
-        if abs(actual_initial_value - self.initial_portfolio_value) > 100:  # $100 tolerance for TC rounding
-            print(f"\nComparison portfolio initialization error: {actual_initial_value} != {self.initial_portfolio_value}")
+        if abs(actual_initial_value - expected_initial_value) > init_tc_tolerance:
+            print(f"\nComparison portfolio initialization error: {actual_initial_value} != {expected_initial_value} "
+                  f"(target {self.initial_portfolio_value}, init_tc {total_init_tc})")
 
-        # Validate benchmark portfolio value matches configuration (allowing for small rounding)
+        # Validate benchmark portfolio value matches configuration net of its own init TC
+        expected_benchmark_value = self.initial_portfolio_value - benchmark_tc
         actual_initial_value = self.benchmark_portfolio_state.get_total_value()
-        if abs(actual_initial_value - self.initial_portfolio_value) > 100:  # $100 tolerance for TC rounding
-            print(f"Benchmark portfolio initialization error: {actual_initial_value} != {self.initial_portfolio_value}")
+        if abs(actual_initial_value - expected_benchmark_value) > init_tc_tolerance:
+            print(f"Benchmark portfolio initialization error: {actual_initial_value} != {expected_benchmark_value} "
+                  f"(target {self.initial_portfolio_value}, init_tc {benchmark_tc})")
 
         # Seed a pre-step entry in the EpisodeBuffer so the first observation contains real weights
         initial_weights = self.portfolio_state.get_weights().astype(np.float32)
