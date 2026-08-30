@@ -793,18 +793,19 @@ class SAASignalWrapper(VecEnvWrapper):
         self.saa_state: Optional[Any] = None
         self.episode_start = np.ones(self.n_rows, dtype=bool)
         self._last_signals = np.zeros((venv.num_envs, self.num_assets, 1), dtype=np.float32)
+        self._last_shadow_weights = np.zeros((venv.num_envs, self.num_assets, 1), dtype=np.float32)
         # Row-aligned one-hot asset IDs, tiled once for the whole batch.
         self._asset_one_hot_batch = np.tile(self._asset_one_hot, (venv.num_envs, 1))
 
         self.initial_portfolio_value = float(self.venv.get_attr("initial_portfolio_value")[0])
 
-        # Resize obs space: add +1 feature per asset for SAA signal
+        # Resize obs space: add +2 features per asset (SAA signal + shadow-portfolio holding %)
         old_low, old_high = self.observation_space.low, self.observation_space.high
         asset_size = self.num_assets * self.raw_feat_dim
         low_assets = old_low[:asset_size].reshape(self.num_assets, self.raw_feat_dim)
         high_assets = old_high[:asset_size].reshape(self.num_assets, self.raw_feat_dim)
-        low_assets = np.concatenate([low_assets, np.full((self.num_assets, 1), -np.inf, dtype=np.float32)], axis=1)
-        high_assets = np.concatenate([high_assets, np.full((self.num_assets, 1), np.inf, dtype=np.float32)], axis=1)
+        low_assets = np.concatenate([low_assets, np.full((self.num_assets, 2), -np.inf, dtype=np.float32)], axis=1)
+        high_assets = np.concatenate([high_assets, np.full((self.num_assets, 2), np.inf, dtype=np.float32)], axis=1)
         new_low_assets = low_assets.reshape(-1)
         new_high_assets = high_assets.reshape(-1)
         self.observation_space = gym.spaces.Box(
@@ -822,9 +823,9 @@ class SAASignalWrapper(VecEnvWrapper):
         # Drop recurrent memory: every (env, asset) row starts a fresh episode.
         self.saa_state = None
         self.episode_start[:] = True
-        signals = self._compute_saa_signals(obs)
+        signals, shadow_weights = self._compute_saa_signals(obs)
         self._commit_saa_actions(signals)
-        return self._inject_signals(obs, signals)
+        return self._inject_signals(obs, signals, shadow_weights)
 
     def step_wait(self):
         obs, rewards, dones, infos = self.venv.step_wait()
@@ -837,20 +838,22 @@ class SAASignalWrapper(VecEnvWrapper):
                 info["terminal_observation"] = self._inject_signals(
                     info["terminal_observation"][None, ...],
                     self._last_signals[i][None, ...],
+                    self._last_shadow_weights[i][None, ...],
                 )[0]
 
         # VecEnv auto-resets, so the obs returned here is already the next episode's first
         # observation for any env that reported done. Flag those rows accordingly.
         self.episode_start = np.repeat(dones_arr, self.num_assets)
 
-        signals = self._compute_saa_signals(obs)
+        signals, shadow_weights = self._compute_saa_signals(obs)
         self._commit_saa_actions(signals)
-        return self._inject_signals(obs, signals), rewards, dones, infos
+        return self._inject_signals(obs, signals, shadow_weights), rewards, dones, infos
 
-    def _compute_saa_signals(self, obs: np.ndarray) -> np.ndarray:
+    def _compute_saa_signals(self, obs: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
         Rebuild the SAA training observation for every (env, asset) row and run a single
-        batched forward pass. Returns signals shaped (B, N, 1). Advances the LSTM state.
+        batched forward pass. Returns (signals, shadow_weights), each shaped (B, N, 1).
+        Advances the LSTM state.
         """
         B = obs.shape[0]
         N = self.num_assets
@@ -876,6 +879,14 @@ class SAASignalWrapper(VecEnvWrapper):
         initial_pv = self.initial_portfolio_value
         cash_log_value = np.where(cash_all > 0, np.log(np.maximum(cash_all, eps) / initial_pv), 0.0).astype(np.float32)
         asset_log_value = np.where(asset_notional > 0, np.log(np.maximum(asset_notional, eps) / initial_pv), 0.0).astype(np.float32)
+
+        # Shadow sub-portfolio holding percentage: this asset's share of ITS OWN isolated shadow
+        # book (cash_all + asset_notional). Never derived from, or written into, the live PAA
+        # portfolio state - only this scalar crosses the shadow/live boundary.
+        shadow_sub_total = cash_all + asset_notional
+        shadow_weight_all = np.where(
+            shadow_sub_total > eps, asset_notional / np.maximum(shadow_sub_total, eps), 0.0
+        ).astype(np.float32)
 
         rf_z_rep = np.repeat(rf_z_all[:, None], repeats=N, axis=1)
         mem_block = np.stack(
@@ -907,24 +918,27 @@ class SAASignalWrapper(VecEnvWrapper):
         # Rescale to the target_position_change range actually seen by env.step() during
         # SAA training/inference (see SingleAssetEpisodeAdapter.step() action_factor_fn).
         signals = (raw_signal * self.action_limiting_factor).reshape(B, N, 1).astype(np.float32)
+        shadow_weights = shadow_weight_all.reshape(B, N, 1).astype(np.float32)
         self._last_signals = signals
-        return signals
+        self._last_shadow_weights = shadow_weights
+        return signals, shadow_weights
 
     def _commit_saa_actions(self, signals: np.ndarray) -> None:
         """Apply the SAA actions to each env's sub-portfolio so the next step marks to market."""
         for b in range(signals.shape[0]):
             self.venv.env_method("apply_saa_sub_actions", signals[b, :, 0], indices=b)
 
-    def _inject_signals(self, obs: np.ndarray, signals: np.ndarray) -> np.ndarray:
+    def _inject_signals(self, obs: np.ndarray, signals: np.ndarray, shadow_weights: np.ndarray) -> np.ndarray:
         """
         Input obs: (B, num_assets*raw_feat_dim + portfolio_dim)
-        Output obs: asset part becomes num_assets*(raw_feat_dim+1) with SAA signal appended per asset.
+        Output obs: asset part becomes num_assets*(raw_feat_dim+2), with the SAA signal and the
+        shadow sub-portfolio's own holding percentage appended per asset.
         """
         B = obs.shape[0]
         asset_block = self.num_assets * self.raw_feat_dim
         asset_feats = obs[:, :asset_block].reshape(B, self.num_assets, self.raw_feat_dim)
         portfolio_part = obs[:, asset_block:]
-        augmented_assets = np.concatenate([asset_feats, signals], axis=-1).reshape(B, -1)
+        augmented_assets = np.concatenate([asset_feats, signals, shadow_weights], axis=-1).reshape(B, -1)
         return np.concatenate([augmented_assets, portfolio_part], axis=1)
 
 
@@ -1128,12 +1142,14 @@ class SAATokenizer(BaseFeaturesExtractor):
         Builds asset and portfolio tokens from the augmented observation.
 
         Observation (after SAASignalWrapper):
-            - Asset block: N * (raw_feat_dim + 1)  where +1 is the injected SAA signal
+            - Asset block: N * (raw_feat_dim + 2)  where the +2 are the injected SAA signal
+              and the shadow sub-portfolio's own holding percentage
             - Portfolio block: remaining dims (portfolio_dim)
 
         Asset token:
-            selected asset features (len(asset_feature_idx)) + SAA signal (1) + asset_weight (1)
-            => expected size: len(asset_feature_idx) + 2 (should be 26 per rules)
+            selected asset features (len(asset_feature_idx)) + SAA signal (1)
+            + shadow-portfolio holding percentage (1) + live PAA asset_weight (1)
+            => expected size: len(asset_feature_idx) + 3
 
         Portfolio token:
             time features (len(portfolio_time_idx)) taken from asset-0 raw features
@@ -1141,20 +1157,20 @@ class SAATokenizer(BaseFeaturesExtractor):
             => size: len(portfolio_time_idx) + portfolio_dim
         """
         self.n_assets = num_assets
-        self.raw_feat_dim = raw_feat_dim                      # Raw market features per asset (without SAA signal)
+        self.raw_feat_dim = raw_feat_dim                      # Raw market features per asset (without SAA signal/shadow weight)
         self.d_model = d_model
-        self.asset_feature_idx = list(asset_feature_idx)      # expected length 24
+        self.asset_feature_idx = list(asset_feature_idx)      # expected length 26
         self.portfolio_time_idx = list(portfolio_time_idx)    # expected length 6
 
         # Compute expected portfolio_dim from observation space
         obs_len = observation_space.shape[0]
-        asset_block = self.n_assets * (self.raw_feat_dim + 1)  # +1 for SAA signal
+        asset_block = self.n_assets * (self.raw_feat_dim + 2)  # +2 for SAA signal + shadow holding %
         if obs_len <= asset_block:
             raise ValueError(f"Observation too small. obs_len={obs_len}, asset_block={asset_block}")
         self.portfolio_dim = obs_len - asset_block
 
         # Validate target sizes
-        asset_token_in_dim = len(self.asset_feature_idx) + 2   # + SAA signal + asset_weight
+        asset_token_in_dim = len(self.asset_feature_idx) + 3   # + SAA signal + shadow holding % + asset_weight
         # if asset_token_in_dim != 26:
         #     raise ValueError(f"Asset token dim mismatch: got {asset_token_in_dim}, expected 26 "
         #                      f"(len(asset_feature_idx)={len(self.asset_feature_idx)})")
@@ -1196,33 +1212,32 @@ class SAATokenizer(BaseFeaturesExtractor):
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         """
-        observations: (B, n_assets*(raw_feat_dim+1) + portfolio_dim)
+        observations: (B, n_assets*(raw_feat_dim+2) + portfolio_dim)
         Returns: flattened tokens (B, (n_assets+1)*d_model)
         """
         B = observations.shape[0]
-        asset_block = self.n_assets * (self.raw_feat_dim + 1)
+        asset_block = self.n_assets * (self.raw_feat_dim + 2)
         portfolio_block = observations[:, asset_block:]                    # (B, portfolio_dim)
-        asset_flat = observations[:, :asset_block]                         # (B, N*(F+1))
-        asset_feats_full = asset_flat.view(B, self.n_assets, self.raw_feat_dim + 1)
+        asset_flat = observations[:, :asset_block]                         # (B, N*(F+2))
+        asset_feats_full = asset_flat.view(B, self.n_assets, self.raw_feat_dim + 2)
 
-        # Split raw features and SAA signal
+        # Split raw features, SAA signal, and shadow sub-portfolio holding percentage
         raw_feats = asset_feats_full[:, :, : self.raw_feat_dim]
         saa_sig = asset_feats_full[:, :, self.raw_feat_dim : self.raw_feat_dim + 1]  # (B, N, 1)
+        shadow_weight = asset_feats_full[:, :, self.raw_feat_dim + 1 : self.raw_feat_dim + 2]  # (B, N, 1)
 
         # Select configured asset features
         asset_feats_sel = raw_feats[:, :, self.asset_feature_idx]          # (B, N, len(idx))
         if asset_feats_sel.shape[-1] != len(self.asset_feature_idx):
             raise ValueError("Selected asset features shape mismatch")
 
-        # Asset weights from portfolio block: weights are first (N+1): cash + N assets
+        # Live PAA asset weights from portfolio block: weights are first (N+1): cash + N assets
         asset_weights = portfolio_block[:, 1 : 1 + self.n_assets].unsqueeze(-1)  # (B, N, 1)
         if asset_weights.shape[1] != self.n_assets:
             raise ValueError("Asset weights shape mismatch")
 
-        # Build asset tokens: selected feats + SAA signal + asset_weight
-        asset_token_inputs = torch.cat([asset_feats_sel, saa_sig, asset_weights], dim=-1)  # (B, N, 26)
-        # if asset_token_inputs.shape[-1] != 26:
-        #     raise ValueError(f"Asset token final dim mismatch: {asset_token_inputs.shape}")
+        # Build asset tokens: selected feats + SAA signal + shadow holding % + live asset_weight
+        asset_token_inputs = torch.cat([asset_feats_sel, saa_sig, shadow_weight, asset_weights], dim=-1)
 
         asset_tokens = self.asset_embedding(asset_token_inputs)            # (B, N, d_model)
 
@@ -2036,8 +2051,9 @@ def run(cache: MarketDataCache, config: Dict[str, Any]) -> Dict[str, Any]:
     # Infer per-asset dim from the env observation space (unwrapped)
     sample_space = vec_train.observation_space
     obs_len = int(sample_space.shape[0])
-    # vec_train is post SAASignalWrapper, so asset block includes the injected +1 SAA signal.
-    expected_asset_block = num_assets * (raw_feature_dim + 1)
+    # vec_train is post SAASignalWrapper, so asset block includes the injected SAA signal (+1)
+    # and the shadow sub-portfolio holding percentage (+1).
+    expected_asset_block = num_assets * (raw_feature_dim + 2)
     portfolio_dim = obs_len - expected_asset_block
     if portfolio_dim <= 0:
         raise ValueError(

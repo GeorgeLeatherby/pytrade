@@ -1,0 +1,535 @@
+\section{System Design and Methodology}
+
+PyTrade separates two problems that are usually learned jointly: extracting a temporal trading signal from a single instrument, and allocating capital across many instruments. Section~\ref{sec:mdp} formalizes both problems as Markov decision processes. Sections~\ref{sec:state}--\ref{sec:reward} describe the shared state, action, and reward machinery. Sections~\ref{sec:saa}--\ref{sec:info-flow} describe the two learned layers and how they are wired together. Sections~\ref{sec:simulator}--\ref{sec:universe} describe the simulator that makes the whole system testable.
+
+\subsection{Markov Decision Process (MDP) Formulation and Observation Fidelity}
+\label{sec:mdp}
+
+Only one of the two agents is recurrent. The SAA carries a 2-layer LSTM whose hidden state persists across environment steps within an episode. The PAA's \texttt{AttentionEngine} (Section~\ref{sec:paa-arch}) is a feed-forward self-attention module: it attends across the $N+1$ tokens available \emph{at the current step only} and carries no state from one step to the next. Any memory that reaches the PAA about the past arrives indirectly, already compressed into the scalar signal produced by a frozen, recurrent SAA copy (Section~\ref{sec:info-flow}). Framing both agents as operating on a Partially Observable Markov Decision Process (POMDP) is therefore correct for the SAA in the usual RL sense, and correct for the whole hierarchical system in a broader sense, but not because the PAA itself hides a temporal state.
+
+Partial observability in this system has two distinct sources, and it is worth being precise about which one the POMDP formalism below actually captures. The dominant source is not a modeling choice at all: daily-frequency financial markets are influenced by an effectively unbounded set of macroeconomic, political, and microstructural factors that are never fully measurable, and even a perfectly informed observer could not forecast their future evolution from present information. No feature engineering closes that gap. A second, compounding source is a deliberate engineering choice: this system reduces every asset to a small, hand-selected panel of stationary technical features (Section~\ref{sec:state}), which discards information a full order book, news feed, or fundamentals dataset would carry. Both of these sources mean $\mathcal{O}$ is, by construction, a lossy view of whatever true generative process drives asset prices, independent of any network architecture. What the POMDP tuple below formalizes is a third, narrower, and purely technical source: the SAA's LSTM cell state is an internal summary of past observations that is never re-exposed to the environment or the reward function, so from the environment's point of view the SAA's policy is not a memoryless function of the current observation alone. This third source is real and matters for the transfer argument in Section~\ref{sec:saa-stability}, but it should not be read as a claim that the agents come close to seeing the true state of the market; they do not, and no realistic system trained on daily OHLCV-derived features would.
+
+We describe each agent's decision problem as a POMDP
+
+\begin{equation}
+\mathcal{M} = (\mathcal{S}, \mathcal{A}, \mathcal{O}, \mathcal{P}, \mathcal{R}, \mathcal{Z}),
+\end{equation}
+
+where $\mathcal{S}$ is the true simulator state, $\mathcal{A}$ the action space, $\mathcal{O}$ the observation space handed to the network, $\mathcal{P}$ the (deterministic) transition function, $\mathcal{R}$ the reward function, and $\mathcal{Z}: \mathcal{S} \to \mathcal{O}$ the deterministic observation map. No discount factor is used explicitly; episodes are finite and rewards are already normalized per step.
+
+\subsubsection{Single-Asset Agent}
+
+At each step $t$ the SAA holds a position in exactly one, randomly selected asset. The relevant slice of simulator state is
+
+\begin{equation}
+s_t^{\text{saa}} = \big(p_t,\, c_t,\, x_t\big),
+\end{equation}
+
+the asset's close price $p_t$, the cash balance $c_t$, and the held share count $x_t$. The observation $o_t^{\text{saa}} \in \mathcal{Z}(s_t^{\text{saa}})$ handed to the policy is the concatenation of three blocks:
+
+\begin{equation}
+o_t^{\text{saa}} = \big[\, \mathbf{f}_t \in \mathbb{R}^{32},\ \ \mathbf{m}_t \in \mathbb{R}^{6},\ \ \mathbf{e}_i \in \{0,1\}^{11} \,\big],
+\end{equation}
+
+where $\mathbf{f}_t$ is a selectable set of stationary technical features (Section~\ref{sec:state}), $\mathbf{e}_i$ is a one-hot encoding of which of the $N{=}11$ universe assets is currently traded, and $\mathbf{m}_t$ is a portfolio memory block
+
+\begin{equation}
+\mathbf{m}_t = \Big(\log\tfrac{c_t}{c_0},\ \log\tfrac{x_t p_t}{c_0},\ r_t^{\text{sub}},\ a_{t-1},\ z_t^{\text{rf}},\ \alpha_t^{\text{rf}}\Big),
+\end{equation}
+
+with $c_0$ the initial notional, $r_t^{\text{sub}}$ the previous-step log return of the cash-plus-asset sub-portfolio, $a_{t-1}$ the previous action, $z_t^{\text{rf}}$ a 60-day z-score of the risk-free rate, and $\alpha_t^{\text{rf}}$ the sub-portfolio's excess log return over the risk-free carry. This memory block, not the raw cash and share numbers, is what re-anchors the LSTM's hidden state to the agent's own position every step; Section~\ref{sec:saa-stability} explains why that anchoring is required once the same weights are deployed inside the PAA.
+
+The action space is a single continuous scalar, $\mathcal{A}_{\text{saa}} = [-1, 1]$, interpreted not as a target weight but as a \emph{target position change}: $a_t = 1$ requests a buy notional equal to a fixed fraction of portfolio value (Section~\ref{sec:action}). The environment executes the implied trade, marks the sub-portfolio to market, and returns the reward described in Section~\ref{sec:reward}.
+
+\subsubsection{Portfolio Allocator Agent}
+
+The PAA observes the full universe at once. Its observation is a sequence of $N+1$ tokens, one per asset plus one portfolio-level token (Section~\ref{sec:paa-arch}), and each asset token already contains the injected SAA signal $a_t^{(i)}$ for that asset (Section~\ref{sec:info-flow}). Formally,
+
+\begin{equation}
+o_t^{\text{paa}} = \big(\mathbf{T}^{(1)}_t,\, \dots,\, \mathbf{T}^{(N)}_t,\, \mathbf{T}^{\text{pf}}_t\big), \qquad \mathbf{T}^{(i)}_t, \mathbf{T}^{\text{pf}}_t \in \mathbb{R}^{d_{\text{model}}}.
+\end{equation}
+
+Critically, $o_t^{\text{paa}}$ is recomputed from scratch every step and the PAA holds no hidden state of its own across steps: given $o_t^{\text{paa}}$, its policy is a memoryless function, exactly matching the Markov assumption a standard (non-recurrent) PPO update relies on. The only place time enters the PAA's decision is already baked into the token values themselves, either from the environment's own running statistics (Section~\ref{sec:paa-arch}) or from the frozen SAA's recurrent signal.
+
+The action space is $\mathcal{A}_{\text{paa}} = \mathbb{R}^{N}$: one logit per asset. These logits are converted to portfolio weights through a softmax with an explicit, fixed cash anchor (Section~\ref{sec:action}), so the raw network output never has to represent "hold cash" as a learned bias.
+
+\subsubsection{Why the Shadow Design Preserves Observability}
+
+Deploying one SAA copy per asset inside the PAA creates a risk that is easy to miss: if each copy's LSTM state were updated using the \emph{live}, PAA-controlled portfolio, its hidden state would drift out of the distribution it was trained on the moment the PAA starts making allocation decisions the SAA never saw during single-asset training. PyTrade avoids this by never letting the live portfolio touch the SAA's recurrent state at all. Every deployed SAA copy is re-anchored each step purely through its own private, hypothetical sub-portfolio (Section~\ref{sec:info-flow}); it is mathematically identical to the observation it received during training, so the transition dynamics it was optimized for are preserved exactly. This is why the memory block $\mathbf{m}_t$ above is a required part of the observation and not a convenience feature: it is what keeps the SAA's hidden state observable and non-drifting when frozen and copied.
+
+\subsection{State Space Representation}
+\label{sec:state}
+
+Raw OHLCV data is not stationary, and stacking more raw history does not fix that; it just gives the network more non-stationary numbers to memorize. Every feature described in this section is produced once, offline, by a dedicated enrichment pipeline (\texttt{DataEnricher} in \texttt{data\_processor\_2.py}) and cached by the \texttt{MarketDataCache} of Section~\ref{sec:simulator}; the environment itself never computes a feature at runtime. All engineered features live on one of two scales, log-returns/log-ratios or z-scores over a rolling window, and every feature is computed independently per asset so the same feature vector is meaningful across the universe. Nearly all rolling statistics in the pipeline share a single window length, $w_{\text{norm}} = \lfloor 252/7 \rfloor = 36$ trading days (roughly one and a half months). This keeps the question of: "after how much history is z-score averaging over?" answerable with one number throughout this section. This will be important once the exact train, validation and testing set up is further elaborated in section \ref{sec:simulator}.
+
+\subsubsection{Multi-Horizon Return, Volume, and Volatility Features}
+\label{sec:state-returns}
+
+A common feature family is computed at three horizons $N \in \{1, 5, 21\}$ trading days (the enrichment pipeline itself also computes $N \in \{3, 10, 20, 40\}$, but only the 1/5/21-day variants are enabled in the active feature configuration, matching daily, weekly, and monthly trading rhythms). For each horizon:
+
+\begin{equation}
+r_t^{(N)} = \log\frac{P_t}{P_{t-N}}, \qquad r_t^{(N),\text{SPY}} = \log\frac{P_t^{\text{SPY}}}{P_{t-N}^{\text{SPY}}}, \qquad \tilde{r}_t^{(N)} = r_t^{(N)} - r_t^{(N),\text{SPY}},
+\end{equation}
+
+the asset's own log return, SPY's log return over the same horizon, and the asset's log return relative to SPY. The market-relative return $\tilde{r}_t^{(N)}$, not the raw return $r_t^{(N)}$, is what actually enters the feature set (as \texttt{log\_close\_return\_Nd} is joined by its z-scored relative counterpart):
+
+\begin{equation}
+z\text{\_rel\_log\_close}_t^{(N)} = \text{clip}\!\left(\frac{\tilde{r}_t^{(N)} - \mu_{36}(\tilde{r}^{(N)})_t}{\sigma_{36}(\tilde{r}^{(N)})_t + \epsilon}, \, -4, 4\right),
+\end{equation}
+
+where $\mu_{36}(\cdot)_t$ and $\sigma_{36}(\cdot)_t$ denote the rolling mean and standard deviation over the trailing $w_{\text{norm}}=36$ days. Removing SPY's return before z-scoring is deliberate: it prevents a broad market rally or sell-off from being read by the network as an asset-specific signal, which matters directly for the research question of Section~\ref{sec:mdp}, since genuine cross-asset structure should come from the PAA's attention mechanism, not leak in through a feature that is secretly just "the market went up today."
+
+A volatility-breakout companion feature, \texttt{z\_vol\_breakout\_Nd}, flags when short-term realized volatility of the relative return has broken out of its recent regime:
+
+\begin{equation}
+z\text{\_vol\_breakout}_t^{(N)} = \text{clip}\!\left(\frac{\log\big(\sigma_5(\tilde{r}^{(N)})_t + \epsilon\big) - \mu_{36}(\tilde{r}^{(N)})_t}{\sigma_{36}(\tilde{r}^{(N)})_t + \epsilon}, \, -4, 4\right),
+\end{equation}
+
+comparing the log of a 5-day realized-volatility estimate against the 36-day rolling mean and standard deviation of the relative return series itself. An analogous pair of features is computed for traded volume: $\text{log\_volume\_intensity}_t^{(N)} = \log\!\big(V_t / (\mu_{36}(V)_t + \epsilon)\big)$ measures today's volume against its own trailing average, is again made market-relative by subtracting SPY's volume intensity, z-scored over 36 days, and squashed with $\tanh$ into \texttt{norm\_volume\_feature\_Nd} $\in (-1,1)$.
+
+\subsubsection{Intraday Shape and Single-Horizon Indicators}
+
+A second group of features is computed once per day (no horizon parameter) from that day's own OHLC bar, capturing information a close-only feature discards entirely: where within the day's range the close occurred, and whether the day opened with a gap.
+
+\begin{equation}
+\text{intra\_vol}_t = \log\frac{H_t}{L_t}, \qquad
+\text{cl\_strength}_t = \frac{C_t - L_t}{H_t - L_t}, \qquad
+\text{gap}_t = \log\frac{O_t}{C_{t-1}}, \qquad
+\text{shadow}_t = \frac{H_t - \max(O_t, C_t)}{H_t - L_t},
+\end{equation}
+
+the log high-low range, the fraction of the day's range the close sits above the low (bounded in $[0,1]$), the overnight log return from the previous close to today's open, and the upper-wick fraction of the day's range. $\text{intra\_vol}_t$ and $\text{gap}_t$ are z-scored over the 36-day window and passed through $\tanh$ (\texttt{z\_log\_intra\_vol}, \texttt{z\_log\_overnight\_gap}); $\text{cl\_strength}_t$ and $\text{shadow}_t$ are already bounded in $[0,1]$ and are simply rescaled to $[-1,1]$ via $2x-1$ (\texttt{norm\_closing\_strength}, \texttt{norm\_shadow\_ratio}). Three classical technical indicators are computed alongside them: a smoothed, $[-1,1]$-normalized 14-day RSI ($\text{rsi\_14} = \tfrac{1}{3}\sum(\text{RSI}_{14}-50)/50$, 3-day moving average), a reworked Bollinger-Band width ($4\sigma_{36}(P)/\mu_{36}(P)$, itself z-scored over 36 days and clipped to $[-3,3]$ as \texttt{bb\_width\_reworked}), and a z-scored, clipped Average True Range (\texttt{atr\_z\_norm}), all designed to be scale-free across the eleven-asset universe.
+
+\subsubsection{Cross-Asset Features}
+
+Three features make each asset's representation depend explicitly on the rest of the universe, giving the PAA's cross-sectional attention (Section~\ref{sec:paa-arch}) genuine correlation structure to work with even before any learned attention weights are applied. A rolling 21-day Pearson correlation between the asset's daily log return and SPY's is Fisher-$z$ transformed for variance stabilization,
+
+\begin{equation}
+\rho_t = \text{clip}\big(\text{Corr}_{21}(r^{(1)}, r^{(1),\text{SPY}})_t,\, -0.99, 0.99\big), \qquad
+z\text{\_fisher\_corr\_spy}_t = \tfrac{1}{2}\log\frac{1+\rho_t}{1-\rho_t},
+\end{equation}
+
+a rolling 36-day beta against SPY is computed from the same covariance/variance ratio a CAPM regression would use, then z-scored over 36 days (\texttt{z\_beta\_spy}), and a cross-sectional dispersion feature, $\log\big(\text{std}_i(r_{i,t}^{(1)}) + \epsilon\big)$ (the standard deviation, across all eleven assets on date $t$, of that day's log return), is likewise z-scored over 36 days into \texttt{z\_market\_dispersion}, giving every asset a shared, date-aligned read of "how dispersed is the whole universe's behavior today."
+
+\subsubsection{Memory-Preserving Stationary Features via Fractional Differentiation}
+\label{sec:state-ffd}
+
+Standard integer differencing, i.e., using $\log P_t - \log P_{t-1}$ as the SAA/PAA's only price feature, achieves stationarity but destroys long-range memory: a return series has (by construction) no information left about the price level or slow trends that produced it. López de Prado \cite{LopezdePrado.2018} shows that this is not a necessary trade-off. Treating the difference order as a continuous parameter $d \in \mathbb{R}$ rather than the integer $d=1$ of ordinary returns, the fractional difference operator is defined through the binomial series expansion of $(1-L)^d$ in the backshift operator $L$ (where $L X_t = X_{t-1}$):
+
+\begin{equation}
+(1-L)^d = \sum_{k=0}^{\infty} \binom{d}{k}(-L)^k = \sum_{k=0}^{\infty} w_k L^k, \qquad
+w_0 = 1, \quad w_k = -w_{k-1}\,\frac{d - k + 1}{k}.
+\end{equation}
+
+For $d=1$ this collapses to $w_0=1, w_1=-1$, i.e., ordinary differencing; for non-integer $d \in (0,1)$, the weights $w_k$ decay slowly toward zero rather than vanishing after one lag, so the transformed series retains a fading memory of every past price rather than none of it. Because the exact weight series is infinite, \texttt{DataEnricher.\_get\_global\_ffd\_weights} uses López de Prado's fixed-width window approximation: weights are generated by the recursion above until either they fall below a threshold or a hard cap is reached,
+
+\begin{equation}
+\ell^{\ast} = \min\Big(\big\{k : |w_k| < \tau\big\} \cup \{k_{\max}\}\Big), \qquad \tau = 10^{-3},\ \ k_{\max}=120,
+\end{equation}
+
+and the fractionally differentiated series is then the finite, fixed-width convolution
+
+\begin{equation}
+\widetilde{X}_t = \sum_{k=0}^{\ell^{\ast}} w_k \,\log P_{t-k},
+\end{equation}
+
+applied to the log price rather than the raw price (log-prices keep the weights scale-free across assets with very different price levels). This is a genuine memory/stationarity trade-off, not a free lunch: smaller $d$ preserves more memory but risks failing a stationarity test; larger $d$ is safely stationary but approaches ordinary returns and their short memory. The pipeline therefore searches for the smallest $d$ that is empirically stationary, the "golden $d$," rather than fixing $d$ by convention.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    node distance=6mm and 8mm,
+    box/.style={draw, rounded corners, fill=black!5, minimum height=9mm, minimum width=64mm, align=center, font=\small},
+    small/.style={draw, rounded corners, fill=black!5, minimum height=8mm, minimum width=28mm, align=center, font=\footnotesize},
+    dec/.style={draw, rounded corners, fill=black!10, minimum height=9mm, minimum width=64mm, align=center, font=\small},
+    arr/.style={-{Latex[length=2mm]}}
+]
+\node[box] (logp) {Log price $\log P_t$, all 11 assets};
+\node[box, below=of logp] (weights) {Binomial weights $w_k$ via recursion\\ $w_0{=}1,\ w_k=-w_{k-1}\frac{d-k+1}{k}$, cut at $\lvert w_k\rvert{<}\tau$};
+\node[small, below=10mm of weights] (gold) {Gold};
+\node[small, left=6mm of gold] (spy) {SPY};
+\node[small, right=6mm of gold] (crude) {Crude};
+\node[dec, below=10mm of gold] (search) {Golden-$d$ search: smallest $d\in[0.45,0.8]$ (step 0.05)\\ passing an ADF stationarity test ($p{<}0.05$), per anchor asset};
+\node[box, below=of search] (maxd) {$d^{\ast} = \max(d_{\text{SPY}}, d_{\text{Gold}}, d_{\text{Crude}})$\\ one shared weight vector for the whole universe};
+\node[box, below=of maxd] (conv) {Fixed-width convolution $\widetilde{X}_t = \sum_{k=0}^{\ell^\ast} w_k \log P_{t-k}$\\ applied per asset with $d^\ast$};
+\node[box, below=of conv] (norm) {Rolling 36-day $z$-score, then $\tanh$\\ $\to$ \texttt{norm\_ffd\_feature}};
+\node[dec, below=of norm] (adf) {Per-asset ADF verification on \texttt{norm\_ffd\_feature}\\ requires 100\% pass rate ($p{<}0.05$), else pipeline aborts};
+\draw[arr] (logp) -- (weights);
+\draw[arr] (weights) -- (spy);
+\draw[arr] (weights) -- (gold);
+\draw[arr] (weights) -- (crude);
+\draw[arr] (spy) -- (search);
+\draw[arr] (gold) -- (search);
+\draw[arr] (crude) -- (search);
+\draw[arr] (search) -- (maxd);
+\draw[arr] (maxd) -- (conv);
+\draw[arr] (conv) -- (norm);
+\draw[arr] (norm) -- (adf);
+\end{tikzpicture}
+\caption{The fractional-differentiation pipeline (\texttt{DataEnricher.add\_frac\_diff\_features}). The differencing order $d$ is searched for, not assumed: three anchor assets (SPY, Gold, Crude) each yield the smallest stationarity-passing $d$ in $[0.45, 0.8]$, the maximum across anchors is adopted as a single global $d^{\ast}$, and the resulting fixed-width weight vector is applied uniformly to all eleven assets before normalization and a final per-asset stationarity check.}
+\label{fig:ffd-pipeline}
+\end{figure}
+
+Figure~\ref{fig:ffd-pipeline} shows the full procedure. \texttt{find\_multi\_asset\_golden\_d} runs \texttt{find\_golden\_d} on three structurally different anchor assets, a broad equity index, a precious metal, and a commodity, sweeping $d \in \{0.45, 0.50, \dots, 0.80\}$ and, for each candidate, generating that $d$'s weight vector, applying it to the asset's log price via the convolution above, and running an Augmented Dickey-Fuller (ADF) test on the result; the first $d$ whose ADF $p$-value falls below $0.05$ is that asset's golden $d$. Rather than tuning $d$ per asset (which would make the resulting feature's memory horizon inconsistent across the universe), the pipeline takes $d^{\ast} = \max$ over the three anchors' golden $d$'s and applies the single resulting weight vector to every asset in the universe, including the eight not used for the search. This is a conservative choice: since larger $d$ is always at least as safely stationary as a smaller one, using the maximum guarantees the shared weight vector is stationarity-passing for the anchors, and Section~\ref{sec:state-ffd}'s closing verification step confirms it empirically for the full universe rather than merely assuming it transfers. The resulting series \texttt{ffd\_close} is then normalized exactly like the other rolling features, z-scored over the shared 36-day window and squashed with $\tanh$, into the final feature \texttt{norm\_ffd\_feature} that actually reaches the SAA and PAA. As a last correctness gate, \texttt{report\_stationarity} reruns the ADF test on \texttt{norm\_ffd\_feature} independently for all eleven assets and requires a 100\% pass rate at $p<0.05$; if even one asset fails, \texttt{add\_frac\_diff\_features} raises rather than silently shipping a non-stationary feature into training.
+
+\subsubsection{Calendar Encoding}
+
+A final block of six calendar features supplies periodicity without a discontinuity at period boundaries (\texttt{trigonometric\_date\_encoding}): day-of-week is encoded over a 5-trading-day cycle, day-of-month as the day's relative position within that month's actual trading days (so month length does not distort the cycle), and month-of-year over a 12-month cycle, each as a $(\sin,\cos)$ pair,
+
+\begin{equation}
+x^{\sin}_t = \sin\!\Big(\tfrac{2\pi\, k_t}{K}\Big), \qquad x^{\cos}_t = \cos\!\Big(\tfrac{2\pi\, k_t}{K}\Big),
+\end{equation}
+
+with $(k_t, K)$ equal to (day-of-week, 5), (trading-day-rank-in-month, days traded that month), and (month$-1$, 12) respectively. Unlike a raw integer day-of-week or month index, this pair-encoding places, e.g., Friday and the following Monday at a bounded cyclical distance rather than an artificial jump, and is identical in structure to the SAA's memory-block treatment of the previous action in Section~\ref{sec:mdp}: both replace a value with a representation that does not falsely imply an unbounded numeric relationship.
+
+Feature selection on top of this pipeline is entirely config-driven: the SAA, the PAA's per-asset token, and the PAA's portfolio token each read their own boolean feature map from the active JSON config (e.g.\ \texttt{config\_10007.json}'s \texttt{saa\_features}, \texttt{paa\_asset\_token\_features}, and \texttt{paa\_portfolio\_token\_features} sections), so architecture and feature set can be iterated on independently without touching the enrichment pipeline itself. This deliberate emphasis on feature construction, more than on the reward or the network, follows directly from the low signal-to-noise ratio of daily financial data: a well-conditioned, stationary, memory-preserving feature is worth more engineering effort than an additional backtest.
+
+\subsection{Action Space}
+\label{sec:action}
+
+The two agents use structurally different action encodings, chosen to match what each agent actually controls.
+
+\textbf{SAA.} The action $a_t \in [-1,1]$ is a target position \emph{change}, not a target position. A fixed fraction of portfolio notional, the action-limiting factor $\kappa_t$, is annealed over training via a three-phase linear schedule (constant at a warm-up value, linear ramp, constant at a terminal value); $a_t = 1$ requests a buy of $\kappa_t \cdot c_0$ dollars, subject to available cash, and $a_t = -0.5$ requests a sell of $0.5\,\kappa_t \cdot c_0$ dollars, subject to available inventory. This design keeps the action distribution centered and bounded regardless of how large the current position already is, which matters because the same scalar head is reused, unmodified, across every asset once the SAA is frozen and copied.
+
+\textbf{PAA.} The policy outputs $N$ real-valued logits $\mathbf{z}_t \in \mathbb{R}^N$, one per risky asset. A cash logit is fixed at $z_t^{(0)} \equiv 0$ and prepended, and the executed target weights follow from a stable softmax,
+
+\begin{equation}
+w_t^{(j)} = \frac{\exp\big(z_t^{(j)} - \max_k z_t^{(k)}\big)}{\sum_{k=0}^{N} \exp\big(z_t^{(k)} - \max_k z_t^{(k)}\big)}, \qquad j = 0, \dots, N.
+\end{equation}
+
+Anchoring the cash logit rather than learning it removes one redundant degree of freedom from the policy (softmax is shift-invariant, so an unconstrained cash logit would only ever matter relative to the asset logits) and gives the agent a well-defined, always-available "do nothing" reference point. The resulting target weights are not applied instantaneously. A soft-execution step moves the live portfolio only part-way toward the target,
+
+\begin{equation}
+\Delta w_t = w_t - w_t^{\text{live}}, \qquad
+\Delta w_t^{\text{exec}} = \eta_{\text{exec}} \cdot \Delta w_t \cdot \mathbb{1}\big[\lvert \Delta w_t \rvert > \delta\big],
+\end{equation}
+
+with step size $\eta_{\text{exec}} \in (0,1]$ and deadband $\delta$. The deadband suppresses trades too small to be worth the transaction cost, and the partial step spreads a large rebalance over several days rather than realizing it as one trade, which is closer to how a real allocator would rebalance and keeps single-step turnover, and therefore cost, bounded.
+
+\subsection{Reward Shaping}
+\label{sec:reward}
+
+Both agents are trained with the same reward methodology, applied to two different notions of "portfolio". The design goal is to reward risk-adjusted skill, not exposure to a rising market, and to do so with a signal dense enough for PPO to differentiate through at every step.
+
+\subsubsection{Multi-Objective Reward Composition}
+
+The per-step reward is a sum of five components, each isolating one aspect of trading quality, squashed at the end so that no single component can dominate the gradient:
+
+\begin{equation}
+R_t^{\text{raw}} = \underbrace{s_\alpha \, \Delta\ell_t}_{\text{excess return}} \;+\; \underbrace{s_\sigma \, \Delta\text{Sortino}_t}_{\text{risk-adjusted trend}} \;-\; \underbrace{\lambda_{dd}\,\Delta\text{DD}_t^{+}}_{\text{drawdown shock}} \;-\; \underbrace{\lambda_{dd}^{\text{lvl}}\,\text{DD}_t^{\text{level}}}_{\text{sustained drawdown}} \;-\; \underbrace{\lambda_{\text{exec}}\,G_t}_{\text{execution gap}} \;+\; \underbrace{b_t^{\text{exit}}}_{\text{realized-profit bonus}},
+\end{equation}
+
+\begin{equation}
+R_t = \tanh\!\Big(\frac{R_t^{\text{raw}}}{\tau}\Big) \cdot \sigma_R.
+\end{equation}
+
+All five components are computed for both agents; only the mechanics of two of them differ with the action space. The execution-gap term (Section~\ref{sec:execgap}) is a scalar comparison of requested vs. executed notional for the SAA and a per-asset vector comparison of requested vs. executed weight change for the PAA; the realized-profit exit bonus is computed from a single running entry price for the SAA's one open position and from $N$ per-asset running entry prices for the PAA. The two agents differ mainly in which portfolio $\Delta\ell_t$ is measured against (Section~\ref{sec:excess-return}).
+
+\subsubsection{Excess Return and the Choice of Benchmark}
+\label{sec:excess-return}
+
+Rewarding raw portfolio return teaches an agent that "the market goes up" is a strategy, which is not the behavior this thesis is trying to elicit or measure. Both agents are instead rewarded relative to a passive counterfactual with the same starting capital. Writing $V_t$ for the live (or single-asset sub-) portfolio value and $B_t$ for the counterfactual's value,
+
+\begin{equation}
+\Delta\ell_t = \big(\log V_t - \log V_{t-1}\big) - \big(\log B_t - \log B_{t-1}\big).
+\end{equation}
+
+Because both terms are log-returns, $\Delta\ell_t$ is the log excess return of the agent over "having done nothing," which isolates timing and selection skill from beta exposure.
+
+The PAA's counterfactual for $B_t$ is a 100\%-invested, transaction-cost-paying SPY buy-and-hold: an SPY-only position sized with the full initial portfolio value, which pays its own one-time transaction cost at episode reset and is then never traded again, only marked to market every step. This is the passive alternative any real allocator is implicitly compared against, and it is the portfolio the reward's excess-return term is actually computed against. The codebase tracks two further portfolios that are easy to confuse with it. A \emph{comparison portfolio} is a static clone that receives the exact same initial cash and positions as the live portfolio at episode reset (including whatever random or cash-only starting allocation was sampled for that episode) and is then never traded again; it is reported for diagnostics (\texttt{comparison\_final\_value}) but does not enter the reward. A separate, fixed-weight \emph{benchmark portfolio} (45\% SPY, 20\% Gold, 10\% EWJ, 10\% EWG, 5\% Crude, 5\% EWQ, 5\% EWT, fully invested from day one) is also simulated every episode and reported as a diagnostic "alpha" metric, but likewise never enters the reward. Reading the reward function without this distinction risks concluding the PAA is being trained to beat one of these two diagnostic-only portfolios; it is not. It is trained to beat a realistic, cost-adjusted passive SPY allocation, which is also philosophically consistent with the SAA's own same-asset buy-and-hold benchmark: in both cases, the counterfactual is "the simplest passive thing an investor could actually do with this capital."
+
+\subsubsection{Risk-Adjusted Trend: Differential Sortino}
+
+A single exponential moving average (EMA) tracks the mean step return and the downside variance (squared negative returns only, floored to avoid division blow-ups),
+
+\begin{equation}
+\bar{r}_t = \bar{r}_{t-1} + \eta\big(r_t - \bar{r}_{t-1}\big), \qquad
+\bar{v}_t^{-} = \bar{v}_{t-1}^{-} + \eta\Big(\min(r_t,0)^2 - \bar{v}_{t-1}^{-}\Big),
+\end{equation}
+
+\begin{equation}
+\text{Sortino}_t = \frac{\bar{r}_t}{\sqrt{\max(\bar{v}_t^{-}, v_{\min})}}, \qquad
+\Delta\text{Sortino}_t = \text{Sortino}_t - \text{Sortino}_{t-1}.
+\end{equation}
+
+Rewarding the \emph{change} in this ratio rather than its level gives a step-wise, differentiable signal that still points the policy toward a smoother, higher-Sortino equity curve, without waiting for episode termination to score risk. A short warm-up window suppresses this term until the EMAs have enough history to be meaningful, avoiding an artificial spike from the zero-initialized baseline.
+
+\subsubsection{Drawdown Penalties}
+\label{sec:drawdown}
+
+Two complementary drawdown terms are used. An incremental penalty charges only the \emph{new} drawdown incurred this step, $\Delta\text{DD}_t^{+} = \max(0, \text{DD}_t - \text{DD}_{t-1})$, over a growing lookback window (starting at 2 steps and expanding to a configured cap), so early-episode noise cannot trigger a large penalty. A persistent level penalty additionally charges every step spent underwater relative to the running peak portfolio value, $\text{DD}_t^{\text{level}} = \max\big(0,\, 1 - V_t / \text{Peak}_t\big)$, discouraging the agent from lingering in a drawdown even once it has stopped worsening.
+
+\subsubsection{The Execution Gap}
+\label{sec:execgap}
+
+The execution-gap term penalizes the distance between what the policy asked for and what the environment actually filled, net of a deadband that excludes changes too small to trade profitably. For the PAA, this is the vector gap left by the soft-execution mechanics of Section~\ref{sec:action}:
+
+\begin{equation}
+G_t^{\text{paa}} = \sum_{j} \max\big(0,\, \lvert \Delta w_t^{(j)} - \Delta w_t^{\text{exec},(j)} \rvert - \delta\big).
+\end{equation}
+
+For the SAA, the same idea applies to the scalar action: writing $a_t^{\text{exec}}$ for the fraction of portfolio value actually traded (which can fall short of $a_t$ if cash or inventory is insufficient), the gap is
+
+\begin{equation}
+G_t^{\text{saa}} = \max\big(0,\, \lvert a_t - a_t^{\text{exec}} \rvert - g_0\big),
+\end{equation}
+
+where $g_0$ is a dynamic no-penalty band derived from the minimum trade-value threshold so that trades too small to clear the transaction-cost floor are never penalized as an execution failure. Both terms use an asymmetric multiplier ($\lambda_{\text{exec}}$ scaled up when net exposure was requested but not delivered, scaled down when the policy over-shoots and the environment simply declines to execute more than requested). This keeps the policy honest about the cost of the requests it makes, without punishing it for the deliberate friction built into Section~\ref{sec:action}.
+
+\subsubsection{Realized-Profit Exit Bonus}
+
+A per-asset running average entry price is maintained from executed buys. Any sell that realizes a price above that running average pays a small bonus proportional to the realized dollar profit, normalized by initial capital. This term is currently disabled by default ($\text{coeff}=0$) in the best-performing configurations discovered so far and is kept as an optional lever for future curriculum experiments rather than a load-bearing part of the current reward.
+
+\subsection{Layer 1: Temporal Extraction Module (Single-Asset Agent)}
+\label{sec:saa}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    node distance=6mm and 8mm,
+    box/.style={draw, rounded corners, minimum height=8mm, minimum width=48mm, align=center, font=\small},
+    io/.style={draw, rounded corners, fill=black!5, minimum height=9mm, minimum width=48mm, align=center, font=\small},
+    small/.style={draw, rounded corners, fill=black!5, minimum height=8mm, minimum width=48mm, align=center, font=\small},
+    head/.style={draw, rounded corners, fill=black!10, minimum height=9mm, minimum width=44mm, align=center, font=\small},
+    arr/.style={-{Latex[length=2mm]}}
+]
+% Two parallel input paths
+\node[io] (feat) {Market + memory features\\ $[\mathbf{f}_t,\, \mathbf{m}_t] \in \mathbb{R}^{38}$\\ (32 market $+$ 6 memory)};
+\node[io, right=22mm of feat] (id) {One-hot asset id\\ $\mathbf{e}_i \in \{0,1\}^{11}$};
+\node[small, below=of id] (emb) {Learned embedding\\ $\text{Embedding}(11 \rightarrow 6)$};
+\coordinate (topmid) at ($(feat)!0.5!(emb)$);
+\node[box, below=19mm of topmid] (concat) {Concatenate\\ $[\mathbf{f}_t,\, \mathbf{m}_t,\, \text{emb}(i)] \in \mathbb{R}^{44}$};
+\node[box, below=of concat] (mlp) {MLP: Linear--LayerNorm--SiLU--Dropout\\ (128 $\to$ 64), projected to $d_{f}{=}64$\\ \texttt{InputMLPFeatures}};
+\node[box, below=of mlp] (lstm) {2-layer LSTM (hidden size 64)\\ \texttt{MlpLstmPolicy}};
+\node[head, below left=10mm and -6mm of lstm] (actor) {Actor head\\ $\mu(a_t),\ \log\sigma(a_t)$};
+\node[head, below right=10mm and -6mm of lstm] (critic) {Critic head\\ $V(s_t)$};
+\node[io, below=of actor] (act) {Action $a_t \in [-1,1]$, scaled by $\kappa_t$\\ \textbf{executed by the environment}};
+\node[io, below=of critic] (val) {Value estimate\\ \textbf{used only for GAE / PPO value loss}\\ never feeds back into $a_t$};
+\draw[arr] (feat) -- (concat);
+\draw[arr] (id) -- (emb);
+\draw[arr] (emb) -- (concat);
+\draw[arr] (concat) -- (mlp);
+\draw[arr] (mlp) -- (lstm);
+\draw[arr] (lstm) -- (actor);
+\draw[arr] (lstm) -- (critic);
+\draw[arr] (actor) -- (act);
+\draw[arr] (critic) -- (val);
+\end{tikzpicture}
+\caption{SAA information flow. The observation splits into two parallel paths: raw market and memory features pass through unchanged, while the one-hot asset id is first mapped through a small learned embedding table. Both paths are concatenated before the shared MLP. A 2-layer LSTM turns the resulting feature into a recurrent state, which two independent linear heads read out: an actor head that produces the executed action, and a critic head whose value estimate is consumed only by the PPO/GAE loss and has no causal path back to the action.}
+\label{fig:saa-arch}
+\end{figure}
+
+Figure~\ref{fig:saa-arch} shows the full path from observation to action, corrected to make two things explicit that a single linear pipeline would obscure. First, \texttt{InputMLPFeatures} does not feed the one-hot asset-id block into the same transformation as the market and memory features: it slices the observation into two separate tensors, sends the trailing 11-dimensional id block through a small learned embedding table (11 assets $\to$ 6 dimensions), and leaves the remaining 38-dimensional market-and-memory block untouched. Only after this split are the two tensors concatenated into a single 44-dimensional vector, which is then pushed through two dense blocks (128 then 64 units, each with LayerNorm, SiLU, and dropout) and projected to the policy's feature dimension. Second, the actor and critic heads are two independent linear readouts of the same LSTM hidden state; they do not feed into one another. The critic's value estimate $V(s_t)$ is consumed exclusively by the PPO advantage/GAE computation described below and never participates in producing $a_t$, so the two downward branches in Figure~\ref{fig:saa-arch} are deliberately drawn as terminating in two unconnected outputs.
+
+\subsubsection{Why Actor and Critic Outputs Are Never Recombined}
+\label{sec:actor-critic-theory}
+
+A natural question, especially coming from value-based RL, is why the critic's value estimate is not added back into the actor's output to form the final action, the way a dueling network combines a state-value stream with an advantage stream into $Q(s,a) = V(s) + A(s,a) - \bar{A}(s)$. PPO, and actor-critic policy-gradient methods generally, do not follow this pattern, and the reason is more than convention.
+
+The two heads solve two different regression problems against two different targets. The actor parameterizes a probability distribution $\pi_\theta(a_t \vert s_t)$ over actions; PPO's clipped surrogate objective is defined purely through the probability ratio $\pi_\theta(a_t\vert s_t)/\pi_{\theta_{\text{old}}}(a_t\vert s_t)$ and requires that ratio to depend only on the current policy parameters. The critic regresses $V(s_t)$ toward an empirical return-to-go target for one purpose only: producing a lower-variance advantage estimate $\hat{A}_t = \hat{R}_t - V(s_t)$ for that same surrogate. $V(s_t)$ is a training-time variance-reduction baseline, not a candidate component of the emitted action; folding it into the action would make the executed trade depend on how well the value regression happens to have converged at that point in training, an entirely different and typically noisier optimization problem than the policy's own.
+
+Concretely, for the SAA, $V(s_t)$ is an unconstrained real number approximating a discounted sum of tanh-squashed rewards, with no reason to lie in $[-1,1]$; adding it to the actor's mean action would either require an ad hoc renormalization or would routinely push the executed target-position-change outside its valid range, injecting the critic's regression noise directly into a real trade and its transaction cost. For the PAA (Section~\ref{sec:paa-arch}), the argument is sharper and purely structural rather than just a matter of numerical hygiene: the critic there produces a single scalar per state, and adding that same scalar to every one of the $N$ asset logits before the softmax of Section~\ref{sec:action} would be mathematically inert, since softmax is shift-invariant, exactly the property already used to justify fixing the cash logit at zero. Recombining the two heads for the PAA would therefore not just be theoretically questionable; it would be a literal no-op wrapped around extra computation.
+
+Keeping the two heads' outputs disjoint costs nothing and buys a clean separation of concerns. The actor can be evaluated with the critic discarded entirely, exactly what happens for every frozen SAA copy in Section~\ref{sec:info-flow}, which reads only the actor's mean action and never instantiates a value estimate at inference time. The critic, symmetrically, can be reweighted (via \texttt{vf\_coef}) or even pretrained on offline Monte-Carlo targets without ever perturbing the executed action. This separation does not mean the two heads are fully independent, however; Section~\ref{sec:paa-arch}'s discussion of actor-critic interaction details the two indirect channels through which they still shape one another's training.
+
+\subsubsection{Dual-Recursion Logic}
+
+The SAA carries two nested notions of memory, and it is worth separating exactly what each one does for the credit-assignment problem, since \texttt{sb3-contrib}'s \texttt{RecurrentPPO} does not modify GAE itself. The LSTM's hidden and cell state provide within-episode memory of price dynamics: because the environment is stepped sequentially during rollout collection, with the hidden state carried forward one step at a time, the critic's value estimate $V(s_t)$ already reflects an implicit summary of everything the LSTM has seen so far in that episode, not just the current observation. GAE is then computed exactly as in standard, non-recurrent PPO: \texttt{RecurrentPPO} reuses \texttt{stable-baselines3}'s base rollout-buffer routine unmodified, running the usual backward recursion $A_t = \delta_t + (\gamma\lambda) A_{t+1}$ once over the full collected rollout (all $n_{\text{steps}}$ timesteps, across every parallel environment), masked at episode boundaries by the recorded \texttt{episode\_starts} flags. This advantage computation is never truncated or chunked; the delayed-reward attribution the differential-Sortino reward of Section~\ref{sec:reward} needs comes for free from this full-length recursion.
+
+What \emph{is} chunked is the optimization phase, and only the optimization phase. When \texttt{RecurrentPPO} re-evaluates log-probabilities and values to compute the PPO loss, it cannot simply replay the LSTM start-to-finish over an arbitrarily long, multi-episode rollout buffer; instead it cuts each parallel environment's contiguous rollout into per-episode sequences, pads them to equal length, and replays the LSTM per sequence with its hidden state correctly reset at every recorded episode start. Backpropagation-through-time is therefore bounded to one episode's length within the current rollout. This is a deliberate and harmless decoupling: the long-horizon credit assignment lives in the advantage targets, which were already computed from a critic that saw the full sequential trajectory; the truncated BPTT during optimization only has to correct the weights that produced that already-informed value estimate, not re-derive the horizon itself.
+
+\subsubsection{Training Dynamics and Stability}
+\label{sec:saa-stability}
+
+RecurrentPPO is sensitive to the balance between exploration and convergence speed. Learning rate, entropy coefficient, PPO clip range, and the action-limiting factor $\kappa_t$ all follow independent three-phase linear schedules (hold, ramp, hold), tuned to avoid two failure modes observed during development: early policy collapse into a long-only or short-only strategy when entropy decays too fast, and oscillatory, high-turnover behavior when $\kappa_t$ is annealed to its terminal value too early. A more structural risk is the one discussed in Section~\ref{sec:mdp}: a temporal extractor trained on a single, isolated sub-portfolio has never seen the transition dynamics induced by a second agent's independent trades. If the frozen SAA's recurrent state were updated from the live, PAA-controlled portfolio once deployed, exogenous rebalancing by the PAA would look, from the SAA's perspective, like a domain shift it was never trained to handle. Section~\ref{sec:info-flow} shows how the shadow-portfolio design sidesteps this by construction, rather than by regularization.
+
+\subsection{Layer 2: Cross-Sectional Allocator (Portfolio Allocator Agent)}
+\label{sec:paa-arch}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    node distance=7.2mm and 7.2mm,
+    tok/.style={draw, rounded corners, fill=black!5, minimum height=9mm, minimum width=30mm, align=left, font=\scriptsize, inner sep=2mm},
+    box/.style={draw, rounded corners, minimum height=8mm, minimum width=96mm, align=center, font=\small},
+    head/.style={draw, rounded corners, fill=black!10, minimum height=9mm, minimum width=34mm, align=center, font=\small},
+    arr/.style={-{Latex[length=2mm]}}
+]
+\node[tok] (t1) {\textbf{Asset token 1}\\[1mm]
+26 market feats.:\\
+1d/5d/21d $\times$ \{log\_close\_ret,\\
+z\_vol\_breakout, z\_rel\_log\_close,\\
+log\_vol\_intensity, norm\_vol\_feat.\}\\
+$+$ z\_log\_intra\_vol, norm\_closing\_\\
+strength, z\_log\_overnight\_gap,\\
+norm\_shadow\_ratio, atr\_z\_norm,\\
+rsi\_14, bb\_width\_reworked,\\
+z\_fisher\_corr\_spy, z\_market\_\\
+dispersion, z\_beta\_spy, norm\_ffd\\[1mm]
+$+$ SAA signal $a_t^{(1)}$\\
+$+$ shadow holding \% $\rho_t^{(1)}$\\
+$+$ live PAA weight $w_t^{(1)}$};
+\node[tok, right=of t1] (t2) {\textbf{Asset token $i$}\\[1mm] $(\cdots$ identical 26 feats.\\ $+\ a_t^{(i)} + \rho_t^{(i)} + w_t^{(i)})$};
+\node[tok, right=of t2] (t3) {\textbf{Asset token 11}\\[1mm] $(\cdots$ identical 26 feats.\\ $+\ a_t^{(11)} + \rho_t^{(11)} + w_t^{(11)})$};
+\node[tok, right=of t3] (tp) {\textbf{Portfolio token}\\[1mm]
+6 calendar: dow/dom/moy\\ $\times$ \{sin, cos\}\\[1mm]
+$+$ 12 live weights (cash $+$ 11)\\
+$+$ 14 portfolio metrics: alpha,\\
+sharpe, drawdown, volatility,\\
+turnover, concentration, prev./\\
+curr. sortino, running mean\\
+EMA, downside std, prev. max\\
+drawdown, rf z-score 60d, rf\\
+daily (excess), rf daily (raw)};
+\node[fit=(t1)(t2)(t3)(tp), inner sep=0pt] (tokrow) {};
+\node[box, below=13mm of tokrow] (embed) {\texttt{SAATokenizer}: Linear embed each token to $d_{\text{model}}{=}64$\\ + scaled learned asset-id embedding + LayerNorm};
+\node[box, below=of embed] (shared) {Shared \texttt{TransformerEncoder} (2 layers, 4 heads, Pre-LN, GELU)\\ self-attention across all $N{+}1$ tokens};
+\coordinate (branchrow) at ($(shared.south)+(0,-12mm)$);
+\node[head, anchor=east] (actorL) at (t1.east |- branchrow) {Private actor layer\\ (asset tokens only) $\to$ mean-pool};
+\node[head, anchor=west] (criticL) at (tp.west |- branchrow) {Private critic layer\\ (portfolio token only)};
+\node[head, below=of actorL] (actorH) {Actor head: $N$ logits $\mathbf{z}_t$\\ + fixed cash logit $0$ $\to$ softmax $\mathbf{w}_t$};
+\node[head, below=of criticL] (criticH) {Critic head: $V(s_t)$};
+\draw[arr] (t1) -- (embed);
+\draw[arr] (t2) -- (embed);
+\draw[arr] (t3) -- (embed);
+\draw[arr] (tp) -- (embed);
+\draw[arr] (embed) -- (shared);
+\draw[arr] (shared) -- (actorL);
+\draw[arr] (shared) -- (criticL);
+\draw[arr] (actorL) -- (actorH);
+\draw[arr] (criticL) -- (criticH);
+\end{tikzpicture}
+\caption{PAA information flow with explicit token contents. Every asset token carries the same 26 named \texttt{paa\_asset\_token\_features}, the injected SAA signal, the shadow sub-portfolio's own holding percentage, and the asset's current live PAA weight; the portfolio token carries 6 calendar features, the full live weight vector, and 14 running portfolio-risk metrics. All tokens are embedded to equal width, attend to one another in a shared transformer encoder, then diverge into private single-layer encoders, horizontally aligned with the asset/portfolio token span, that isolate actor and critic gradients before the final linear heads.}
+\label{fig:paa-arch}
+\end{figure}
+
+Figure~\ref{fig:paa-arch} shows the PAA's \texttt{AttentionEngine} with the token contents named explicitly, as configured in \texttt{paa\_asset\_token\_features} and \texttt{paa\_portfolio\_token\_features}. Each of the $N$ asset tokens is built from that asset's 26 selected market features (three time-horizon blocks of five features each, plus seven single-horizon indicators, all listed in the figure), the single scalar SAA signal for that asset (Section~\ref{sec:info-flow}), the corresponding shadow sub-portfolio's own holding percentage (Section~\ref{sec:info-flow}), and the asset's current \emph{live} PAA weight, for a 29-dimensional input to the token's embedding layer. The portfolio token is built from six calendar features and the full 26-dimensional live-portfolio block: the 12-entry live weight vector (cash plus 11 assets) and the 14 running metrics named in the figure (excess-return diagnostics, the Sortino EMA state, drawdown state, turnover, concentration, and the risk-free carry terms), for a 32-dimensional input. A learned per-asset identity embedding, scaled by a small trainable gate and added before a LayerNorm, lets the network distinguish assets without the identity signal overwhelming the market-derived content of the token, an issue that surfaced early in development when an unscaled identity embedding dominated the token representation. All $N+1$ tokens then pass through a shared, two-layer \texttt{TransformerEncoder} so that every asset's representation can be conditioned on every other asset and on the live portfolio's own state, i.e., cross-sectional attention.
+
+The architecture then deliberately splits. Rather than reading the actor and critic heads directly off the shared encoder's output, each head gets its own single \texttt{TransformerEncoderLayer} that only ever receives gradient from its own loss. The actor's private layer only sees the $N$ asset tokens (mean-pooled afterwards into the policy's latent vector); the critic's private layer only sees the portfolio token. This absorbs the well-known tendency of actor and critic losses to pull a shared trunk in conflicting directions before that conflict reaches the (much more expensive to retrain) shared attention stack. The actor head's $N$ raw logits are combined with the fixed cash anchor and passed through the softmax of Section~\ref{sec:action} to produce the executed target weights; the critic head reads only the portfolio token into a single scalar value estimate.
+
+\subsubsection{Actor-Critic Interaction}
+
+As formalized in Section~\ref{sec:actor-critic-theory}, adding the critic's scalar value estimate to every asset logit before the softmax of Section~\ref{sec:action} would change nothing about the resulting weights at all, since softmax is shift-invariant; recombining the heads here would therefore be mathematically inert, not merely unconventional. There is, deliberately, no direct connection between the actor and critic heads: neither reads the other's output, and at inference time the value estimate has no causal path to the executed action, mirroring the SAA's actor/critic separation in Figure~\ref{fig:saa-arch}. The two heads interact only through two indirect channels. First, both private encoder layers are downstream of the same shared, two-layer \texttt{TransformerEncoder}; gradients from the policy loss and from the value loss both flow into that shared trunk's weights, so a representation collapse driven by one loss can, in principle, degrade the other. This is precisely the risk the private per-head layers of Section~\ref{sec:paa-arch} are designed to absorb: they let the two losses disagree at the last layer without forcing that disagreement all the way back into the expensive shared attention stack every update. Second, the two losses are combined into a single scalar by PPO's objective, $L = L_{\text{policy}} - c_1 L_{\text{value}} + c_2 L_{\text{entropy}}$, so the critic still shapes the actor's training indirectly through the advantage estimates $\hat{A}_t = R_t - V(s_t)$ used inside $L_{\text{policy}}$: a miscalibrated critic yields a noisy or biased advantage signal, which is the standard way actor-critic methods couple even when their network paths are otherwise disjoint. Xavier initialization with GPT-2-style residual-branch scaling is applied specifically to the shared trunk to keep this coupling numerically stable as depth increases.
+
+\subsection{Information Flow: Shadow Portfolios as the SAA-PAA Interface}
+\label{sec:info-flow}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    node distance=5mm and 8mm,
+    lane/.style={draw, rounded corners, fill=black!5, minimum height=8mm, minimum width=40mm, align=center, font=\footnotesize},
+    saabox/.style={draw, rounded corners, fill=black!15, minimum height=8mm, minimum width=40mm, align=center, font=\footnotesize},
+    arr/.style={-{Latex[length=1.8mm]}},
+    every node/.style={font=\footnotesize}
+]
+% Lane 1
+\node (l1top) {Asset 1};
+\node[lane, below=of l1top] (shadow1) {Shadow sub-portfolio 1\\ cash$_1$, shares$_1$ (isolated)};
+\node[lane, below=of shadow1] (obs1) {Rebuild SAA obs.\\ market feats. + memory$_1$ + id$_1$};
+\node[saabox, below=of obs1] (saa1) {Frozen SAA\\ LSTM state row $r{=}1$};
+\node[lane, below=of saa1] (sig1) {Signal $a_t^{(1)} = \kappa \cdot \hat{a}^{(1)}$\\ Shadow weight $\rho_t^{(1)}$};
+% Lane i
+\node[right=18mm of l1top] (litop) {Asset $i$ ($\cdots$)};
+\node[lane, below=of litop] (shadowi) {Shadow sub-portfolio $i$\\ cash$_i$, shares$_i$ (isolated)};
+\node[lane, below=of shadowi] (obsi) {Rebuild SAA obs.\\ market feats. + memory$_i$ + id$_i$};
+\node[saabox, below=of obsi] (saai) {Frozen SAA (shared weights)\\ LSTM state row $r{=}i$};
+\node[lane, below=of saai] (sigi) {Signal $a_t^{(i)} = \kappa \cdot \hat{a}^{(i)}$\\ Shadow weight $\rho_t^{(i)}$};
+% Lane N
+\node[right=18mm of litop] (lNtop) {Asset $11$};
+\node[lane, below=of lNtop] (shadowN) {Shadow sub-portfolio 11\\ cash$_{11}$, shares$_{11}$ (isolated)};
+\node[lane, below=of shadowN] (obsN) {Rebuild SAA obs.\\ market feats. + memory$_{11}$ + id$_{11}$};
+\node[saabox, below=of obsN] (saaN) {Frozen SAA (shared weights)\\ LSTM state row $r{=}11$};
+\node[lane, below=of saaN] (sigN) {Signal $a_t^{(11)} = \kappa \cdot \hat{a}^{(11)}$\\ Shadow weight $\rho_t^{(11)}$};
+% PAA box spanning all lanes
+\node[draw, rounded corners, fill=black!10, minimum width=132mm, minimum height=12mm, below=10mm of sigi, align=center] (paa) {PAA \texttt{SAATokenizer} injects $a_t^{(i)}$ and $\rho_t^{(i)}$ into asset token $i$ $\to$ \texttt{AttentionEngine} $\to$ live portfolio weights $\mathbf{w}_t$};
+\draw[arr] (shadow1) -- (obs1);
+\draw[arr] (obs1) -- (saa1);
+\draw[arr] (saa1) -- (sig1);
+\draw[arr] (sig1.south) .. controls +(-23mm,-16mm) and +(-6mm,6mm) .. (shadow1.west |- sig1) node[midway, left, xshift=-5mm, yshift=9mm] {commit shadow trade};
+\draw[arr] (shadowi) -- (obsi);
+\draw[arr] (obsi) -- (saai);
+\draw[arr] (saai) -- (sigi);
+\draw[arr] (shadowN) -- (obsN);
+\draw[arr] (obsN) -- (saaN);
+\draw[arr] (saaN) -- (sigN);
+\draw[arr] (sig1) -- (paa.north -| sig1);
+\draw[arr] (sigi) -- (paa.north -| sigi);
+\draw[arr] (sigN) -- (paa.north -| sigN);
+\end{tikzpicture}
+\caption{Shadow-portfolio signal generation. One frozen SAA (shared weights, one LSTM state per asset row) trades an isolated, hypothetical sub-portfolio for every asset in parallel. Only the resulting scalar action and the shadow book's own holding percentage, never the shadow book itself, cross into the PAA's asset tokens; the live, PAA-controlled portfolio never touches any SAA's recurrent state.}
+\label{fig:shadow-flow}
+\end{figure}
+
+Figure~\ref{fig:shadow-flow} shows the mechanism that turns one trained SAA into $N$ independent advisors. A single frozen \texttt{RecurrentPPO} policy is evaluated in one batched forward pass per environment step, with the $N$ assets stacked into $N$ rows; each row carries its own LSTM state, indexed consistently across steps, so the batching is computationally convenient but behaviorally identical to running $N$ separate agents. Each row also owns a private, hypothetical \emph{shadow sub-portfolio}, cash and share count that exist only for that row and mirror exactly what would have happened had the SAA traded that one asset alone since the start of the episode. Every step, the row's observation is rebuilt from that asset's raw market features and from memory features computed against its own shadow book, never against the live portfolio; the frozen policy is queried deterministically; and the resulting raw action, rescaled by the same action-limiting factor the SAA was trained with, (a) executes a trade against the shadow book, so it stays correctly marked to market for the next step, and (b) is emitted as the scalar signal $a_t^{(i)}$ that is written into asset token $i$ (Section~\ref{sec:paa-arch}). Alongside it, the shadow book's own holding percentage $\rho_t^{(i)} = (\text{shadow shares}_i \cdot \text{price}_i) / (\text{shadow cash}_i + \text{shadow shares}_i \cdot \text{price}_i)$ is computed purely from that row's isolated shadow state and injected as a second per-asset signal, distinct from the asset token's other weight field, the asset's current \emph{live} PAA weight $w_t^{(i)}$, which is read from the environment's own portfolio state, not from the shadow book. The portfolio token, by contrast, is unambiguous: it carries the actual live-traded PAA portfolio's weights and risk metrics only, and never sees any shadow-portfolio state.
+
+This design directly resolves the domain-shift concern raised in Section~\ref{sec:saa-stability}. Because the shadow sub-portfolios never observe the live portfolio's cash, weights, or trades, the SAA's recurrent state can never be perturbed by the PAA's decisions; from every SAA copy's point of view, it is still playing the exact single-asset game it was trained on. The PAA, in turn, receives the SAA's opinion as an ordinary feature, alongside raw market data and the asset's live weight, and is free to trust, discount, or override it. Section~\ref{sec:paa-arch}'s attention mechanism is what actually performs that weighting; the shadow-portfolio wrapper's only job is to deliver a clean, undistorted signal for it to weigh.
+
+\subsection{Simulator Design}
+\label{sec:simulator}
+
+The simulator is a single Gymnasium-compliant environment (\texttt{TradingEnv}) with four execution modes controlled by configuration rather than by subclassing: a single-asset target-position mode used to train the SAA, a portfolio-weights mode used to train the PAA, and two instruction-list modes (simple and tranche execution) reserved for manual or scripted trading experiments outside of the RL loop. A \texttt{MarketDataCache} precomputes and memory-maps the entire feature panel once per run, so that repeated episode resets during training never re-run feature engineering; an \texttt{EpisodeBuffer} records every step's prices, weights, and portfolio metrics for the reward and observation functions to read back a rolling window from, without recomputation. Episodes are sampled from contiguous, non-overlapping date blocks that are split once into train, validation, and test partitions at the block level (not at the individual-day level), so that no walk-forward evaluation ever trains and validates on adjacent, correlated days from the same block.
+
+The split itself is constructed once, by \texttt{MarketDataCache.\_create\_time\_series\_blocks}, directly on the full, continuous date range, before any episode is ever sampled. It is not a single chronological cut into three pieces; it repeats a purged train/validation cycle,
+
+\begin{equation}
+[\text{train}_0][\text{purge}][\text{val}_0]\,[\text{train}_1][\text{purge}][\text{val}_1]\,\cdots\,[\text{purge}][\text{test}],
+\end{equation}
+
+across the available history, with a configurable target validation share (here $20\%$ of every train\,+\,validation super-block, \texttt{train\_val\_split\_ratio}) and a fixed-length purge gap ($60$ trading days, \texttt{purge\_length\_days}) inserted between each training block and the validation block that follows it. A single out-of-sample test block is then held out at the very end of the date range, itself preceded by one more purge gap. Block boundaries, not individual days, are the unit of assignment: every training, validation, and test episode is sampled (\texttt{sample\_episode\_start}, weighted by each block's day count so short and long blocks contribute proportionally) from entirely within one block, and an episode's full length (252 trading days, \texttt{episode\_length\_days}) is always contained inside that block's date range, never straddling a purge gap or a block boundary.
+
+The purge gap is not a cosmetic buffer; it is sized against the same rolling-window features described in Sections~\ref{sec:state-returns} and~\ref{sec:state-ffd}. Every engineered feature is computed once, causally, over the full continuous time series, using only backward-looking windows of up to $w_{\text{norm}}=36$ days (and, for the fractionally differentiated feature, up to $\ell^{\ast}\le 120$ days). Without a gap at least as wide as the longest such window, the first days of a validation block would carry features whose rolling statistics were computed partly from data inside the immediately preceding training block, letting information the model was fitted on leak into the observations it is being evaluated on, exactly the mechanism L{\'o}pez de Prado \cite{LopezdePrado.2018} identifies as the reason ordinary $k$-fold cross-validation fails on financial time series: samples are serially correlated and overlap through shared lookback windows, so a random, non-contiguous split systematically overstates out-of-sample performance. The $60$-day purge used here exceeds the dominant $36$-day feature window with margin to spare; the FFD feature's rarely-approached $120$-day cap is the one place this margin is not formally guaranteed, which is worth flagging as an assumption rather than a proof. No purge is inserted on the reverse edge, between a validation block and the following training block, because the risk purging defends against is asymmetric: it is validation (and test) performance, not training loss, that this thesis reports and selects checkpoints on, so only training-into-evaluation leakage needs to be closed off.
+
+This design follows López de Prado's broader prescription for backtesting DRL and other sequential trading systems on a purpose-built simulator \cite{LopezdePrado.2018}: chronological, purged, block-level splitting in place of shuffled cross-validation; several validation blocks spread across the full history rather than one arbitrary cutoff, so that validation performance reflects multiple market regimes (e.g., the dot-com decline, the 2008 crisis, and the 2020 crash all fall inside different blocks of the 2000--2025 range used here) instead of a single one; and a final test block that is touched exactly once. Model and checkpoint selection throughout this thesis (Section~\ref{sec:reward}) use validation-block metrics only, never the test block, so the reported test-set result is a single, final, previously-unseen evaluation rather than the best of several attempts against the same data, the specific failure mode López de Prado terms backtest overfitting. This implementation uses repeated purged train/validation cycles rather than his full Combinatorial Purged Cross-Validation (CPCV): CPCV's combinatorial fold count would make an already expensive PPO training run intractable to repeat many times over, and repeatedly re-running full training against many combinatorial folds would itself reintroduce a version of the same overfitting risk it is meant to prevent. The scheme adopted here is best read as the practical, purged walk-forward compromise López de Prado himself allows for settings where full CPCV is computationally out of reach.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    node distance=6mm and 10mm,
+    cpu/.style={draw, rounded corners, fill=black!5, minimum height=9mm, minimum width=48mm, align=center, font=\small},
+    gpu/.style={draw, rounded corners, fill=black!12, minimum height=9mm, minimum width=48mm, align=center, font=\small},
+    grp/.style={draw, dashed, rounded corners, inner sep=3mm},
+    arr/.style={-{Latex[length=2mm]}}
+]
+\node[cpu] (cache) {\texttt{MarketDataCache}\\ (feature panel, once per run)};
+\node[cpu, below=of cache] (envs) {$k$ $\times$ \texttt{TradingEnv} in \texttt{SubprocVecEnv}\\ (one OS process per worker)};
+\node[cpu, below=of envs] (norm) {\texttt{VecNormalize}\\ (running obs/reward statistics)};
+\node[gpu, below=of norm] (wrapper) {\texttt{SAASignalWrapper}\\ batches obs across all (env, asset) rows};
+\node[gpu, below=of wrapper] (saa) {Frozen SAA policy on GPU\\ one batched forward pass, $k{\times}N$ rows};
+\node[gpu, below=of saa] (ppo) {PAA \texttt{AttentionEngine} (PPO policy) on GPU\\ batched forward/backward across $k$ envs};
+\node[cpu, below=of ppo] (step) {\texttt{env.step()} back in each worker process\\ execution, cost model, reward, bookkeeping};
+\draw[arr] (cache) -- (envs);
+\draw[arr] (envs) -- (norm);
+\draw[arr] (norm) -- (wrapper);
+\draw[arr] (wrapper) -- (saa);
+\draw[arr] (saa) -- (ppo);
+\draw[arr] (ppo) -- (step);
+\draw[arr] (step.east) .. controls +(30mm,0) and +(30mm,0) .. (envs.east);
+\begin{scope}[on background layer]
+\node[grp, fit=(cache)(envs)(norm)(step), label={[font=\small]above:CPU: many cheap, independent workers}] {};
+\node[grp, fit=(wrapper)(saa)(ppo), label={[font=\small]right:GPU: few, large, regular tensor ops}] {};
+\end{scope}
+\end{tikzpicture}
+\caption{Class interaction and hardware placement of the simulator/training loop for PAA training (equivalent to a high-level component diagram). Environment simulation is deliberately kept on CPU workers; every neural forward/backward pass is batched across environments (and, for the frozen SAA, across assets) into large GPU tensor operations before control returns to the CPU-side environments.}
+\label{fig:sim-classes}
+\end{figure}
+
+Figure~\ref{fig:sim-classes} makes explicit why this split between CPU and GPU work matters on a CUDA-enabled machine, beyond the generic "neural networks like GPUs" argument. Environment logic (trade execution, the cost model of Section~\ref{sec:friction}, reward bookkeeping) is scalar, branch-heavy, and cheap; running it on a GPU would waste the device's parallelism on work it is not shaped for, so each \texttt{SubprocVecEnv} worker keeps this logic on its own CPU process, and $k$ workers advance $k$ independent episodes concurrently. Every neural network evaluation, by contrast, is deliberately batched before it touches the GPU: \texttt{SAASignalWrapper} stacks the $k$ parallel environments' $N$ assets into a single $(k \cdot N)$-row tensor and queries the frozen SAA once per environment step, rather than once per asset; the PAA's own \texttt{AttentionEngine} likewise processes all $k$ environments' token sequences in one batched forward (and, during optimization, backward) pass. This turns what would otherwise be $k \cdot (N{+}1)$ small, latency-bound calls per step into two large, regular matrix multiplications, which is exactly the workload profile a GPU is built for. The net effect is that the expensive part of the pipeline (two neural networks, one of them evaluated per-asset) is amortized over a single batched CUDA call per step, while the cheap part (environment transition dynamics) stays where it is fast: on ordinary CPU cores, in parallel, never blocking on the GPU except to hand off and receive back a batch of observations and actions.
+
+\subsection{Friction Modeling}
+\label{sec:friction}
+
+Every executed trade pays three cost components, all proportional to traded notional, plus an optional fixed per-order fee:
+
+\begin{equation}
+\text{TC}_t = \underbrace{c_{\text{comm}} \sum_j n_j}_{\text{commission}} + \underbrace{c_{\text{spread}} \sum_j n_j}_{\text{half-spread}} + \underbrace{\lambda_{\text{impact}} \sum_j n_j \sqrt{\tfrac{n_j}{\text{ADV}_j}}}_{\text{market impact}} + f_{\text{fixed}} \cdot \#\{\text{orders}\},
+\end{equation}
+
+where $n_j$ is the traded notional for asset $j$ and $\text{ADV}_j$ is that asset's trailing average daily dollar volume over a configurable window. The square-root impact term is standard in market-microstructure practice: impact grows sublinearly in trade size relative to available liquidity, so a trade that is small relative to an asset's typical volume costs much less per dollar than one that is not. Commission and half-spread rates and the impact coefficient are independently configurable per experiment; setting all three to zero recovers a frictionless environment useful for isolating whether a policy change affects raw signal quality or only realized net returns after costs.
+
+\subsection{Asset Universe}
+\label{sec:universe}
+
+The current universe spans 11 liquid, exchange-traded instruments covering equities, a commodity complex, and precious metals: SPY (US equities), EWG, EWH, EWJ, EWQ, EWS, EWT, EWU, and EWY (Germany, Hong Kong, Japan, France, Singapore, Taiwan, the UK, and South Korea equities, respectively), Crude oil, and Gold. Every one of these eleven instruments is a USD-denominated, US-exchange-listed vehicle: the country ETFs are iShares MSCI products quoted and settled in dollars on US exchanges, not local-currency instruments on their respective home markets, and Crude and Gold are likewise tracked through USD-quoted contracts. The simulator's data pipeline includes a general-purpose FX-conversion step precisely so that a future, more geographically diverse universe could mix local-currency instruments, but for this concrete 11-asset universe every entry in the currency map already resolves to USD, so that conversion step is a documented no-op here rather than an active part of the pipeline.
+
+This choice of universe serves the thesis's research question directly. Restricting the universe to already-USD-denominated instruments removes currency risk as a confounding factor: any cross-asset structure the PAA's attention mechanism discovers can be attributed to genuine co-movement in the underlying assets, not to an artifact of an FX conversion the model never has to reason about. All eleven instruments are ETFs or exchange-traded futures/ETCs rather than single stocks, which avoids single-name idiosyncratic risk and corporate-action noise (splits, spin-offs, individual earnings surprises) that a single-stock universe would otherwise force the feature-engineering layer to absorb. Each instrument also has a long, continuously liquid daily history spanning the 2000--2025 window used throughout this thesis, which is a precondition for the rolling-window statistics of Section~\ref{sec:state} to be well-estimated from the earliest usable episode onward. Finally, the eleven instruments were chosen for cross-sectional \emph{diversity}, not for any expected relative-value relationship between specific pairs: equities from seven distinct regions, a broad commodity, and a traditional safe-haven metal give the PAA a universe in which regime-dependent co-movement (e.g., regional equity indices moving together while gold diverges in risk-off periods) is plausible but not hand-engineered into the reward or the features. A genuinely useful cross-sectional allocator should be able to discover that structure through attention, rather than have it handed to it.

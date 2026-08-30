@@ -2804,6 +2804,9 @@ class TradingEnv(gym.Env):
         portfolio_value_before = self.portfolio_state.get_total_value()
         benchmark_portfolio_value_before = self.benchmark_portfolio_state.get_total_value()
         comparison_portfolio_value_before = self.comparison_portfolio_state.get_total_value()
+        # SPY buy-and-hold reference (pays its own init transaction costs, then never trades again).
+        # This is the PAA reward's actual excess-return counterfactual, not comparison_portfolio_state.
+        spy_bh_value_before = self.selected_asset_bh_portfolio_state.get_total_value()
         live_portfolio_cash_before = self.portfolio_state.cash
 
         trade_results: List[Dict[str, Any]] = []
@@ -3056,6 +3059,7 @@ class TradingEnv(gym.Env):
         portfolio_value_after = self.portfolio_state.get_total_value()
         benchmark_portfolio_value_after = self.benchmark_portfolio_state.get_total_value()
         comparison_portfolio_value_after = self.comparison_portfolio_state.get_total_value()
+        spy_bh_value_after = self.selected_asset_bh_portfolio_state.get_total_value()
 
         # SAA return: change in cash + target asset return 
         "NOTE: only meaningful in single-asset mode"
@@ -3087,8 +3091,8 @@ class TradingEnv(gym.Env):
                 execution_result=execution_result,
                 portfolio_before=portfolio_value_before,
                 portfolio_after=portfolio_value_after,
-                comparison_before=comparison_portfolio_value_before,
-                comparison_after=comparison_portfolio_value_after,
+                spy_bh_before=spy_bh_value_before,
+                spy_bh_after=spy_bh_value_after,
                 benchmark_before=benchmark_portfolio_value_before,
                 benchmark_after=benchmark_portfolio_value_after,
                 action=(weight_change_target if self.execution_mode == EXECUTION_PORTFOLIO_WEIGHTS else None)
@@ -3552,7 +3556,7 @@ class TradingEnv(gym.Env):
 
     def calculate_allocator_step_reward(
             self, execution_result: ExecutionResult, portfolio_before,
-            portfolio_after, comparison_before, comparison_after, benchmark_before, benchmark_after, action: np.ndarray
+            portfolio_after, spy_bh_before, spy_bh_after, benchmark_before, benchmark_after, action: np.ndarray
             ) -> Tuple[float, Dict[str, float]]:
         """
         Calculate the allocator (PAA) reward for this step.
@@ -3567,7 +3571,10 @@ class TradingEnv(gym.Env):
         Args:
             execution_result: Result of the trade execution step
             portfolio_before/after: Live portfolio value before/after this step's price move
-            comparison_before/after: Static buy-and-hold-from-same-init reference portfolio value
+            spy_bh_before/after: 100%-invested SPY buy-and-hold portfolio value (pays its own
+                init transaction costs, then never trades again); this is the PAA's excess-return
+                counterfactual, NOT comparison_portfolio_state (which stays a separate, purely
+                diagnostic "do-nothing clone of the live portfolio's own start" tracked elsewhere).
             benchmark_before/after: Fixed custom-weights benchmark portfolio value
             action: Target portfolio weights [num_assets + 1] including cash (PORTFOLIO_WEIGHTS only)
         Returns:
@@ -3631,12 +3638,12 @@ class TradingEnv(gym.Env):
         drawdown_level_penalty = float(self.paa_drawdown_level_penalty_coeff * current_drawdown_level)
         self.episode_peak_value = float(max(peak_before, float(portfolio_after)))
 
-        # Core objective: outperform the static comparison portfolio from the same random init
+        # Core objective: outperform a 100%-invested, transaction-cost-paying SPY buy-and-hold
         # (the PAA's "passive benchmark", analogous to the SAA's same-asset buy-and-hold).
         eps = 1e-12
         port_log_ret = np.log(max(float(portfolio_after), eps)) - np.log(max(float(portfolio_before), eps))
-        comp_log_ret = np.log(max(float(comparison_after), eps)) - np.log(max(float(comparison_before), eps))
-        excess_log_ret = port_log_ret - comp_log_ret
+        spy_bh_log_ret = np.log(max(float(spy_bh_after), eps)) - np.log(max(float(spy_bh_before), eps))
+        excess_log_ret = port_log_ret - spy_bh_log_ret
         excess_return_scaled = float(self.paa_excess_log_return_scale * excess_log_ret)
 
         # Execution-gap penalty and realized-profit exit bonus: portfolio-weights mode only,
