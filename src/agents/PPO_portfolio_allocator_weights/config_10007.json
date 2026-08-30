@@ -215,14 +215,14 @@
 
     "training": {
         "seed": 42,
-        "total_timesteps": 10000000,
+        "n_envs": 8,
+        "vec_env_start_method": "spawn",
+        "total_timesteps": 4000000,
         "train_log_freq": 10,
         "eval_freq": 50000,
-        "n_eval_episodes": 30,
         "patience": 10,
         "min_delta_reward": 0.0,
         "min_delta_sharpe": 0.0,
-        "eval_deterministic": true,
         "progress_bar": true,
         "config_id": 10007,
         "tensorboard_log": "src/agents/PPO_portfolio_allocator_weights/tb_logs"

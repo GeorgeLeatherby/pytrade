@@ -658,6 +658,17 @@ class EpisodeBuffer:
 
         return observation
     
+    def ensure_capacity(self, required_buffer_size_days: int) -> None:
+        """
+        Grow the pre-allocated arrays if a longer episode is requested (e.g. a full validation
+        block). Never shrinks, so repeated episodes reuse the largest allocation seen so far.
+        """
+        required = int(required_buffer_size_days)
+        if required <= self.episode_buffer_length_days:
+            return
+        self.episode_buffer_length_days = required
+        self.__post_init__()
+
     def reset_episode_buffer(self) -> None:
         """
         Reset buffer for new episode.
@@ -1915,6 +1926,7 @@ class TradingEnv(gym.Env):
         self.current_step = None
         self.current_episode = None
         self.current_absolute_step = None
+        self.current_episode_length = int(self.episode_length_days)  # may be overridden per reset()
         self.last_execution_step = -1
   
         # Create portfolio state instance. Correct values will be filled in reset and step!
@@ -1953,6 +1965,16 @@ class TradingEnv(gym.Env):
             terminated=False
         )
         self.selected_asset_bh_init_transaction_cost = 0.0  # Track initialization cost for selected asset BH
+
+        # In allocator mode the selected-asset BH tracker doubles as the SPY buy-and-hold reference.
+        self.spy_asset_index = None
+        if self.execution_mode == EXECUTION_PORTFOLIO_WEIGHTS:
+            if "SPY" not in self.market_data_cache.asset_to_index:
+                raise ValueError(
+                    "PORTFOLIO_WEIGHTS mode requires 'SPY' in the asset universe for the "
+                    "SPY buy-and-hold validation reference."
+                )
+            self.spy_asset_index = int(self.market_data_cache.asset_to_index["SPY"])
 
         # Create EpisodeBuffer instance. Only pass required arguments; __post_init__ will handle array initialization.
         if self.maybe_provide_sequence:
@@ -2162,6 +2184,28 @@ class TradingEnv(gym.Env):
 
         # Calculate absolute step in full dataset. Very important for correct market data retrieval!
         self.current_absolute_step = int(self.current_episode_start_step + self.current_step)
+
+        # Deterministic validation sweeps run one episode per full block, which is longer than
+        # the configured episode_length_days, so the buffer may have to grow.
+        length_override = None if option is None else option.get("episode_length_override", None)
+        if length_override is not None:
+            self.current_episode_length = int(length_override)
+            if self.current_episode_length < 2:
+                raise ValueError(f"episode_length_override must be >= 2, got {self.current_episode_length}")
+            max_available = int(self.market_data_cache.num_days - self.current_episode_start_step)
+            if self.current_episode_length > max_available:
+                raise ValueError(
+                    f"episode_length_override={self.current_episode_length} exceeds available days "
+                    f"({max_available}) from start step {self.current_episode_start_step}"
+                )
+        else:
+            self.current_episode_length = int(self.episode_length_days)
+
+        required_buffer_size_days = (
+            self.lookback_window + self.current_episode_length
+            if self.maybe_provide_sequence else self.current_episode_length
+        )
+        self.episode_buffer.ensure_capacity(required_buffer_size_days)
 
         # Reset episode buffer
         self.episode_buffer.reset_episode_buffer() # fills buffer with 0s
@@ -2453,6 +2497,27 @@ class TradingEnv(gym.Env):
                 terminated=False
             )
             self.selected_asset_bh_init_transaction_cost = bh_init_tc
+        elif self.execution_mode == EXECUTION_PORTFOLIO_WEIGHTS:
+            # Allocator mode: reuse this tracker as a pure SPY buy-and-hold reference.
+            bh_target_positions = np.zeros(num_assets, dtype=np.float32)
+            bh_target_positions[self.spy_asset_index] = self.initial_portfolio_value / initial_prices[self.spy_asset_index]
+
+            bh_cash, bh_positions, bh_init_tc = self._initialize_portfolio_with_costs(
+                target_positions=bh_target_positions,
+                initial_prices=initial_prices,
+                initial_value=self.initial_portfolio_value,
+                allow_cash_residual=True,
+                max_iterations=10
+            )
+
+            self.selected_asset_bh_portfolio_state.portfolio_reset(
+                cash=bh_cash,
+                positions=bh_positions,
+                prices=initial_prices,
+                step=self.current_step,
+                terminated=False
+            )
+            self.selected_asset_bh_init_transaction_cost = bh_init_tc
         else:
             # Non-SAA mode: initialize to empty
             self.selected_asset_bh_portfolio_state.portfolio_reset(
@@ -2634,6 +2699,27 @@ class TradingEnv(gym.Env):
         )
         # Refresh the cached "previous sub-portfolio value" so next step's MTM uses post-trade state
         self._saa_sub_prev_value = (cash + shares * prices).astype(np.float32)
+
+    def get_saa_signal_inputs(self) -> Dict[str, np.ndarray]:
+        """
+        Per-asset state the allocator's SAASignalWrapper needs to rebuild SAA training
+        observations. Returned as a bundle so it survives one SubprocVecEnv round trip.
+        """
+        cash, shares, last_action, daily_return = self.episode_buffer.get_saa_sub_state(self.current_step)
+        return {
+            "cash": np.asarray(cash, dtype=np.float32).copy(),
+            "shares": np.asarray(shares, dtype=np.float32).copy(),
+            "last_action": np.asarray(last_action, dtype=np.float32).copy(),
+            "daily_return": np.asarray(daily_return, dtype=np.float32).copy(),
+            "prices": np.asarray(self.portfolio_state.prices, dtype=np.float32).copy(),
+            "rf_zscore": np.float32(
+                self.market_data_cache.get_risk_free_rate_zscore_at_step(self.current_absolute_step)
+            ),
+            "excess_log_return_over_rf": np.asarray(
+                self.market_data_cache.get_all_assets_excess_log_return_over_rf_at_step(self.current_absolute_step),
+                dtype=np.float32,
+            ).copy(),
+        }
 
     def _get_info(self):
         """Get info dictionary for current step."""
@@ -3126,7 +3212,7 @@ class TradingEnv(gym.Env):
             # Print all triggered reasons together
             print(f"Episode {self.current_episode} terminated early due to: " + "; ".join(reasons))
         
-        truncated = self.current_step >= self.episode_length_days -1  # step limit reached in days
+        truncated = self.current_step >= self.current_episode_length - 1  # step limit reached in days
         self.portfolio_state.terminated = terminated or truncated
         
         # Prepare info
@@ -3331,6 +3417,20 @@ class TradingEnv(gym.Env):
             bh_base = max(abs(final_selected_asset_bh_value), 1e-12)
             pv_minus_selected_asset_bh_pct_base = float(pv_minus_selected_asset_bh_abs / bh_base)
 
+            # Allocator validation metrics: terminal PnL and excess over a pure SPY buy-and-hold.
+            terminal_pnl_abs = float(final_portfolio_value - self.initial_portfolio_value)
+            if self.execution_mode == EXECUTION_PORTFOLIO_WEIGHTS:
+                spy_bh_final_value = final_selected_asset_bh_value
+                spy_bh_return = float(spy_bh_final_value / self.initial_portfolio_value - 1.0)
+                excess_return_over_spy_abs = float(final_portfolio_value - spy_bh_final_value)
+                excess_return_over_spy_pct = float(port_ret - spy_bh_return)
+                info.update({
+                    "spy_bh_final_value": spy_bh_final_value,
+                    "spy_bh_return": spy_bh_return,
+                    "excess_return_over_spy_abs": excess_return_over_spy_abs,
+                    "excess_return_over_spy_pct": excess_return_over_spy_pct,
+                })
+
 
             # Populate info dictionary with episode metrics
             info.update({
@@ -3341,6 +3441,7 @@ class TradingEnv(gym.Env):
                 "benchmark_final_value": final_benchmark_value,
                 "comparison_final_value": final_comparison_value,
                 "portfolio_return": port_ret,
+                "terminal_pnl_abs": terminal_pnl_abs,
                 "benchmark_return": bench_ret,
                 "comparison_return": comparison_ret,
                 "alpha_return": alpha_ret,

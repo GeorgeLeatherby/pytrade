@@ -41,7 +41,7 @@ from stable_baselines3.common.policies import ActorCriticPolicy
 # from stable_baselines3.common.distributions import Normal
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.vec_env import (
-    VecNormalize, DummyVecEnv, VecEnvWrapper, VecEnv, sync_envs_normalization
+    VecNormalize, DummyVecEnv, SubprocVecEnv, VecEnvWrapper, VecEnv, sync_envs_normalization
 )
 from stable_baselines3.common.evaluation import evaluate_policy
 
@@ -107,772 +107,462 @@ def _normalize_obs_with_vecnormalize(obs: np.ndarray, vecnorm: VecNormalize) -> 
 
 class AllocatorPortfolioLoggerCallback(BaseCallback):
     """
-    Logs allocator-specific portfolio metrics to TensorBoard per episode.
-    
-    Integration:
-    - Called by SB3 during training after each environment step
-    - Checks for episode completion via info dict
-    - Logs portfolio metrics with throttling (every N episodes)
-    - Uses model.logger.record() to write to TensorBoard
-    
-    Metrics Logged:
-    - Portfolio value (final, comparison, benchmark)
-    - Portfolio return and Sharpe ratio
-    - Max drawdown and volatility
-    - Turnover and transaction costs
-    - Asset allocation statistics
-    - Reward components (if available)
+    Aggregates allocator portfolio metrics from every parallel env and emits their means
+    to TensorBoard every `log_freq` rollouts.
     """
+
+    _METRIC_KEYS = (
+        "portfolio_final_value",
+        "comparison_final_value",
+        "benchmark_final_value",
+        "portfolio_return",
+        "terminal_pnl_abs",
+        "episode_sharpe",
+        "episode_max_drawdown",
+        "episode_volatility",
+        "total_turnover",
+        "avg_turnover",
+        "total_transaction_costs",
+        "episode_cost_commission",
+        "episode_cost_spread",
+        "episode_cost_impact",
+        "exposure_start",
+        "exposure_avg",
+        "exposure_end",
+        "shadow_return",
+        "weights_mean",
+        "weights_max",
+        "weights_min",
+        "weights_median",
+        "cumulative_reward",
+        "sortino_mean_ema",
+        "sortino_downside_ema",
+        "alpha_return",
+        "excess_return_over_spy_abs",
+        "excess_return_over_spy_pct",
+    )
 
     def __init__(self, tag_prefix: str = "train", log_freq: int = 10, verbose: int = 0):
         """
-        Initialize callback.
-        
         Args:
             tag_prefix: TensorBoard metric prefix (e.g., "train")
-            log_freq: Log every N completed episodes (throttling to reduce TB overhead)
+            log_freq: Emit aggregated metrics every N rollouts
             verbose: Verbosity level (0=silent, 1=info, 2=debug)
         """
         super().__init__(verbose)
-        
+
         self.tag_prefix = tag_prefix
-        self.log_freq = log_freq
-        self.episode_count = 0  # Track total completed episodes across training
+        self.log_freq = max(1, int(log_freq))
+        self.episode_count = 0
+        self.rollout_count = 0
+        self._buffers: Dict[str, List[float]] = {k: [] for k in self._METRIC_KEYS}
 
     def _on_step(self) -> bool:
-        """
-        Called after each environment step during training.
-        
-        Checks if episode completed and logs metrics if at logging interval.
-        
-        Returns:
-            True to continue training, False to stop
-        """
-        # Extract info dict from vectorized environment
-        # DummyVecEnv wraps single env, so infos is a list with one dict
-        info = self.locals.get("infos", [{}])[0]
-        
-        # Check if episode finished
-        if info.get("episode_final", False):
+        """Buffer metrics from every env that finished an episode on this vector step."""
+        for info in self.locals.get("infos", []):
+            if not info.get("episode_final", False):
+                continue
             self.episode_count += 1
-            
-            # Throttle logging: only log every log_freq episodes
-            # This reduces TensorBoard overhead for long training runs
-            if self.episode_count % self.log_freq != 0:
-                return True  # Skip logging but continue training
-            
-            # --- Core Portfolio Metrics ---
-            
-            # Final portfolio value at episode end
+            for key in self._METRIC_KEYS:
+                value = info.get(key, None)
+                if value is not None:
+                    self._buffers[key].append(float(value))
+
             pv = info.get("portfolio_final_value", None)
-            if pv is not None:
-                self.model.logger.record(f"{self.tag_prefix}/portfolio_final_value", float(pv), exclude=("stdout",))
-            
-            # Comparison value (initial portfolio value for calculating net return)
             comp_pv = info.get("comparison_final_value", None)
-            if comp_pv is not None:
-                self.model.logger.record(f"{self.tag_prefix}/comparison_final_value", float(comp_pv), exclude=("stdout",))
-            
-            # Return difference vs initial allocation (tracks improvement from random init)
             if pv is not None and comp_pv is not None:
-                return_diff = pv - comp_pv
-                self.model.logger.record(
-                    f"{self.tag_prefix}/return_diff_vs_init", 
-                    float(return_diff), 
-                    exclude=("stdout",)
-                )
-            
-            # Benchmark final value (buy-and-hold comparison)
-            bench = info.get("benchmark_final_value", None)
-            if bench is not None:
-                self.model.logger.record(f"{self.tag_prefix}/benchmark_final_value", float(bench), exclude=("stdout",))
-            
-            # Total portfolio return (percentage)
-            ret = info.get("portfolio_return", None)
-            if ret is not None:
-                self.model.logger.record(f"{self.tag_prefix}/portfolio_return", float(ret), exclude=("stdout",))
-            
-            # --- Risk Metrics ---
-            
-            # Sharpe ratio (risk-adjusted return)
-            sharpe = info.get("episode_sharpe", None)
-            if sharpe is not None:
-                self.model.logger.record(f"{self.tag_prefix}/episode_sharpe", float(sharpe), exclude=("stdout",))
-            
-            # Maximum drawdown (peak-to-trough decline)
-            dd = info.get("episode_max_drawdown", None)
-            if dd is not None:
-                self.model.logger.record(f"{self.tag_prefix}/episode_max_drawdown", float(dd), exclude=("stdout",))
-            
-            # Portfolio volatility (standard deviation of returns)
-            if "portfolio_volatility" in info:
-                self.model.logger.record(
-                    f"{self.tag_prefix}/portfolio_volatility", 
-                    float(info["portfolio_volatility"]), 
-                    exclude=("stdout",)
-                )
-            
-            # --- Trading Activity Metrics ---
-            
-            # Turnover (total trading volume relative to portfolio size)
-            if "total_turnover" in info:
-                self.model.logger.record(
-                    f"{self.tag_prefix}/episode_turnover", 
-                    float(info["total_turnover"]), 
-                    exclude=("stdout",)
-                )
-                # Average turnover per step
-                if "avg_turnover" in info:
-                    self.model.logger.record(
-                        f"{self.tag_prefix}/avg_turnover", 
-                        float(info["avg_turnover"]), 
-                        exclude=("stdout",)
-                    )
-            
-            # Transaction costs breakdown
-            if "total_transaction_cost" in info:
-                self.model.logger.record(
-                    f"{self.tag_prefix}/cost_total", 
-                    float(info["total_transaction_cost"]), 
-                    exclude=("stdout",)
-                )
-                # Commission costs
-                if "episode_cost_commission" in info:
-                    self.model.logger.record(
-                        f"{self.tag_prefix}/cost_commission", 
-                        float(info["episode_cost_commission"]), 
-                        exclude=("stdout",)
-                    )
-                # Spread costs (bid-ask)
-                if "episode_cost_spread" in info:
-                    self.model.logger.record(
-                        f"{self.tag_prefix}/cost_spread", 
-                        float(info["episode_cost_spread"]), 
-                        exclude=("stdout",)
-                    )
-                # Market impact costs
-                if "episode_cost_impact" in info:
-                    self.model.logger.record(
-                        f"{self.tag_prefix}/cost_impact", 
-                        float(info["episode_cost_impact"]), 
-                        exclude=("stdout",)
-                    )
-            
-            # --- Exposure Metrics (Allocator-Specific) ---
-            
-            # Asset exposure statistics (fraction of capital invested vs cash)
-            if "exposure_avg" in info:
-                # Starting exposure
-                self.model.logger.record(
-                    f"{self.tag_prefix}/exposure_start", 
-                    float(info.get("exposure_start", 0.0)), 
-                    exclude=("stdout",)
-                )
-                # Average exposure during episode
-                self.model.logger.record(
-                    f"{self.tag_prefix}/exposure_avg", 
-                    float(info["exposure_avg"]), 
-                    exclude=("stdout",)
-                )
-                # Final exposure
-                self.model.logger.record(
-                    f"{self.tag_prefix}/exposure_end", 
-                    float(info.get("exposure_end", 0.0)), 
-                    exclude=("stdout",)
-                )
-            
-            # --- Gross vs Net Performance ---
-            
-            # Gross return (without transaction costs, for attribution analysis)
-            if "shadow_return" in info:
-                self.model.logger.record(
-                    f"{self.tag_prefix}/gross_return", 
-                    float(info["shadow_return"]), 
-                    exclude=("stdout",)
-                )
-            
-            # --- Allocation Statistics ---
-            
-            # Weight distribution across assets
-            if "weight_mean" in info:
-                self.model.logger.record(
-                    f"{self.tag_prefix}/weight_mean", 
-                    float(info["weight_mean"]), 
-                    exclude=("stdout",)
-                )
-            if "weight_std" in info:
-                self.model.logger.record(
-                    f"{self.tag_prefix}/weight_std", 
-                    float(info["weight_std"]), 
-                    exclude=("stdout",)
-                )
-            if "weight_concentration" in info:
-                # Herfindahl index (sum of squared weights)
-                self.model.logger.record(
-                    f"{self.tag_prefix}/weight_concentration", 
-                    float(info["weight_concentration"]), 
-                    exclude=("stdout",)
-                )
-            
-            # Cash weight statistics
-            if "cash_weight_mean" in info:
-                self.model.logger.record(
-                    f"{self.tag_prefix}/cash_weight_mean", 
-                    float(info["cash_weight_mean"]), 
-                    exclude=("stdout",)
-                )
-            if "cash_weight_end" in info:
-                self.model.logger.record(
-                    f"{self.tag_prefix}/cash_weight_end", 
-                    float(info["cash_weight_end"]), 
-                    exclude=("stdout",)
-                )
-            
-            # --- Reward Components (for debugging reward shaping) ---
-            
-            # Cumulative reward over episode
-            if "cumulative_reward" in info:
-                self.model.logger.record(
-                    f"{self.tag_prefix}/cumulative_reward", 
-                    float(info["cumulative_reward"]), 
-                    exclude=("stdout",)
-                )
-            
-            # Sortino reward components (if using differential Sortino)
-            if "sortino_mean_ema" in info:
-                self.model.logger.record(
-                    f"{self.tag_prefix}/sortino_mean_ema", 
-                    float(info["sortino_mean_ema"]), 
-                    exclude=("stdout",)
-                )
-            if "sortino_downside_ema" in info:
-                self.model.logger.record(
-                    f"{self.tag_prefix}/sortino_downside_ema", 
-                    float(info["sortino_downside_ema"]), 
-                    exclude=("stdout",)
-                )
-            
-            # Alpha (excess return over benchmark)
-            if "alpha_return" in info:
-                self.model.logger.record(
-                    f"{self.tag_prefix}/alpha_return", 
-                    float(info["alpha_return"]), 
-                    exclude=("stdout",)
-                )
-        
-        # Continue training
+                self._buffers.setdefault("return_diff_vs_init", []).append(float(pv) - float(comp_pv))
+
+        return True
+
+    def _on_rollout_end(self) -> bool:
+        self.rollout_count += 1
+        if self.rollout_count % self.log_freq != 0:
+            return True
+
+        for key, values in self._buffers.items():
+            if values:
+                self.model.logger.record(f"{self.tag_prefix}/{key}", float(np.mean(values)), exclude=("stdout",))
+
+        self.model.logger.record(f"{self.tag_prefix}/episodes_completed", int(self.episode_count), exclude=("stdout",))
+        for values in self._buffers.values():
+            values.clear()
         return True
 
 
 class AllocatorValidationCallback(BaseCallback):
     """
-    Accumulates and logs validation metrics from evaluation episodes.
-    
-    Integration:
-    - Passed as eval_step_callback to AllocatorEvalCallback
-    - Accumulates metrics during each evaluation episode
-    - Computes aggregated statistics after all eval episodes complete
-    - Logs mean/std to TensorBoard via flush_metrics()
-    
-    Design Pattern:
-    - _on_step(): Accumulate metrics in buffers during eval
-    - flush_metrics(): Compute stats and log to TensorBoard
-    - _reset_buffers(): Clear buffers for next eval run
-    
-    This two-phase approach allows computing statistics across multiple
-    episodes before logging, providing more stable validation metrics.
+    Accumulates per-episode validation metrics across the deterministic sweep and emits
+    aggregated statistics to TensorBoard.
+
+    Two-phase design:
+    - collect_info(): called once per finished validation episode
+    - flush_metrics(): computes aggregates, logs them, and clears the buffers
     """
 
+    _MEAN_STD_KEYS = (
+        "portfolio_final_value",
+        "portfolio_return",
+        "terminal_pnl_abs",
+        "excess_return_over_spy_abs",
+        "excess_return_over_spy_pct",
+        "spy_bh_final_value",
+        "benchmark_final_value",
+        "comparison_final_value",
+        "episode_sharpe",
+        "episode_max_drawdown",
+        "alpha_return",
+        "cumulative_reward",
+        "episode_volatility",
+        "total_turnover",
+        "total_transaction_costs",
+    )
+
     def __init__(self, tag_prefix: str = "validation", verbose: int = 0):
-        """
-        Initialize validation callback.
-        
-        Args:
-            tag_prefix: TensorBoard metric prefix (e.g., "validation")
-            verbose: Verbosity level
-        """
         super().__init__(verbose)
-        
+
         self.tag_prefix = tag_prefix
-        self.eval_episode_count = 0  # Track episodes in current eval run
-        
-        # Accumulation buffers for per-episode metrics
-        # These store one value per evaluation episode
-        self.pv_buffer = []           # Portfolio final values
-        self.comp_pv_buffer = []      # Comparison values (initial portfolio)
-        self.bench_buffer = []        # Benchmark final values
-        self.ret_buffer = []          # Portfolio returns
-        self.sharpe_buffer = []       # Sharpe ratios
-        self.dd_buffer = []           # Max drawdowns
-        self.alpha_ret_buffer = []    # Alpha (excess returns)
-        self.cum_reward_buffer = []   # Cumulative rewards
-        self.volatility_buffer = []   # Portfolio volatility
-        self.turnover_buffer = []     # Trading turnover
-        self.cost_buffer = []         # Transaction costs
+        self.eval_episode_count = 0
+        self._buffers: Dict[str, List[float]] = {k: [] for k in self._MEAN_STD_KEYS}
+        self._per_block: List[Tuple[str, float, float]] = []  # (block_id, terminal_pnl, excess_over_spy)
+
+        # Values consumed by AllocatorEvalCallback for checkpointing / early stopping.
         self.last_mean_sharpe: float = -np.inf
+        self.last_excess_over_spy_abs_mean: float = -np.inf
+        self.last_terminal_pnl_mean: float = -np.inf
+        self.last_terminal_pnl_min: float = -np.inf
+
+    def collect_info(self, info: Mapping[str, Any]) -> None:
+        """Record one finished validation episode."""
+        self.eval_episode_count += 1
+        for key in self._MEAN_STD_KEYS:
+            value = info.get(key, None)
+            if value is not None:
+                self._buffers[key].append(float(value))
+
+        self._per_block.append(
+            (
+                str(info.get("block_id", f"ep_{self.eval_episode_count}")),
+                float(info.get("terminal_pnl_abs", np.nan)),
+                float(info.get("excess_return_over_spy_abs", np.nan)),
+            )
+        )
 
     def _on_step(self) -> bool:
-        """
-        Called during each step of evaluation episodes.
-        
-        Accumulates metrics when episode completes.
-        
-        Returns:
-            True to continue evaluation
-        """
-        # Extract info dict from current step
-        # During evaluation, EvalCallback provides infos list
-        info = self.locals.get("infos", [{}])[0]
-        
-        # Check if evaluation episode finished
-        if info.get("episode_final", False):
-            self.eval_episode_count += 1
-            
-            # --- Accumulate Core Metrics ---
-            
-            # Portfolio final value
-            pv = info.get("portfolio_final_value", None)
-            if pv is not None:
-                self.pv_buffer.append(float(pv))
-            
-            # Comparison value (for tracking improvement)
-            comp_pv = info.get("comparison_final_value", None)
-            if comp_pv is not None:
-                self.comp_pv_buffer.append(float(comp_pv))
-            
-            # Benchmark final value
-            bench = info.get("benchmark_final_value", None)
-            if bench is not None:
-                self.bench_buffer.append(float(bench))
-            
-            # Portfolio return
-            ret = info.get("portfolio_return", None)
-            if ret is not None:
-                self.ret_buffer.append(float(ret))
-            
-            # Sharpe ratio
-            sharpe = info.get("episode_sharpe", None)
-            if sharpe is not None:
-                self.sharpe_buffer.append(float(sharpe))
-            
-            # Max drawdown
-            dd = info.get("episode_max_drawdown", None)
-            if dd is not None:
-                self.dd_buffer.append(float(dd))
-            
-            # Alpha (excess return over benchmark)
-            alpha_ret = info.get("alpha_return", None)
-            if alpha_ret is not None:
-                self.alpha_ret_buffer.append(float(alpha_ret))
-            
-            # Cumulative reward
-            cum_reward = info.get("cumulative_reward", None)
-            if cum_reward is not None:
-                self.cum_reward_buffer.append(float(cum_reward))
-            
-            # Portfolio volatility
-            vol = info.get("portfolio_volatility", None)
-            if vol is not None:
-                self.volatility_buffer.append(float(vol))
-            
-            # Trading turnover
-            turnover = info.get("total_turnover", None)
-            if turnover is not None:
-                self.turnover_buffer.append(float(turnover))
-            
-            # Transaction costs
-            cost = info.get("total_transaction_cost", None)
-            if cost is not None:
-                self.cost_buffer.append(float(cost))
-        
-        # Continue evaluation
         return True
-    
-    def flush_metrics(self, n_eval_episodes: int) -> None:
+
+    def flush_metrics(self, n_expected_episodes: int) -> bool:
         """
         Compute and log aggregated validation statistics.
-        
-        Called after all evaluation episodes complete (by AllocatorEvalCallback).
-        Computes mean/std across episodes and logs to TensorBoard.
-        
-        Args:
-            n_eval_episodes: Expected number of evaluation episodes
-                            Used to verify all episodes completed before logging
+
+        Returns True when the sweep was complete and the aggregates (including the
+        checkpoint metrics) are valid.
         """
-        # Guard: only log if we have the expected number of episodes
-        # This prevents partial logging if evaluation was interrupted
-        if self.eval_episode_count < n_eval_episodes:
-            if self.verbose > 0:
-                print(f"[AllocatorValidationCallback] Skipping flush: only {self.eval_episode_count}/{n_eval_episodes} episodes completed")
-            return
-        
-        # --- Portfolio Value Statistics ---
-        
-        if self.pv_buffer:
-            mean_pv = float(np.mean(self.pv_buffer))
-            std_pv = float(np.std(self.pv_buffer))
-            self.model.logger.record(f"{self.tag_prefix}/portfolio_final_value_mean", mean_pv, exclude=("stdout",))
-            self.model.logger.record(f"{self.tag_prefix}/portfolio_final_value_std", std_pv, exclude=("stdout",))
-        
-        if self.comp_pv_buffer:
-            mean_comp = float(np.mean(self.comp_pv_buffer))
-            self.model.logger.record(f"{self.tag_prefix}/comparison_final_value_mean", mean_comp, exclude=("stdout",))
-        
-        # Return difference vs initial allocation
-        if self.pv_buffer and self.comp_pv_buffer:
-            return_diffs = [pv - comp for pv, comp in zip(self.pv_buffer, self.comp_pv_buffer)]
-            mean_return_diff = float(np.mean(return_diffs))
-            std_return_diff = float(np.std(return_diffs))
-            self.model.logger.record(f"{self.tag_prefix}/return_diff_vs_init_mean", mean_return_diff, exclude=("stdout",))
-            self.model.logger.record(f"{self.tag_prefix}/return_diff_vs_init_std", std_return_diff, exclude=("stdout",))
-        
-        if self.bench_buffer:
-            mean_bench = float(np.mean(self.bench_buffer))
-            self.model.logger.record(f"{self.tag_prefix}/benchmark_final_value_mean", mean_bench, exclude=("stdout",))
-        
-        # --- Return Statistics ---
-        
-        if self.ret_buffer:
-            mean_ret = float(np.mean(self.ret_buffer))
-            std_ret = float(np.std(self.ret_buffer))
-            self.model.logger.record(f"{self.tag_prefix}/portfolio_return_mean", mean_ret, exclude=("stdout",))
-            self.model.logger.record(f"{self.tag_prefix}/portfolio_return_std", std_ret, exclude=("stdout",))
-        
-        # --- Risk-Adjusted Performance ---
-        
-        if self.sharpe_buffer:
-            mean_sharpe = float(np.mean(self.sharpe_buffer))
-            std_sharpe = float(np.std(self.sharpe_buffer))
-            self.last_mean_sharpe = mean_sharpe # Store for potential use in early stopping or model selection
-            self.model.logger.record(f"{self.tag_prefix}/episode_sharpe_mean", mean_sharpe, exclude=("stdout",))
-            self.model.logger.record(f"{self.tag_prefix}/episode_sharpe_std", std_sharpe, exclude=("stdout",))
-        
-        if self.dd_buffer:
-            mean_dd = float(np.mean(self.dd_buffer))
-            std_dd = float(np.std(self.dd_buffer))
-            self.model.logger.record(f"{self.tag_prefix}/episode_max_drawdown_mean", mean_dd, exclude=("stdout",))
-            self.model.logger.record(f"{self.tag_prefix}/episode_max_drawdown_std", std_dd, exclude=("stdout",))
-        
-        if self.alpha_ret_buffer:
-            mean_alpha = float(np.mean(self.alpha_ret_buffer))
-            std_alpha = float(np.std(self.alpha_ret_buffer))
-            self.model.logger.record(f"{self.tag_prefix}/alpha_return_mean", mean_alpha, exclude=("stdout",))
-            self.model.logger.record(f"{self.tag_prefix}/alpha_return_std", std_alpha, exclude=("stdout",))
-        
-        # --- Reward Statistics ---
-        
-        if self.cum_reward_buffer:
-            mean_cum_reward = float(np.mean(self.cum_reward_buffer))
-            std_cum_reward = float(np.std(self.cum_reward_buffer))
-            self.model.logger.record(f"{self.tag_prefix}/cumulative_reward_mean", mean_cum_reward, exclude=("stdout",))
-            self.model.logger.record(f"{self.tag_prefix}/cumulative_reward_std", std_cum_reward, exclude=("stdout",))
-        
-        # --- Trading Activity Statistics ---
-        
-        if self.volatility_buffer:
-            mean_vol = float(np.mean(self.volatility_buffer))
-            self.model.logger.record(f"{self.tag_prefix}/portfolio_volatility_mean", mean_vol, exclude=("stdout",))
-        
-        if self.turnover_buffer:
-            mean_turnover = float(np.mean(self.turnover_buffer))
-            self.model.logger.record(f"{self.tag_prefix}/turnover_mean", mean_turnover, exclude=("stdout",))
-        
-        if self.cost_buffer:
-            mean_cost = float(np.mean(self.cost_buffer))
-            self.model.logger.record(f"{self.tag_prefix}/transaction_cost_mean", mean_cost, exclude=("stdout",))
-        
-        # Reset buffers for next evaluation run
+        if self.eval_episode_count < n_expected_episodes:
+            print(
+                f"[AllocatorValidationCallback] Incomplete sweep: "
+                f"{self.eval_episode_count}/{n_expected_episodes} episodes - metrics not logged"
+            )
+            self._reset_buffers()
+            return False
+
+        for key, values in self._buffers.items():
+            if not values:
+                continue
+            self.model.logger.record(f"{self.tag_prefix}/{key}_mean", float(np.mean(values)), exclude=("stdout",))
+            self.model.logger.record(f"{self.tag_prefix}/{key}_std", float(np.std(values)), exclude=("stdout",))
+
+        # Return difference vs the buy-and-hold of the initial allocation
+        pv = self._buffers["portfolio_final_value"]
+        comp = self._buffers["comparison_final_value"]
+        if pv and comp and len(pv) == len(comp):
+            diffs = [p - c for p, c in zip(pv, comp)]
+            self.model.logger.record(f"{self.tag_prefix}/return_diff_vs_init_mean", float(np.mean(diffs)), exclude=("stdout",))
+
+        # Worst-case block statistics drive the min-based checkpoint.
+        pnl_values = self._buffers["terminal_pnl_abs"]
+        excess_values = self._buffers["excess_return_over_spy_abs"]
+
+        self.last_mean_sharpe = float(np.mean(self._buffers["episode_sharpe"])) if self._buffers["episode_sharpe"] else -np.inf
+        self.last_terminal_pnl_mean = float(np.mean(pnl_values)) if pnl_values else -np.inf
+        self.last_terminal_pnl_min = float(np.min(pnl_values)) if pnl_values else -np.inf
+        self.last_excess_over_spy_abs_mean = float(np.mean(excess_values)) if excess_values else -np.inf
+
+        if pnl_values:
+            self.model.logger.record(f"{self.tag_prefix}/terminal_pnl_abs_min", self.last_terminal_pnl_min, exclude=("stdout",))
+            self.model.logger.record(f"{self.tag_prefix}/terminal_pnl_abs_max", float(np.max(pnl_values)), exclude=("stdout",))
+        if excess_values:
+            self.model.logger.record(
+                f"{self.tag_prefix}/excess_return_over_spy_abs_min", float(np.min(excess_values)), exclude=("stdout",)
+            )
+
+        # Per-block scalars so a single degrading block stays visible behind the means.
+        for block_id, block_pnl, block_excess in self._per_block:
+            if np.isfinite(block_pnl):
+                self.model.logger.record(f"{self.tag_prefix}/block_{block_id}/terminal_pnl_abs", block_pnl, exclude=("stdout",))
+            if np.isfinite(block_excess):
+                self.model.logger.record(
+                    f"{self.tag_prefix}/block_{block_id}/excess_return_over_spy_abs", block_excess, exclude=("stdout",)
+                )
+
         self._reset_buffers()
-    
+        return True
+
     def _reset_buffers(self) -> None:
-        """
-        Clear all accumulation buffers after logging.
-        
-        Called automatically by flush_metrics() to prepare for next eval run.
-        """
-        self.pv_buffer = []
-        self.comp_pv_buffer = []
-        self.bench_buffer = []
-        self.ret_buffer = []
-        self.sharpe_buffer = []
-        self.dd_buffer = []
-        self.alpha_ret_buffer = []
-        self.cum_reward_buffer = []
-        self.volatility_buffer = []
-        self.turnover_buffer = []
-        self.cost_buffer = []
+        for values in self._buffers.values():
+            values.clear()
+        self._per_block = []
         self.eval_episode_count = 0
 
 
 class AllocatorEvalCallback(BaseCallback):
     """
-    Periodic evaluation callback for allocator on validation data.
-    
-    Integration:
-    - Registered with SB3's learn() via callback list
-    - Triggers evaluation every eval_freq environment steps
-    - Uses evaluate_policy() from SB3 to run N evaluation episodes
-    - Forwards per-step metrics to eval_step_callback (AllocatorValidationCallback)
-    - Saves best model checkpoint based on mean reward
-    
-    Architecture:
-    - _init_callback(): Setup directories and initialize sub-callbacks
-    - _on_step(): Check if evaluation due, run evaluate_policy(), log results
-    - Uses nested callback pattern: this callback wraps AllocatorValidationCallback
-    
-    This mirrors EvalCallbackWithMetrics from SAA agent but adapted for allocator
-    environment and metrics.
+    Periodic deterministic validation for the allocator.
+
+    Every `eval_freq` calls it runs exactly one episode per validation block, each spanning
+    the block in full and starting from 100% cash, then logs metrics and saves checkpoints on:
+    - highest mean excess return over SPY buy-and-hold (absolute)
+    - highest mean terminal PnL (absolute)
+    - highest worst-block terminal PnL (absolute)
     """
 
     def __init__(
         self,
-        eval_env: gym.Env,
+        eval_env: VecEnv,
         best_model_save_path: str,
         log_path: str,
         eval_freq: int,
-        n_eval_episodes: int,
-        deterministic: bool = False,
-        eval_step_callback: Optional[BaseCallback] = None,
+        eval_step_callback: Optional["AllocatorValidationCallback"] = None,
         patience: int = 7,
         min_delta_reward: float = 0.0,
         min_delta_sharpe: float = 0.0,
         verbose: int = 0
     ):
-        """
-        Initialize evaluation callback.
-        
-        Args:
-            eval_env: Validation environment (typically wrapped with VecNormalize)
-            best_model_save_path: Directory for best model checkpoint
-            log_path: Directory for evaluation logs (evaluations.npz)
-            eval_freq: Evaluate every N environment steps (total_timesteps)
-            n_eval_episodes: Number of episodes per evaluation run
-            deterministic: If True, use deterministic policy (no exploration noise)
-            eval_step_callback: Optional callback for per-step metrics during eval
-                               (typically AllocatorValidationCallback)
-            verbose: Verbosity level
-        """
         super().__init__(verbose)
-        
-        # Store parameters
+
         self.eval_env = eval_env
         self.best_model_save_path = best_model_save_path
         self.log_path = log_path
         self.eval_freq = eval_freq
-        self.n_eval_episodes = n_eval_episodes
-        self.deterministic = deterministic
         self.eval_step_callback = eval_step_callback
-        
-        # Track dual best performance for checkpoint saving & early stopping
+
         self.best_mean_reward = -np.inf
         self.best_mean_sharpe = -np.inf
+        self.best_excess_over_spy_abs_mean = -np.inf
+        self.best_terminal_pnl_mean = -np.inf
+        self.best_terminal_pnl_min = -np.inf
 
         # Early stopping
         self.patience = patience
         self.min_delta_reward = min_delta_reward
         self.min_delta_sharpe = min_delta_sharpe
-        self.no_improve_reward = 0  # consecutive eval calls without reward improvement
-        self.no_improve_sharpe = 0  # consecutive eval calls without sharpe improvement
-        
-        # Count evaluation runs (for logging frequency)
+        self.no_improve_reward = 0
+        self.no_improve_sharpe = 0
+
         self.n_eval_calls = 0
+        self._sweep_plan: List[Dict[str, Any]] = []
 
     def _init_callback(self) -> None:
-        """
-        Initialize callback before training starts.
-        
-        Called by SB3 after model is created but before training begins.
-        Sets up directories and initializes sub-callbacks.
-        """
-        # Create directory for best model checkpoint
         if self.best_model_save_path is not None:
             os.makedirs(self.best_model_save_path, exist_ok=True)
-        
-        # Create directory for evaluation logs
         if self.log_path is not None:
             os.makedirs(self.log_path, exist_ok=True)
-        
-        # Initialize sub-callback (AllocatorValidationCallback)
-        # This allows it to access self.model for logging
         if self.eval_step_callback is not None:
             self.eval_step_callback.init_callback(self.model)
 
+        # The plan is identical for every eval env, so read it once from env 0.
+        self._sweep_plan = self.eval_env.env_method("get_validation_sweep_plan", indices=0)[0]
+        if not self._sweep_plan:
+            raise RuntimeError("Validation sweep plan is empty; no validation blocks available.")
+        if self.verbose > 0:
+            print(
+                f"[AllocatorEvalCallback] Deterministic sweep: {len(self._sweep_plan)} validation "
+                f"blocks across {self.eval_env.num_envs} eval env(s)"
+            )
+
+    def _run_validation_sweep(self) -> Tuple[List[float], List[int]]:
+        """
+        Run every plan in the sweep exactly once, deterministically, sharding the plans
+        round-robin across the eval envs. Returns per-episode rewards and lengths.
+        """
+        n_envs = self.eval_env.num_envs
+        shards: List[List[Dict[str, Any]]] = [self._sweep_plan[i::n_envs] for i in range(n_envs)]
+        for i, shard in enumerate(shards):
+            self.eval_env.env_method("set_plan_queue", shard, indices=i)
+
+        # Envs whose shard is empty must not contribute episodes.
+        remaining = np.array([len(s) for s in shards], dtype=int)
+        active = remaining > 0
+        remaining = np.maximum(remaining - 1, 0)  # the upcoming reset consumes one plan per env
+
+        obs = self.eval_env.reset()
+        episode_rewards: List[float] = []
+        episode_lengths: List[int] = []
+        current_reward = np.zeros(n_envs, dtype=np.float64)
+        current_length = np.zeros(n_envs, dtype=int)
+
+        while active.any():
+            actions, _ = self.model.predict(obs, deterministic=True)
+            obs, rewards, dones, infos = self.eval_env.step(actions)
+            current_reward += np.asarray(rewards, dtype=np.float64) * active
+            current_length += active
+
+            for i in range(n_envs):
+                if not active[i] or not dones[i]:
+                    continue
+                if self.eval_step_callback is not None and infos[i].get("episode_final", False):
+                    self.eval_step_callback.collect_info(infos[i])
+                episode_rewards.append(float(current_reward[i]))
+                episode_lengths.append(int(current_length[i]))
+                current_reward[i] = 0.0
+                current_length[i] = 0
+                if remaining[i] > 0:
+                    remaining[i] -= 1
+                else:
+                    # Shard exhausted: the auto-reset episode is discarded.
+                    active[i] = False
+
+        return episode_rewards, episode_lengths
+
+    def _save_checkpoint(self, checkpoint_name: str) -> None:
+        """Save model and the matching VecNormalize stats at the same instant."""
+        if self.best_model_save_path is None:
+            return
+        self.model.save(os.path.join(self.best_model_save_path, checkpoint_name))
+        vec_env = self.model.get_env()
+        if isinstance(vec_env, VecNormalize):
+            vec_env.save(os.path.join(self.best_model_save_path, f"{checkpoint_name}_vecnormalize.pkl"))
+        else:
+            raise RuntimeError(
+                f"Checkpoint '{checkpoint_name}' saved without VecNormalize stats "
+                "(training env is not wrapped in VecNormalize)."
+            )
+
     def _on_step(self) -> bool:
-        """
-        Called after each training step.
-        
-        Checks if evaluation is due (every eval_freq steps), runs evaluation,
-        logs metrics, and saves best model.
-        
-        Returns:
-            True to continue training, False to stop
-        """
-        # Check if evaluation is due
-        # self.n_calls tracks total environment steps since training start
-        if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
-            
-            # --- Run Evaluation Episodes ---
-            
-            # Define nested callback for evaluate_policy()
-            # This forwards each step to our eval_step_callback
-            def _step_cb(locals_, globals_):
-                if self.eval_step_callback is None:
-                    return True
-                # Inject locals/globals into sub-callback for metric extraction
-                self.eval_step_callback.locals = locals_
-                self.eval_step_callback.globals = globals_
-                # Call sub-callback's _on_step()
-                return bool(self.eval_step_callback.on_step())
-            
-            # Run evaluation using SB3's evaluate_policy utility
-            # This runs n_eval_episodes complete episodes and returns rewards/lengths
-            episode_rewards, episode_lengths = evaluate_policy(
-                model=self.model,
-                env=self.eval_env,
-                n_eval_episodes=self.n_eval_episodes,
-                deterministic=self.deterministic,
-                render=False,  # No rendering during automated evaluation
-                return_episode_rewards=True,  # Get per-episode rewards for stats
-                warn=True,  # Warn about potential issues
-                callback=_step_cb  # Per-step callback for metrics
-            )
-            
-            self.n_eval_calls += 1
-            
-            # --- Flush Aggregated Validation Metrics ---
-            
-            # After all eval episodes complete, compute aggregated statistics
-            # This calls flush_metrics() on AllocatorValidationCallback
-            if self.eval_step_callback is not None:
-                self.eval_step_callback.flush_metrics(self.n_eval_episodes)
-            
-            # --- Log Standard SB3 Evaluation Metrics ---
-            
-            # Compute mean and std of episode rewards
-            mean_reward = float(np.mean(episode_rewards))
-            std_reward = float(np.std(episode_rewards))
-            min_reward = float(np.min(episode_rewards))
-            max_reward = float(np.max(episode_rewards))
-            mean_ep_length = float(np.mean(episode_lengths))
-            
-            # Log to TensorBoard
-            self.model.logger.record("eval/mean_reward", mean_reward)
-            self.model.logger.record("eval/min_reward", min_reward)
-            self.model.logger.record("eval/max_reward", max_reward)
-            self.model.logger.record("eval/std_reward", std_reward)
-            self.model.logger.record("eval/mean_ep_length", mean_ep_length)
-            
-            # --- Save Evaluation Results to Disk ---
-            
-            # Save numpy arrays for offline analysis
-            if self.log_path is not None:
-                eval_log_path = os.path.join(self.log_path, "evaluations.npz")
-                
-                # Load existing data if available (append mode)
-                if os.path.exists(eval_log_path):
-                    try:
-                        existing_data = np.load(eval_log_path)
-                        timesteps = np.append(existing_data["timesteps"], self.num_timesteps)
-                        results = np.append(existing_data["results"], [episode_rewards], axis=0)
-                        ep_lengths = np.append(existing_data["ep_lengths"], [episode_lengths], axis=0)
-                    except Exception:
-                        # If loading fails, start fresh
-                        timesteps = np.array([self.num_timesteps])
-                        results = np.array([episode_rewards])
-                        ep_lengths = np.array([episode_lengths])
-                else:
-                    # First evaluation: create new arrays
-                    timesteps = np.array([self.num_timesteps])
-                    results = np.array([episode_rewards])
-                    ep_lengths = np.array([episode_lengths])
-                
-                # Save to disk (compressed format)
-                np.savez(
-                    eval_log_path,
-                    timesteps=timesteps,
-                    results=results,
-                    ep_lengths=ep_lengths
+        if self.eval_freq <= 0 or self.n_calls % self.eval_freq != 0:
+            return True
+
+        # Keep the frozen eval normalization aligned with the training statistics.
+        sync_envs_normalization(self.model.get_env(), self.eval_env)
+
+        episode_rewards, episode_lengths = self._run_validation_sweep()
+        self.n_eval_calls += 1
+
+        sweep_complete = True
+        if self.eval_step_callback is not None:
+            sweep_complete = self.eval_step_callback.flush_metrics(len(self._sweep_plan))
+
+        mean_reward = float(np.mean(episode_rewards)) if episode_rewards else -np.inf
+        self.model.logger.record("eval/mean_reward", mean_reward)
+        if episode_rewards:
+            self.model.logger.record("eval/min_reward", float(np.min(episode_rewards)))
+            self.model.logger.record("eval/max_reward", float(np.max(episode_rewards)))
+            self.model.logger.record("eval/std_reward", float(np.std(episode_rewards)))
+            self.model.logger.record("eval/mean_ep_length", float(np.mean(episode_lengths)))
+            self.model.logger.record("eval/n_episodes", int(len(episode_rewards)))
+
+        if self.log_path is not None and episode_rewards:
+            self._append_eval_log(episode_rewards, episode_lengths)
+
+        if not sweep_complete:
+            return True
+
+        # --- Checkpoints on the three validation metrics ---
+        vcb = self.eval_step_callback
+        if vcb is not None:
+            if vcb.last_excess_over_spy_abs_mean > self.best_excess_over_spy_abs_mean:
+                self.best_excess_over_spy_abs_mean = vcb.last_excess_over_spy_abs_mean
+                self._save_checkpoint("best_model_excess_over_spy_abs")
+                print(
+                    "[AllocatorEvalCallback] New best mean excess over SPY: "
+                    f"{self.best_excess_over_spy_abs_mean:.2f}"
                 )
-            
-            # --- Save Best Model Checkpoint ---
-            
-            # Check if this is the best performance so far
-            if mean_reward > self.best_mean_reward:
-                if self.verbose > 0:
-                    print(f"[AllocatorEvalCallback] New best mean reward: {mean_reward:.3f} (previous: {self.best_mean_reward:.3f})")
-                
-                self.best_mean_reward = mean_reward
-                
-                # Save model checkpoint
-                if self.best_model_save_path is not None:
-                    best_model_path = os.path.join(self.best_model_save_path, "best_model")
-                    self.model.save(best_model_path)
-                    
-                    # Save VecNormalize statistics
-                    if isinstance(self.eval_env, VecNormalize):
-                        vecnorm_path = os.path.join(self.best_model_save_path, "vecnormalize_stats.pkl")
-                        self.eval_env.save(vecnorm_path)
 
-                    if self.verbose > 0:
-                        print(f"[AllocatorEvalCallback] Saved best model to: {best_model_path}")
-        
-            # --- Early Stopping (dual-condition) ---
+            if vcb.last_terminal_pnl_mean > self.best_terminal_pnl_mean:
+                self.best_terminal_pnl_mean = vcb.last_terminal_pnl_mean
+                self._save_checkpoint("best_model_terminal_pnl_mean")
+                print(f"[AllocatorEvalCallback] New best mean terminal PnL: {self.best_terminal_pnl_mean:.2f}")
 
-            # Read sharpe exposed by AllocatorValidationCallback after flush
-            mean_sharpe = (
-                self.eval_step_callback.last_mean_sharpe
-                if self.eval_step_callback is not None
-                else -np.inf
+            if vcb.last_terminal_pnl_min > self.best_terminal_pnl_min:
+                self.best_terminal_pnl_min = vcb.last_terminal_pnl_min
+                self._save_checkpoint("best_model_terminal_pnl_min")
+                print(f"[AllocatorEvalCallback] New best worst-block terminal PnL: {self.best_terminal_pnl_min:.2f}")
+
+        # --- Reward-based checkpoint (kept for continuity) + early stopping ---
+        previous_best_reward = self.best_mean_reward
+        if mean_reward > self.best_mean_reward:
+            self.best_mean_reward = mean_reward
+            self._save_checkpoint("best_model")
+            if self.verbose > 0:
+                print(
+                    f"[AllocatorEvalCallback] New best mean reward: {mean_reward:.3f} "
+                    f"(previous: {previous_best_reward:.3f})"
+                )
+
+        if mean_reward > previous_best_reward + self.min_delta_reward:
+            self.no_improve_reward = 0
+        else:
+            self.no_improve_reward += 1
+            print(
+                f"[AllocatorEvalCallback] Reward has not improved for "
+                f"{self.no_improve_reward}/{self.patience} eval calls "
+                f"(current={mean_reward:.4f}, best={self.best_mean_reward:.4f})"
             )
 
-            # Track reward improvement
-            if mean_reward > self.best_mean_reward + self.min_delta_reward:
-                self.no_improve_reward = 0
-                # (best_mean_reward already updated above in the model-save block)
-            else:
-                self.no_improve_reward += 1
+        mean_sharpe = vcb.last_mean_sharpe if vcb is not None else -np.inf
+        if mean_sharpe > self.best_mean_sharpe + self.min_delta_sharpe:
+            self.best_mean_sharpe = mean_sharpe
+            self.no_improve_sharpe = 0
+        else:
+            self.no_improve_sharpe += 1
+            if mean_sharpe == -np.inf:
                 print(
-                    f"[AllocatorEvalCallback] Reward has not improved for "
-                    f"{self.no_improve_reward}/{self.patience} eval calls "
-                    f"(current={mean_reward:.4f}, best={self.best_mean_reward:.4f})"
+                    "[AllocatorEvalCallback] WARNING: Sharpe buffer was empty this eval - "
+                    "env may not be emitting Sharpe in info dict. "
+                    "Sharpe early stopping condition is inactive."
+                )
+            else:
+                print(
+                    f"[AllocatorEvalCallback] Sharpe has not improved for "
+                    f"{self.no_improve_sharpe}/{self.patience} eval calls "
+                    f"(current={mean_sharpe:.4f}, best={self.best_mean_sharpe:.4f})"
                 )
 
-            # Track sharpe improvement
-            if mean_sharpe > self.best_mean_sharpe + self.min_delta_sharpe:
-                self.best_mean_sharpe = mean_sharpe
-                self.no_improve_sharpe = 0
-            else:
-                self.no_improve_sharpe += 1
-                if mean_sharpe == -np.inf:
-                    print(
-                        "[AllocatorEvalCallback] WARNING: Sharpe buffer was empty this eval — "
-                        "env may not be emitting Sharpe in info dict. "
-                        "Sharpe early stopping condition is inactive."
-                    )
-                else:
-                    print(
-                        f"[AllocatorEvalCallback] Sharpe has not improved for "
-                        f"{self.no_improve_sharpe}/{self.patience} eval calls "
-                        f"(current={mean_sharpe:.4f}, best={self.best_mean_sharpe:.4f})"
-                    )
+        sharpe_available = mean_sharpe > -np.inf
+        if (
+            self.no_improve_reward >= self.patience
+            and self.no_improve_sharpe >= self.patience
+            and sharpe_available
+        ):
+            print(
+                f"[AllocatorEvalCallback] Early stopping triggered: "
+                f"neither mean reward ({mean_reward:.4f}) nor mean Sharpe ({mean_sharpe:.4f}) "
+                f"have improved for {self.patience} consecutive eval calls. "
+                f"Best reward={self.best_mean_reward:.4f}, best Sharpe={self.best_mean_sharpe:.4f}."
+            )
+            return False
 
-            # Stop only if BOTH reward AND sharpe have stagnated for full patience period
-            sharpe_available = mean_sharpe > -np.inf
-            if (
-                self.no_improve_reward >= self.patience
-                and self.no_improve_sharpe >= self.patience
-                and sharpe_available
-            ):
-                print(
-                    f"[AllocatorEvalCallback] Early stopping triggered: "
-                    f"neither mean reward ({mean_reward:.4f}) nor mean Sharpe ({mean_sharpe:.4f}) "
-                    f"have improved for {self.patience} consecutive eval calls. "
-                    f"Best reward={self.best_mean_reward:.4f}, best Sharpe={self.best_mean_sharpe:.4f}."
-                )
-                return False
-
-        # Continue training
         return True
+
+    def _append_eval_log(self, episode_rewards: List[float], episode_lengths: List[int]) -> None:
+        eval_log_path = os.path.join(self.log_path, "evaluations.npz")
+        if os.path.exists(eval_log_path):
+            try:
+                existing = np.load(eval_log_path)
+                timesteps = np.append(existing["timesteps"], self.num_timesteps)
+                results = np.append(existing["results"], [episode_rewards], axis=0)
+                ep_lengths = np.append(existing["ep_lengths"], [episode_lengths], axis=0)
+            except Exception:
+                timesteps = np.array([self.num_timesteps])
+                results = np.array([episode_rewards])
+                ep_lengths = np.array([episode_lengths])
+        else:
+            timesteps = np.array([self.num_timesteps])
+            results = np.array([episode_rewards])
+            ep_lengths = np.array([episode_lengths])
+
+        np.savez(eval_log_path, timesteps=timesteps, results=results, ep_lengths=ep_lengths)
+
 
 # Three-Phase Linear schedule to be used with learning rate and entropy coefficient
 def linear_three_phase_schedule(start: float, end: float, warmup_pct: float, ramping_pct: float) -> Callable[[float], float]:
@@ -1026,8 +716,13 @@ class EntropyScheduleCallback(BaseCallback):
 
 class SAASignalWrapper(VecEnvWrapper):
     """
-    Manages N independent SAA models (one per asset) and injects their signals
-    into the allocator's observations. Preserves recurrent state per asset/env.
+    Runs the frozen SAA over every (env, asset) pair and injects its signal into the
+    allocator's observations.
+
+    Row layout of the batched SAA forward pass is r = env_index * num_assets + asset_index.
+    That mapping must stay fixed for the whole run: the LSTM state carried in
+    self.saa_state is indexed by r, so reordering rows would cross-contaminate the
+    per-asset recurrent memory.
     """
     def __init__(self, venv: VecEnv, saa_model, saa_vecnormalize: Optional[VecNormalize],
                 num_assets: int, device: torch.device,
@@ -1047,6 +742,12 @@ class SAASignalWrapper(VecEnvWrapper):
         self.action_limiting_factor = float(action_limiting_factor)
         # Precomputed one-hot asset-ID rows; SAA's InputMLPFeatures expects this trailing block.
         self._asset_one_hot = np.eye(self.num_assets, dtype=np.float32)
+
+        if not hasattr(self.venv, "env_method"):
+            raise RuntimeError(
+                "SAASignalWrapper requires a VecEnv exposing env_method(); place it directly "
+                "around the raw DummyVecEnv/SubprocVecEnv (no VecNormalize in between)."
+            )
 
         # Infer dimensions from selected market features and env observation shape.
         # The raw env emits: N * raw_feat_dim + portfolio_dim (before SAA signal injection).
@@ -1081,18 +782,21 @@ class SAASignalWrapper(VecEnvWrapper):
                 f"max_idx={int(np.max(self.saa_idx))}"
             )
 
-        # Create N distinct SAA models (deep copies) and keep their own recurrent states
-        self.saa_models: List[Any] = []
-        for _ in range(self.num_assets):
-            m = copy.deepcopy(saa_model)
-            m.policy.to(self.device)
-            m.device = self.device # Ensure model's device attribute is set for VecNormalize    
-            m.policy.eval() # Set to eval mode (important for layers like LayerNorm, Dropout)
-            self.saa_models.append(m)
-        # per-asset recurrent states (None -> auto-init), shape managed by SB3
-        self.saa_states: List[Optional[Any]] = [None for _ in range(self.num_assets)]
-        # episode_start flags per asset (vector over envs)
-        self.episode_start = np.ones((self.num_assets, venv.num_envs), dtype=bool)
+        # One frozen SAA shared by every (env, asset) row; the LSTM state carries the batch
+        # dimension, so separate model copies would be redundant.
+        self.saa_model = saa_model
+        self.saa_model.policy.to(self.device)
+        self.saa_model.device = self.device
+        self.saa_model.policy.eval()
+
+        self.n_rows = int(venv.num_envs) * self.num_assets
+        self.saa_state: Optional[Any] = None
+        self.episode_start = np.ones(self.n_rows, dtype=bool)
+        self._last_signals = np.zeros((venv.num_envs, self.num_assets, 1), dtype=np.float32)
+        # Row-aligned one-hot asset IDs, tiled once for the whole batch.
+        self._asset_one_hot_batch = np.tile(self._asset_one_hot, (venv.num_envs, 1))
+
+        self.initial_portfolio_value = float(self.venv.get_attr("initial_portfolio_value")[0])
 
         # Resize obs space: add +1 feature per asset for SAA signal
         old_low, old_high = self.observation_space.low, self.observation_space.high
@@ -1108,13 +812,6 @@ class SAASignalWrapper(VecEnvWrapper):
             high=np.concatenate([new_high_assets, old_high[asset_size:]]),
             dtype=np.float32,
         )
-        # Cache direct handles to the underlying TradingEnv instances (works for DummyVecEnv).
-        # Required so we can read/write the per-asset SAA sub-portfolio state in the env's episode_buffer.
-        # Assumes SAASignalWrapper wraps the raw DummyVecEnv (no VecNormalize in between), which is how run() builds it.
-        self._base_envs = list(self.venv.envs)  # len == num_envs; each is a TradingEnv
-        if any(not hasattr(e, "episode_buffer") for e in self._base_envs):
-            raise RuntimeError("SAASignalWrapper requires direct access to TradingEnv.episode_buffer; "
-                               "do not place VecNormalize between the raw env and this wrapper.")
 
     def reset(self):
         res = self.venv.reset()
@@ -1122,129 +819,165 @@ class SAASignalWrapper(VecEnvWrapper):
             obs, _info = res
         else:
             obs = res
-        # reset per-asset states and episode flags
-        self.saa_states = [None for _ in range(self.num_assets)]
+        # Drop recurrent memory: every (env, asset) row starts a fresh episode.
+        self.saa_state = None
         self.episode_start[:] = True
-        obs = self._augment_obs_with_saa(obs)
-        return obs
+        signals = self._compute_saa_signals(obs)
+        self._commit_saa_actions(signals)
+        return self._inject_signals(obs, signals)
 
     def step_wait(self):
         obs, rewards, dones, infos = self.venv.step_wait()
         dones_arr = np.asarray(dones, dtype=bool)  # shape (B,)
-        # update per-asset episode_start flags (same done for all assets in this env)
-        for a in range(self.num_assets):
-            self.episode_start[a] = dones_arr
-        obs = self._augment_obs_with_saa(obs)
 
-        # also augment terminal_observation in infos to match new obs shape
+        # Terminal observations belong to the finished episode; augment them with the last
+        # known signal only - no LSTM advance, no sub-portfolio commit.
         for i, info in enumerate(infos):
-            if "terminal_observation" in info:
-                term = info["terminal_observation"]
-                if term is not None:
-                    term_aug = self._augment_obs_with_saa(term[None, ...])
-                    info["terminal_observation"] = term_aug[0]
-        return obs, rewards, dones, infos
+            if info.get("terminal_observation", None) is not None:
+                info["terminal_observation"] = self._inject_signals(
+                    info["terminal_observation"][None, ...],
+                    self._last_signals[i][None, ...],
+                )[0]
 
-    def _augment_obs_with_saa(self, obs: np.ndarray) -> np.ndarray:
+        # VecEnv auto-resets, so the obs returned here is already the next episode's first
+        # observation for any env that reported done. Flag those rows accordingly.
+        self.episode_start = np.repeat(dones_arr, self.num_assets)
+
+        signals = self._compute_saa_signals(obs)
+        self._commit_saa_actions(signals)
+        return self._inject_signals(obs, signals), rewards, dones, infos
+
+    def _compute_saa_signals(self, obs: np.ndarray) -> np.ndarray:
+        """
+        Rebuild the SAA training observation for every (env, asset) row and run a single
+        batched forward pass. Returns signals shaped (B, N, 1). Advances the LSTM state.
+        """
+        B = obs.shape[0]
+        N = self.num_assets
+        asset_block = N * self.raw_feat_dim
+        asset_feats = obs[:, :asset_block].reshape(B, N, self.raw_feat_dim)
+
+        # Selected SAA market features per (env, asset).
+        saa_market_feats = asset_feats[:, :, self.saa_idx]  # (B, N, F_saa)
+
+        # --- Per-asset hypothetical sub-portfolio state, one RPC round trip ---
+        bundles = self.venv.env_method("get_saa_signal_inputs")
+        cash_all = np.stack([b["cash"] for b in bundles], axis=0)                       # (B, N)
+        shares_all = np.stack([b["shares"] for b in bundles], axis=0)                   # (B, N)
+        last_act_all = np.stack([b["last_action"] for b in bundles], axis=0)            # (B, N)
+        dret_all = np.stack([b["daily_return"] for b in bundles], axis=0)               # (B, N)
+        prices_all = np.stack([b["prices"] for b in bundles], axis=0)                   # (B, N)
+        rf_z_all = np.asarray([b["rf_zscore"] for b in bundles], dtype=np.float32)      # (B,)
+        alpha_rf_all = np.stack([b["excess_log_return_over_rf"] for b in bundles], axis=0)  # (B, N)
+
+        asset_notional = shares_all * prices_all
+        # Log-ratios with gating at 0 (matches get_observation_single_step L3973-3976)
+        eps = 1e-12
+        initial_pv = self.initial_portfolio_value
+        cash_log_value = np.where(cash_all > 0, np.log(np.maximum(cash_all, eps) / initial_pv), 0.0).astype(np.float32)
+        asset_log_value = np.where(asset_notional > 0, np.log(np.maximum(asset_notional, eps) / initial_pv), 0.0).astype(np.float32)
+
+        rf_z_rep = np.repeat(rf_z_all[:, None], repeats=N, axis=1)
+        mem_block = np.stack(
+            [cash_log_value, asset_log_value, dret_all, last_act_all, rf_z_rep, alpha_rf_all], axis=-1
+        )  # (B, N, 6)
+
+        # Flatten to rows r = b * N + a and append the trailing one-hot asset-ID block so the
+        # layout matches SAA training: [features, portfolio_features(6), one_hot_asset_id(N)].
+        saa_obs = np.concatenate([saa_market_feats, mem_block], axis=-1).reshape(B * N, -1)
+        one_hot = self._asset_one_hot_batch if B == self.venv.num_envs else np.tile(self._asset_one_hot, (B, 1))
+        batch_obs = np.concatenate([saa_obs, one_hot], axis=-1).astype(np.float32)
+        batch_obs = _normalize_obs_with_vecnormalize(batch_obs, self.saa_vecnormalize)
+
+        # SB3 recurrent policies expect NumPy observations; a CUDA tensor would break
+        # policy.obs_to_tensor's internal np.array() conversion.
+        actions, state_out = self.saa_model.policy.predict(
+            batch_obs,
+            state=self.saa_state,
+            episode_start=np.asarray(self.episode_start[: B * N], dtype=bool),
+            deterministic=True,
+        )
+        self.saa_state = state_out
+
+        if isinstance(actions, torch.Tensor):
+            actions_np = actions.detach().cpu().numpy()
+        else:
+            actions_np = np.asarray(actions)
+        raw_signal = np.clip(actions_np[:, 0:1], -1.0, 1.0)
+        # Rescale to the target_position_change range actually seen by env.step() during
+        # SAA training/inference (see SingleAssetEpisodeAdapter.step() action_factor_fn).
+        signals = (raw_signal * self.action_limiting_factor).reshape(B, N, 1).astype(np.float32)
+        self._last_signals = signals
+        return signals
+
+    def _commit_saa_actions(self, signals: np.ndarray) -> None:
+        """Apply the SAA actions to each env's sub-portfolio so the next step marks to market."""
+        for b in range(signals.shape[0]):
+            self.venv.env_method("apply_saa_sub_actions", signals[b, :, 0], indices=b)
+
+    def _inject_signals(self, obs: np.ndarray, signals: np.ndarray) -> np.ndarray:
         """
         Input obs: (B, num_assets*raw_feat_dim + portfolio_dim)
         Output obs: asset part becomes num_assets*(raw_feat_dim+1) with SAA signal appended per asset.
         """
-        B = obs.shape[0]  # typically 1 (single DummyVecEnv)
+        B = obs.shape[0]
         asset_block = self.num_assets * self.raw_feat_dim
-        asset_flat = obs[:, :asset_block]           # (B, N*F)
-        portfolio_part = obs[:, asset_block:]       # (B, P)
-        asset_feats = asset_flat.reshape(B, self.num_assets, self.raw_feat_dim)  # (B, N, F)
-
-        # Select the configured SAA market features.
-        saa_market_feats = asset_feats[:, :, self.saa_idx]
-
-        # --- Build SAA per-asset obs EXACTLY like SAA training (num_saa_features + 6) ---
-        # Read per-asset hypothetical sub-portfolio state from each underlying env's buffer.
-        num_envs = obs.shape[0]
-        N = self.num_assets
-        initial_pv = float(self._base_envs[0].initial_portfolio_value)  # cached in __init__
-
-        cash_all   = np.zeros((num_envs, N), dtype=np.float32)
-        shares_all = np.zeros((num_envs, N), dtype=np.float32)
-        last_act_all = np.zeros((num_envs, N), dtype=np.float32)
-        dret_all   = np.zeros((num_envs, N), dtype=np.float32)
-        prices_all = np.zeros((num_envs, N), dtype=np.float32)
-        rf_z_all = np.zeros((num_envs, 1), dtype=np.float32)
-        alpha_rf_all = np.zeros((num_envs, N), dtype=np.float32)
-
-        for b in range(num_envs):
-            env_b = self._base_envs[b]
-            c, s, la, dr = env_b.episode_buffer.get_saa_sub_state(env_b.current_step)
-            cash_all[b]   = c
-            shares_all[b] = s
-            last_act_all[b] = la
-            dret_all[b]   = dr
-            prices_all[b] = env_b.portfolio_state.prices
-            rf_z_all[b, 0] = env_b.market_data_cache.get_risk_free_rate_zscore_at_step(env_b.current_absolute_step)
-            alpha_rf_all[b] = env_b.market_data_cache.get_all_assets_excess_log_return_over_rf_at_step(
-                env_b.current_absolute_step
-            )
-
-        asset_notional = shares_all * prices_all                                                  # (B, N)
-        # Log-ratios with gating at 0 (matches get_observation_single_step L3973-3976)
-        eps = 1e-12
-        cash_log_value  = np.where(cash_all        > 0, np.log(np.maximum(cash_all,        eps) / initial_pv), 0.0).astype(np.float32)
-        asset_log_value = np.where(asset_notional  > 0, np.log(np.maximum(asset_notional,  eps) / initial_pv), 0.0).astype(np.float32)
-
-        # Stack into per-asset 6-feature memory block: (B, N, 6)
-        rf_z_rep = np.repeat(rf_z_all, repeats=N, axis=1)
-        mem_block = np.stack([cash_log_value, asset_log_value, dret_all, last_act_all, rf_z_rep, alpha_rf_all], axis=-1)  # (B, N, 6)
-
-        # Combine with configured SAA market features
-        saa_obs = np.concatenate([saa_market_feats, mem_block], axis=-1)                          # (B, N, F_saa + 6)
-
-        # Collect SAA signals per asset using distinct models/states
-        signals = []
-        for a in range(self.num_assets):
-            # Append trailing one-hot asset-ID block to exactly match SAA training observation
-            # layout: [features, portfolio_features(6), one_hot_asset_id(N)]. Without this block
-            # InputMLPFeatures.forward() slices the wrong tail as the asset-ID one-hot.
-            one_hot = np.tile(self._asset_one_hot[a], (num_envs, 1))                # (B, N)
-            asset_obs = np.concatenate([saa_obs[:, a, :], one_hot], axis=-1)        # (B, F_saa+6+N)
-            per_asset_obs = _normalize_obs_with_vecnormalize(asset_obs, self.saa_vecnormalize)
-
-            # SB3 recurrent policies expect NumPy-based observations for .predict().
-            # Passing a CUDA torch tensor here triggers stable_baselines3 policy.obs_to_tensor ->
-            # np.array(torch_tensor), which raises "can't convert cuda:0 device type tensor to numpy".
-            episode_start = np.asarray(self.episode_start[a], dtype=bool)
-            actions, state_out = self.saa_models[a].policy.predict(
-                per_asset_obs,
-                state=self.saa_states[a],
-                episode_start=episode_start,
-                deterministic=True,
-            )
-            self.saa_states[a] = state_out
-
-            if isinstance(actions, torch.Tensor):
-                actions_np = actions.detach().cpu().numpy()
-            else:
-                actions_np = np.asarray(actions)
-            raw_signal = np.clip(actions_np[:, 0:1], -1.0, 1.0)
-            # Rescale to the target_position_change range actually seen by env.step() during
-            # SAA training/inference (see SingleAssetEpisodeAdapter.step() action_factor_fn).
-            signals.append(raw_signal * self.action_limiting_factor)  # (B, 1)
-
-        saa_sig = np.stack(signals, axis=1)  # (B, N, 1)
-        
-        # After the for-a loop, saa_sig has shape (B, N, 1). Commit the actions to each underlying env
-        # so the sub-portfolios update for the next step's MTM.
-        for b in range(num_envs):
-            self._base_envs[b].apply_saa_sub_actions(saa_sig[b, :, 0])
-
-        # Inject SAA signal into asset features
-        augmented_assets = np.concatenate(
-            [asset_feats, saa_sig],
-            axis=-1,
-        ).reshape(B, -1)  # (B, N*(F+1)) => N*(31)
-
+        asset_feats = obs[:, :asset_block].reshape(B, self.num_assets, self.raw_feat_dim)
+        portfolio_part = obs[:, asset_block:]
+        augmented_assets = np.concatenate([asset_feats, signals], axis=-1).reshape(B, -1)
         return np.concatenate([augmented_assets, portfolio_part], axis=1)
-    
+
+
+class PortfolioEpisodeAdapter(gym.Wrapper):
+    """
+    Lets the eval callback drive deterministic validation episodes through a VecEnv.
+
+    Each env is handed a queue of episode plans; every reset() consumes the next one and
+    forwards it as reset options. Once the queue is empty the env falls back to normal
+    sampling, and `plans_remaining` reports 0 so the caller can stop collecting.
+    """
+
+    def __init__(self, env: gym.Env):
+        super().__init__(env)
+        self._plan_queue: List[Dict[str, Any]] = []
+
+    def get_validation_sweep_plan(self) -> List[Dict[str, Any]]:
+        """One episode per validation block, spanning the block in full, starting from cash."""
+        cache = self.env.market_data_cache
+        blocks = sorted(cache.validation_blocks, key=lambda b: b.start_date_idx)
+        plans: List[Dict[str, Any]] = []
+        for block in blocks:
+            start_step = int(block.min_start_step)
+            episode_length = int(block.end_date_idx - start_step)
+            plans.append(
+                {
+                    "block_id": str(block.block_id),
+                    "episode_start_step": start_step,
+                    "episode_length_override": episode_length,
+                    "force_cash_only_start": True,
+                }
+            )
+        return plans
+
+    def set_plan_queue(self, plans: Sequence[Dict[str, Any]]) -> None:
+        self._plan_queue = [dict(p) for p in plans]
+
+    @property
+    def plans_remaining(self) -> int:
+        return len(self._plan_queue)
+
+    def get_plans_remaining(self) -> int:
+        return len(self._plan_queue)
+
+    def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
+        reset_options = dict(options) if options is not None else {}
+        if self._plan_queue:
+            reset_options.update(self._plan_queue.pop(0))
+        return self.env.reset(seed=seed, option=reset_options if reset_options else None)
+
+    def step(self, action):
+        return self.env.step(action)
+
 
 class AttentionEngine(nn.Module):
     def __init__(self, feature_dim: int, n_assets: int, d_model: int, n_heads: int, 
@@ -1828,7 +1561,7 @@ def build_allocator_model(
 
 
 def build_allocator_eval_callback(
-    eval_env: gym.Env,
+    eval_env: VecEnv,
     config: Dict[str, Any],
     log_dir: str
 ) -> BaseCallback:
@@ -1839,9 +1572,10 @@ def build_allocator_eval_callback(
     for comprehensive evaluation on validation data during training.
     
     Args:
-        eval_env: Validation environment (should be VecNormalized with training=False)
+        eval_env: Validation environment (VecNormalized with training=False, envs wrapped
+                  in PortfolioEpisodeAdapter)
         config: Configuration dict containing training parameters
-        log_dir: Directory for best model checkpoint and evaluation logs
+        log_dir: Directory for checkpoints and evaluation logs
     
     Returns:
         AllocatorEvalCallback instance configured with validation metrics callback
@@ -1853,8 +1587,7 @@ def build_allocator_eval_callback(
     
     Config Keys Used:
     - training.eval_freq: Steps between evaluations (default: 10000)
-    - training.n_eval_episodes: Episodes per evaluation (default: 5)
-    - training.eval_deterministic: Use deterministic policy (default: False)
+    - training.patience / min_delta_reward / min_delta_sharpe: early stopping
     - training.verbose: Verbosity level (default: 1)
     """
     # Extract training configuration section
@@ -1868,18 +1601,7 @@ def build_allocator_eval_callback(
     patience = int(train_cfg.get("patience", 10))
     min_delta_reward = float(train_cfg.get("min_delta_reward", 0.0))
     min_delta_sharpe = float(train_cfg.get("min_delta_sharpe", 0.0))
-    
-    # Number of episodes to run per evaluation
-    # More episodes = more stable statistics but slower evaluation
-    # Default: 5 episodes (balance between speed and reliability)
-    n_eval_episodes = int(train_cfg.get("n_eval_episodes", 5))
-    
-    # Whether to use deterministic policy during evaluation
-    # True = no exploration noise (pure exploitation)
-    # False = sample from policy distribution (mirrors training behavior)
-    # Default: False (to see realistic performance with exploration)
-    eval_deterministic = bool(train_cfg.get("eval_deterministic", False))
-    
+
     # Verbosity level for logging
     # 0 = silent, 1 = info, 2 = debug
     verbose = int(train_cfg.get("verbose", 1))
@@ -1896,18 +1618,16 @@ def build_allocator_eval_callback(
     # --- Create Main Evaluation Callback ---
     
     # This callback:
-    # 1. Triggers evaluation every eval_freq steps
-    # 2. Runs n_eval_episodes on validation data
-    # 3. Forwards per-step metrics to val_metrics_cb
-    # 4. Saves best model based on mean reward
+    # 1. Triggers a deterministic sweep every eval_freq calls
+    # 2. Runs one full-length episode per validation block, starting from 100% cash
+    # 3. Forwards per-episode infos to val_metrics_cb
+    # 4. Saves checkpoints on excess-over-SPY, mean terminal PnL and worst-block terminal PnL
     # 5. Logs evaluation results to TensorBoard and disk
     eval_callback = AllocatorEvalCallback(
         eval_env=eval_env,                    # Validation environment (VecNormalized)
-        best_model_save_path=log_dir,         # Directory for best_model.zip checkpoint
+        best_model_save_path=log_dir,         # Directory for checkpoints
         log_path=log_dir,                     # Directory for evaluations.npz logs
         eval_freq=eval_freq,                  # Steps between evaluations
-        n_eval_episodes=n_eval_episodes,      # Episodes per evaluation run
-        deterministic=eval_deterministic,          # Policy sampling mode
         eval_step_callback=val_metrics_cb,    # Nested callback for metrics accumulation
         patience=patience, 
         min_delta_reward=min_delta_reward, 
@@ -1919,8 +1639,8 @@ def build_allocator_eval_callback(
     if verbose > 0:
         print(f"[build_allocator_eval_callback] Configured evaluation:")
         print(f"  eval_freq: {eval_freq} steps")
-        print(f"  n_eval_episodes: {n_eval_episodes}")
-        print(f"  deterministic: {eval_deterministic}")
+        print(f"  mode: deterministic sweep over all validation blocks (100% cash start)")
+        print(f"  eval_envs: {eval_env.num_envs}")
         print(f"  log_dir: {log_dir}")
     
     return eval_callback
@@ -1962,12 +1682,12 @@ def _collect_mc_dataset_random_policy(
     gamma: float
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Collect offline dataset from random actions.
+    Collect offline dataset from random actions across all parallel envs.
     Returns:
     - obs_all: [N, obs_dim]
     - rtg_all: [N]
     """
-    assert vec_env.num_envs == 1, "Project rule: single env only"
+    n_envs = int(vec_env.num_envs)
 
     old_training = bool(vec_env.training)
     old_norm_reward = bool(vec_env.norm_reward)
@@ -1979,19 +1699,7 @@ def _collect_mc_dataset_random_policy(
     all_obs: List[np.ndarray] = []
     all_targets: List[np.ndarray] = []
 
-    for _ in range(n_episodes):
-        obs = vec_env.reset()  # [1, obs_dim]
-        done = False
-        ep_obs: List[np.ndarray] = []
-        ep_rewards: List[float] = []
-
-        while not done:
-            ep_obs.append(obs[0].astype(np.float32, copy=True))  # [obs_dim]
-            action = _sample_random_vec_action(vec_env)          # [1, action_dim]
-            obs, rewards, dones, _ = vec_env.step(action)
-            ep_rewards.append(float(rewards[0]))
-            done = bool(dones[0])
-
+    def _finalize(ep_obs: List[np.ndarray], ep_rewards: List[float]) -> None:
         r = np.asarray(ep_rewards, dtype=np.float32)             # [T]
         y = np.zeros_like(r, dtype=np.float32)                   # [T]
         running = np.float32(0.0)
@@ -2003,6 +1711,25 @@ def _collect_mc_dataset_random_policy(
         assert ep_obs_np.shape[0] == y.shape[0]
         all_obs.append(ep_obs_np)
         all_targets.append(y)
+
+    # Per-env trajectory buffers; VecEnv auto-resets, so episodes are flushed on done.
+    ep_obs_buf: List[List[np.ndarray]] = [[] for _ in range(n_envs)]
+    ep_rew_buf: List[List[float]] = [[] for _ in range(n_envs)]
+    episodes_done = 0
+
+    obs = vec_env.reset()  # [n_envs, obs_dim]
+    while episodes_done < n_episodes:
+        for i in range(n_envs):
+            ep_obs_buf[i].append(obs[i].astype(np.float32, copy=True))
+        action = _sample_random_vec_action(vec_env)              # [n_envs, action_dim]
+        obs, rewards, dones, _ = vec_env.step(action)
+        for i in range(n_envs):
+            ep_rew_buf[i].append(float(rewards[i]))
+            if dones[i]:
+                _finalize(ep_obs_buf[i], ep_rew_buf[i])
+                ep_obs_buf[i] = []
+                ep_rew_buf[i] = []
+                episodes_done += 1
 
     vec_env.training = old_training
     vec_env.norm_reward = old_norm_reward
@@ -2137,6 +1864,85 @@ def _reset_ppo_optimizer_after_pretraining(model: PPO) -> None:
     model._n_updates = 0
 
 # ================================
+# Environment Construction
+# ================================
+
+def _make_trading_env(cache: MarketDataCache, config: Dict[str, Any], mode: str, seed: int, for_eval: bool):
+    """Env factory; must stay picklable for SubprocVecEnv with start_method='spawn'."""
+    def _init():
+        # TradingEnv draws its episode starts and random initial allocations from the global
+        # numpy RNG, so each worker needs its own stream.
+        np.random.seed(seed)
+        env = TradingEnv(config=config, market_data_cache=cache, mode=mode)
+        if for_eval:
+            return PortfolioEpisodeAdapter(env)
+        return env
+    return _init
+
+
+def _build_saa_wrapped_envs(
+    cache: MarketDataCache,
+    config: Dict[str, Any],
+    seed: int,
+    saa_model: Any,
+    saa_vecnorm: Optional[VecNormalize],
+    saa_device: torch.device,
+    saa_action_limiting_factor: float,
+    num_assets: int,
+    tag: str,
+) -> Tuple["SAASignalWrapper", "SAASignalWrapper"]:
+    """
+    Build the parallel train/eval vector envs and wrap both in SAA signal injection.
+
+    The eval env gets one worker per validation block at most, so no eval worker idles
+    during the deterministic sweep.
+    """
+    train_cfg = config.get("training", {})
+    n_envs = int(train_cfg.get("n_envs", 1))
+    if n_envs < 1:
+        raise ValueError(f"training.n_envs must be >= 1, got {n_envs}")
+    start_method = str(train_cfg.get("vec_env_start_method", "spawn"))
+    if start_method not in ("spawn", "fork", "forkserver"):
+        raise ValueError(
+            f"training.vec_env_start_method must be one of spawn/fork/forkserver, got '{start_method}'"
+        )
+
+    n_blocks = len(cache.validation_blocks)
+    if n_blocks == 0:
+        raise RuntimeError("No validation blocks available; cannot build the validation sweep.")
+    n_eval_envs = min(n_envs, n_blocks)
+
+    def _vectorize(env_fns):
+        if len(env_fns) == 1:
+            return DummyVecEnv(env_fns)
+        return SubprocVecEnv(env_fns, start_method=start_method)
+
+    train_fns = [_make_trading_env(cache, config, "train", seed + rank, for_eval=False) for rank in range(n_envs)]
+    eval_fns = [
+        _make_trading_env(cache, config, "validation", seed + n_envs + rank, for_eval=True)
+        for rank in range(n_eval_envs)
+    ]
+
+    vec_train_raw = _vectorize(train_fns)
+    vec_eval_raw = _vectorize(eval_fns)
+
+    print(
+        f"[{tag}] Vectorized envs: train={n_envs}, eval={n_eval_envs} (validation blocks={n_blocks}), "
+        f"class={'SubprocVecEnv' if n_envs > 1 else 'DummyVecEnv'}, start_method={start_method}"
+    )
+
+    vec_train_saa = SAASignalWrapper(
+        vec_train_raw, saa_model, saa_vecnorm, num_assets, saa_device, config=config,
+        feature_to_index=cache.feature_to_index, action_limiting_factor=saa_action_limiting_factor
+    )
+    vec_eval_saa = SAASignalWrapper(
+        vec_eval_raw, saa_model, saa_vecnorm, num_assets, saa_device, config=config,
+        feature_to_index=cache.feature_to_index, action_limiting_factor=saa_action_limiting_factor
+    )
+    return vec_train_saa, vec_eval_saa
+
+
+# ================================
 # Entry Point
 # ================================
 
@@ -2179,26 +1985,17 @@ def run(cache: MarketDataCache, config: Dict[str, Any]) -> Dict[str, Any]:
 
     # --- Build Environments for train/validation ---
     print("[run] Building training and evaluation environments...")
-    def make_env(mode: str):
-        return lambda: TradingEnv(
-            config=config, 
-            market_data_cache=cache, 
-            mode=mode
-        )
-    
-    # Create raw (not normalized) vectorized environments for training and evaluation
-    vec_train_raw = DummyVecEnv([make_env("train")])
-    vec_eval_raw = DummyVecEnv([make_env("validation")])
-
-    # Wrap envs with SAA signal injection
-    vec_train_saa = SAASignalWrapper(
-        vec_train_raw, saa_model, saa_vecnorm, num_assets, saa_device, config=config, 
-        feature_to_index=cache.feature_to_index, action_limiting_factor=saa_action_limiting_factor
-        )
-    vec_eval_saa = SAASignalWrapper(
-        vec_eval_raw, saa_model, saa_vecnorm, num_assets, saa_device, config=config, 
-        feature_to_index=cache.feature_to_index, action_limiting_factor=saa_action_limiting_factor
-        )
+    vec_train_saa, vec_eval_saa = _build_saa_wrapped_envs(
+        cache=cache,
+        config=config,
+        seed=seed,
+        saa_model=saa_model,
+        saa_vecnorm=saa_vecnorm,
+        saa_device=saa_device,
+        saa_action_limiting_factor=saa_action_limiting_factor,
+        num_assets=num_assets,
+        tag="run",
+    )
     
     # Normalize allocator (PAA) obs and/or reward after SAA augmentation
     vec_train = VecNormalize(
@@ -2546,51 +2343,29 @@ def continue_run(cache: MarketDataCache, config: Dict[str, Any], model_path: str
 
     # --- Build Environments for train/validation ---
     print("[continue_run] Building training and evaluation environments...")
-    def make_env(mode: str):
-        return lambda: TradingEnv(
-            config=config, 
-            market_data_cache=cache, 
-            mode=mode
-        )
-    
-    # Create raw (not normalized) vectorized environments
-    vec_train_raw = DummyVecEnv([make_env("train")])
-    vec_eval_raw = DummyVecEnv([make_env("validation")])
-
-    # Wrap envs with SAA signal injection
-    vec_train_saa = SAASignalWrapper(
-        vec_train_raw, saa_model, saa_vecnorm, num_assets, saa_device, config=config, 
-        feature_to_index=cache.feature_to_index, action_limiting_factor=saa_action_limiting_factor
-    )
-    vec_eval_saa = SAASignalWrapper(
-        vec_eval_raw, saa_model, saa_vecnorm, num_assets, saa_device, config=config, 
-        feature_to_index=cache.feature_to_index, action_limiting_factor=saa_action_limiting_factor
-    )
-    
-    # Create VecNormalize wrappers
-    vec_train = VecNormalize(
-        vec_train_saa,
-        norm_obs=True,
-        norm_reward=True,
-        clip_obs=10.0,
-        clip_reward=10.0,
-        gamma=gamma_cfg,
-        training=True,
-    )
-    vec_eval = VecNormalize(
-        vec_eval_saa,
-        norm_obs=True,
-        norm_reward=False,
-        clip_obs=10.0,
-        clip_reward=10.0,
-        gamma=gamma_cfg,
-        training=False,
+    vec_train_saa, vec_eval_saa = _build_saa_wrapped_envs(
+        cache=cache,
+        config=config,
+        seed=seed,
+        saa_model=saa_model,
+        saa_vecnorm=saa_vecnorm,
+        saa_device=saa_device,
+        saa_action_limiting_factor=saa_action_limiting_factor,
+        num_assets=num_assets,
+        tag="continue_run",
     )
 
     # Load VecNormalize stats from saved pickle file
     vecnorm_path = os.path.join(saved_models_dir, model_dir_name, "vecnormalize_stats.pkl")
     if not os.path.isfile(vecnorm_path):
-        raise FileNotFoundError(f"VecNormalize stats not found at {vecnorm_path}")
+        # Checkpoints are now written as "<stem>_vecnormalize.pkl" next to "<stem>.zip".
+        stem = os.path.splitext(os.path.basename(model_path))[0]
+        fallback = os.path.join(saved_models_dir, model_dir_name, f"{stem}_vecnormalize.pkl")
+        if not os.path.isfile(fallback):
+            raise FileNotFoundError(
+                f"VecNormalize stats not found at {vecnorm_path} nor {fallback}"
+            )
+        vecnorm_path = fallback
     
     # Load training VecNormalize stats
     vec_train = VecNormalize.load(vecnorm_path, venv=vec_train_saa)
