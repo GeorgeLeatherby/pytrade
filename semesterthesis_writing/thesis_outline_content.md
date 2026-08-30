@@ -4,22 +4,41 @@
 **Environment:** Custom coded env called PyTrade
 
 ## 1. Introduction
-
-* **1.1 Motivation:** Financial markets represent highly volatile and complex decision-making environments in artificial intelligence. Research in this domain explores the boundaries of how reinforcement learning agents handle noise, non-stationarity, and multi-layered problem spaces. This thesis objective is not to claim novel alpha, but to explore a new architecture for continous multi-asset trading agents using a hierarchical DRL approach. Finance serves as an interesting and challenging topic for this thesis, not as the primary driver. Then proceed to explain: Why buying and holding ETFs might not be the most efficient strategy with the given amount of data and tools available. Transitioning from static forecasting to sequential decision-making in non-stationary markets. Why DRL is good at sequential decisions.
+* **1.1 Motivation:** Financial markets represent highly volatile and complex decision-making environments in artificial intelligence. Research in this domain explores the boundaries of how reinforcement learning agents handle noise, non-stationarity, and multi-layered problem spaces. This thesis objective is not to claim novel alpha, but to explore a new architecture for continous multi-asset trading agents using a hierarchical DRL approach. Finance serves as an interesting and challenging topic for this thesis, not as the primary topic driver. Then proceed to explain: Why buying and holding ETFs might not be the most efficient strategy with the given amount of data and tools available. Explain the transitioning from static forecasting to sequential decision-making in non-stationary markets. Why DRL is a good fit at sequential decisions. Research question which should be incorporated into the motivations naturally: Does modularizing temporal (Single-Asset) and cross-sectional (Portfolio-Level) functions improve stability and efficiency?
 * **1.2 Problem Description:** The challenge of high-dimensional continuous action spaces and the low signal-to-noise ratio in financial data. 
-* **1.3 Research Question:** Does modularizing temporal (Single-Asset) and cross-sectional (Portfolio-Level) functions improve stability and efficiency?
 
 ## 2. Literature Review (Citations needed! Description of the state of the art)
-
-* **2.1 Quantitative Finance and Deep Reinforcement Learning:** A brief paragraph on the major develoment steps of modern quantitative finance. Using literature this section explains which methods and technologies have been tried. E.g.: the evolution from DQN to PPO in portfolio management. Differences between 3-barrier method with discrete trades (Lopez de Prado) and continous trading setup, such as the architecture proposed in this paper.
-* **2.2 Temporal Memory in Financial Series:** Comparison of RNNs, LSTMs, and TCNs for state representation using literature. Should also cover temporal memory in price series and why integer differentiation looses memory while producing stationarity. Mention that the solution to this issue is adressed in section 3 and that it is possible to produce stationary, memory preserving features.
-* **2.3 Attention Mechanisms:** Section explaining how attention has been used in quantitative finance so far. Explain how attention is used for temporal signals such as a sequence of words in LLMs. Also give other examples if fitting papers are provided or found. 
+* **2.1 Quantitative Finance and Deep Reinforcement Learning:** A brief paragraph on the major develoment steps of modern quantitative finance. Using literature this section explains which methods and technologies have been tried. E.g.: the general evolution of deep learning, or discrete actions vs continous actions in portfolio management. How deep learning got incorporated into quantitative finance. Differences between 3-barrier method with discrete trades (Lopez de Prado) and continous trading setup, such as the architecture proposed in this paper.
+* **2.2 Temporal Memory in Financial Series:** Comparison of recurrent architectures and algorithms (such as RNNs, LSTMs, and TCNs) for state representation using literature. Should also cover temporal memory in price series and why integer differentiation looses memory while producing stationarity. Mention that the solution to this issue is adressed in section 3 and that it is possible to produce stationary, memory preserving features. This section should clearly state the difference between recurrrent algorithms, recurrent architecture and memory in features using the available literature.
+* **2.3 Attention Mechanisms:** Section explaining how attention has been used in quantitative finance so far. Explain how attention is used for temporal signals such as a sequence of words in LLMs. Show how using attention for cross asset relations has been used in the literature and why this is an idea worth persuing.
 * **2.4 Hierarchical & Modular RL:** Theoretical basis for decomposing complex policies into specialized modules. Showcase of what has been tried in this domain so far, especially in quantitative finance.
 
 ## 3. System Design & Methodology
+General introduction of the concept used in PyTrade: Training is conducted in 2 seperate steps. The SAA trades a single randomly choosen asset from the universe. The intend is for the SAA to learn general temporal features across the asset universe. It has a small learned embedding vector to react to the characteristics of each asset and build an internal temporal model. Once a strategy for the SAA has been found which shows sufficient trading results (alpha compared to SPY and proper risk assessment (sharpe)), the SAA is frozen and deepcopied for each asset. The n SAAs are now operating in a shadow portfolio as advisors to the PAA, which has as inputs asset tokens containing raw asset information, SAA state information (action, std, executed trade, shadow portfolio metrics, etc.) and a portfolio token for tha actual portfolio metrics of the live traded portfolio. The same train, validation and test split is used for training the PAA. I am aware that this might result in overly confident SAA interpretations and would introduce some noise to the SAA signals, if necessary. This has not yet been implemented however and will be based on the running research. 
 
-General introduction of the concept used in PyTrade.
-* **3.1 Markov Decision Process (MDP):** Formal definition of State $\mathcal{S}$, Action $\mathcal{A}$, Transition $\mathcal{P}$, and Reward $\mathcal{R}$ of the SAA and the PAA.
+
+# Section 3.1: Markov Decision Process (MDP) & Observation Fidelity
+
+This section formalizes the decision-making framework for both the Single-Asset Agent (SAA) and Portfolio Allocator Agent (PAA) as Partially Observable Markov Decision Processes (POMDPs). While the environments provide complete market observations at each step, the recurrent architectures used (LSTM in SAA, Self-Attention in PAA) maintain hidden state that is not directly observable, motivating the POMDP formulation. The distinction between state $\mathcal{S}$ (true underlying environment state) and observation $\mathcal{O}$ (agent-accessible information) is critical for understanding information flow and ensuring that learned behaviors transfer correctly when SAA modules are deployed in the PAA.
+
+---
+
+## 3.1.1 Mathematical Framework
+
+### General POMDP Definition
+
+A Partially Observable Markov Decision Process is a tuple $(\mathcal{S}, \mathcal{A}, \mathcal{O}, \mathcal{P}, \mathcal{R}, \mathcal{Z}, \gamma)$ where:
+
+- $\mathcal{S}$: State space (true environment state, not fully observable)
+- $\mathcal{A}$: Action space (agent's decision set)
+- $\mathcal{O}$: Observation space (agent-accessible signal)
+- $\mathcal{P}: \mathcal{S} \times \mathcal{A} \times \mathcal{S} \to [0,1]$: State transition probability
+- $\mathcal{R}: \mathcal{S} \times \mathcal{A} \to \mathbb{R}$: Reward function
+- $\mathcal{Z}: \mathcal{S} \to \mathcal{O}$: Observation model (deterministic in this work)
+- $\gamma$: Discount factor (not explicitly used; episodes are finite)
+
+The agent maintains a belief state $b(s)$ over $\mathcal{S}$ and learns a policy $\pi: \mathcal{H} \to \mathcal{A}$ that maps recurrent hidden states $\mathcal{H}$ (maintained by LSTM or Transformer) to actions.
+
 * **3.2 State Space Representation:** Mathematical derivation of stationary features from raw OHLCV. Introduction of memory preserving features (Lopez de Prado). Why just adding more data is not helpful and finding the right input data is so hard. Why Feature Engineering is essential and seen as even more important then backtesting.
 * **3.3 Action Space:** For SAA: continous weights indicating the change in position as a fraction of the total portfolio value. The fraction is a fixed number such as 0.2 meaning that an SAA ouput of 1 will lead to the agent buying 20% of portfolio value in the step, if enough cash is available. An output of -0.5 would lead to selling 10% of portfolio value, if possible with current asset inventory. 
 For PAA: continuous portfolio weight targets $w \in \Delta^n$, executed in enclosing steps by the env based on the real current portfolio weights. For the SAA module, the action is a single scalar which is defined as the requested change in position relative to the current portfolio notional.
