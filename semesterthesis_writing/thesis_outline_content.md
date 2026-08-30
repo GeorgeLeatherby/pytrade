@@ -1,19 +1,23 @@
 # Semesterthesis: Hierarchical Reinforcement Learning for Multi-Asset Trading
+
 **Topic:** Separating single asset temporal signal extraction from multi-asset attention for dynamic allocation in DRL for portfolio allocation problems \
 **Environment:** Custom coded env called PyTrade
 
 ## 1. Introduction
+
 * **1.1 Motivation:** Financial markets represent highly volatile and complex decision-making environments in artificial intelligence. Research in this domain explores the boundaries of how reinforcement learning agents handle noise, non-stationarity, and multi-layered problem spaces. This thesis objective is not to claim novel alpha, but to explore a new architecture for continous multi-asset trading agents using a hierarchical DRL approach. Finance serves as an interesting and challenging topic for this thesis, not as the primary driver. Then proceed to explain: Why buying and holding ETFs might not be the most efficient strategy with the given amount of data and tools available. Transitioning from static forecasting to sequential decision-making in non-stationary markets. Why DRL is good at sequential decisions.
 * **1.2 Problem Description:** The challenge of high-dimensional continuous action spaces and the low signal-to-noise ratio in financial data. 
 * **1.3 Research Question:** Does modularizing temporal (Single-Asset) and cross-sectional (Portfolio-Level) functions improve stability and efficiency?
 
 ## 2. Literature Review (Citations needed! Description of the state of the art)
+
 * **2.1 Quantitative Finance and Deep Reinforcement Learning:** A brief paragraph on the major develoment steps of modern quantitative finance. Using literature this section explains which methods and technologies have been tried. E.g.: the evolution from DQN to PPO in portfolio management. Differences between 3-barrier method with discrete trades (Lopez de Prado) and continous trading setup, such as the architecture proposed in this paper.
 * **2.2 Temporal Memory in Financial Series:** Comparison of RNNs, LSTMs, and TCNs for state representation using literature. Should also cover temporal memory in price series and why integer differentiation looses memory while producing stationarity. Mention that the solution to this issue is adressed in section 3 and that it is possible to produce stationary, memory preserving features.
 * **2.3 Attention Mechanisms:** Section explaining how attention has been used in quantitative finance so far. Explain how attention is used for temporal signals such as a sequence of words in LLMs. Also give other examples if fitting papers are provided or found. 
 * **2.4 Hierarchical & Modular RL:** Theoretical basis for decomposing complex policies into specialized modules. Showcase of what has been tried in this domain so far, especially in quantitative finance.
 
 ## 3. System Design & Methodology
+
 General introduction of the concept used in PyTrade.
 * **3.1 Markov Decision Process (MDP):** Formal definition of State $\mathcal{S}$, Action $\mathcal{A}$, Transition $\mathcal{P}$, and Reward $\mathcal{R}$ of the SAA and the PAA.
 * **3.2 State Space Representation:** Mathematical derivation of stationary features from raw OHLCV. Introduction of memory preserving features (Lopez de Prado). Why just adding more data is not helpful and finding the right input data is so hard. Why Feature Engineering is essential and seen as even more important then backtesting.
@@ -46,6 +50,7 @@ I am testing whether a neural network can allocate assets more efficiently when 
 * **3.10 Asset Universe:** Selection of the 11 instruments (2000-2025) and the rationale for their diversity including SPY, Gold, Oil, and international indices (EWG, EWQ).
 
 ## 4. Experimental Validation & Testing
+
 * **4.1 Out-of-Sample (OOS) Protocol:** Walk-forward testing on unseen data blocks to distinguish true Alpha from memorized noise.
 * **4.2 SAA Performance Baselines:**
     * **4.2.1 Cash-Only Baseline:** Comparing individual agent returns against holding only cash.
@@ -63,12 +68,12 @@ I am testing whether a neural network can allocate assets more efficiently when 
 * **4.8 Control (Randomized signal):** The hierarchical setup but with the SAA signals replaced by structured noise, testing whether performance gains stem from actual historical information rather than mere architectural complexity.
 * **4.9 Monolithic Baseline (End-to-end memory):** A standard recurrent PPO allocator that must learn both temporal memory and cross-asset allocation simultaneously. Might introduce a 2-layer LSTM to the PAA before or after transformer?
 
+NOTE: Erst erklären was man vergleichen möchte und warum. Dann erst in einem nächsten Kapitel die Ergebnisse präsentieren.
 
-NOTE: Erst erklären was man vergleichen möchte und warum. Dann erst in einem nächsten Kapitel die Ergebnisse präsentieren. 
-
-Idee für baselines: Rule-based investment mit-checken. 
+Idee für baselines: Rule-based investment mit-checken.
 
 ## 5. Conclusion & Future Work
+
 * **5.1 Summary of Findings:** Validating the hierarchical approach for Financial RL and the success of "Box-based" reward shaping in stabilizing SAA agents.
 * **5.2 Limitations:** Data frequency constraints, the impact of zero-friction training assumptions, and the "sim-to-real" gap.
 * **5.3 Future Directions:** Multi-agent extensions for PAA coordination or integrating alternative data into the SAA temporal extraction layer.
