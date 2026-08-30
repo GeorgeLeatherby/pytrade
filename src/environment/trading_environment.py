@@ -248,6 +248,7 @@ class EpisodeBuffer:
     previous_max_drawdown: np.ndarray = field(init=False)  # [episode_buffer_length_days] - previous max drawdown for reward component
     risk_free_rate_zscore_60d: np.ndarray = field(init=False)  # [episode_buffer_length_days] - aligned risk-free z-score feature
     risk_free_rate_daily: np.ndarray = field(init=False)  # [episode_buffer_length_days] - portfolio excess log return over daily risk-free
+    risk_free_rate_daily_raw: np.ndarray = field(init=False)  # [episode_buffer_length_days] - raw daily EFFR-derived carry rate (same source as SAA obs)
 
     # weights, alpha, sharpe_ratio, drawdown, volatility, turnover, allocator_rewards
 
@@ -277,7 +278,7 @@ class EpisodeBuffer:
         # If num_features is not available, set to 0
         num_features = getattr(self, "num_features", 0)
         self.current_step = 0
-        self.num_portfolio_features = self.num_assets + 1 + 13  # weights + 13 portfolio metrics used by get_observation_at_step
+        self.num_portfolio_features = self.num_assets + 1 + 14  # weights + 14 portfolio metrics used by get_observation_at_step
         self.action_entropy = np.zeros(self.episode_buffer_length_days, dtype=dtype) 
         # Reward component tracking (per-step)
         self.reward_alpha = np.zeros(self.episode_buffer_length_days, dtype=dtype)
@@ -295,6 +296,7 @@ class EpisodeBuffer:
         self.previous_max_drawdown = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         self.risk_free_rate_zscore_60d = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         self.risk_free_rate_daily = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.risk_free_rate_daily_raw = np.zeros(self.episode_buffer_length_days, dtype=dtype)
         # --- Per-asset hypothetical SAA sub-portfolio containers ---
         # Used ONLY in PORTFOLIO_WEIGHTS execution mode to feed frozen SAAs inside SAASignalWrapper.
         # One independent sub-portfolio per asset; each mimics SAA-training obs inputs.
@@ -316,6 +318,7 @@ class EpisodeBuffer:
                    running_mean_ema: float = 0.0, downside_var_sqrt: float = 0.0, previous_max_drawdown: float = 0.0,
                    risk_free_rate_zscore_60d: float = 0.0,
                    risk_free_rate_daily: float = 0.0,
+                   risk_free_rate_daily_raw: float = 0.0,
                    selected_asset_bh_portfolio_value: float = 0.0, selected_asset_bh_transaction_cost: float = 0.0) -> None:
         
         """
@@ -359,6 +362,7 @@ class EpisodeBuffer:
         self.previous_max_drawdown[internal_offset_step] = previous_max_drawdown
         self.risk_free_rate_zscore_60d[internal_offset_step] = risk_free_rate_zscore_60d
         self.risk_free_rate_daily[internal_offset_step] = risk_free_rate_daily
+        self.risk_free_rate_daily_raw[internal_offset_step] = risk_free_rate_daily_raw
         # Reward components
         if reward_parts is not None:
             self.reward_alpha[internal_offset_step] = reward_parts.get("alpha_component", 0.0)
@@ -587,6 +591,7 @@ class EpisodeBuffer:
         prev_max_dd_seq = self.previous_max_drawdown[start_idx:end_idx+1].reshape(-1, 1)
         rf_zscore_seq = self.risk_free_rate_zscore_60d[start_idx:end_idx+1].reshape(-1, 1)
         rf_daily_seq = self.risk_free_rate_daily[start_idx:end_idx+1].reshape(-1, 1)
+        rf_daily_raw_seq = self.risk_free_rate_daily_raw[start_idx:end_idx+1].reshape(-1, 1)
 
         # Concatenate all features along last axis
         features_seq = np.concatenate([
@@ -604,6 +609,7 @@ class EpisodeBuffer:
             prev_max_dd_seq,
             rf_zscore_seq,
             rf_daily_seq,
+            rf_daily_raw_seq,
         ], axis=1)
 
         # Place into output array (pad at beginning if needed)
@@ -638,6 +644,7 @@ class EpisodeBuffer:
         previous_max_drawdown = self.previous_max_drawdown[internal_step]
         risk_free_rate_zscore_60d = self.risk_free_rate_zscore_60d[internal_step]
         risk_free_rate_daily = self.risk_free_rate_daily[internal_step]
+        risk_free_rate_daily_raw = self.risk_free_rate_daily_raw[internal_step]
 
         # rewards = self.allocator_rewards[internal_step] # Why feed reward.
         effective_asset_concentration_norm = self.effective_asset_concentration_norm[internal_step]
@@ -645,7 +652,8 @@ class EpisodeBuffer:
         observation = np.concatenate([
             weights,
             [alpha, sharpe, drawdown, volatility, turnover, effective_asset_concentration_norm, previous_sortino, 
-            current_sortino, running_mean_ema, downside_var_sqrt, previous_max_drawdown, risk_free_rate_zscore_60d, risk_free_rate_daily]
+            current_sortino, running_mean_ema, downside_var_sqrt, previous_max_drawdown, risk_free_rate_zscore_60d, risk_free_rate_daily,
+            risk_free_rate_daily_raw]
         ]).astype(np.float32)
 
         return observation
@@ -2501,6 +2509,7 @@ class TradingEnv(gym.Env):
             effective_asset_concentration_norm=effective_asset_concentration_norm,
             risk_free_rate_zscore_60d=float(self.market_data_cache.get_risk_free_rate_zscore_at_step(self.current_absolute_step)),
             risk_free_rate_daily=0.0,
+            risk_free_rate_daily_raw=float(self.market_data_cache.get_risk_free_rate_daily_at_step(self.current_absolute_step)),
             selected_asset_bh_portfolio_value=self.selected_asset_bh_portfolio_state.get_total_value(),
             selected_asset_bh_transaction_cost=self.selected_asset_bh_init_transaction_cost
         )
@@ -3091,6 +3100,7 @@ class TradingEnv(gym.Env):
             previous_max_drawdown=reward_parts.get("previous_max_drawdown", None),
             risk_free_rate_zscore_60d=float(self.market_data_cache.get_risk_free_rate_zscore_at_step(self.current_absolute_step)),
             risk_free_rate_daily=portfolio_excess_log_return_over_rf,
+            risk_free_rate_daily_raw=float(daily_cash_return),
             selected_asset_bh_portfolio_value=float(self.selected_asset_bh_portfolio_state.get_total_value()),
             selected_asset_bh_transaction_cost=0.0  # No transaction costs after initialization (buy-and-hold)
         )
