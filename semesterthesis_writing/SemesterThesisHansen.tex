@@ -19,10 +19,7 @@
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %\input{./Ressourcen/Stellenausschreibung/Praeambel.tex} % !!! NICHT ENTFERNEN !!!
 % Übertragen
-\documentclass[10pt]{scrlttr2} % Dokumentenklasse: KOMA-Skript Letter
-
-% Anpassbare Kopf- und Fußzeilen für KOMA-Skript:
-%\usepackage{scrlayer-scrpage}
+\documentclass[10pt]{scrartcl} % Regular KOMA-Script article with the chair's header layout
 
 \usepackage[utf8]{inputenc} % Textkodierung: UTF-8
 \usepackage[T1]{fontenc} % Zeichensatzkodierung
@@ -143,7 +140,7 @@
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 \usepackage[a4paper,
-top=\Seitenrand,
+top=\TextOben,
 bottom=\Seitenrand,
 inner=\SeitenrandLinks,
 outer=\SeitenrandLinks,
@@ -161,31 +158,27 @@ head=0cm
 	pdftitle={\ThesisTopic}
 }
 
-\renewcommand*{\raggedsignature}{\raggedright}
+\KOMAoptions{fontsize=\TextSchriftgroesse}
 
-\makeatletter
-\setplength{refvpos}{\TextOben}
-\makeatother
+\setcounter{secnumdepth}{2}
+\setcounter{tocdepth}{2}
+\setkomafont{disposition}{\normalfont\bfseries}
 
-\KOMAoptions{
-	fontsize=\TextSchriftgroesse,
-	refline=nodate,
-	foldmarks=false,
-	firsthead=false,
-	firstfoot=false,
-	backaddress=no,
-	addrfield=no,
-	fromalign=false
-}
+\RedeclareSectionCommand[
+	beforeskip=1.5\baselineskip,
+	afterskip=0.5\baselineskip
+]{section}
 
-\setkomavar{fromname}{\UniversitaetName}
-%\setkomavar{fromaddress}{\PersonAdresse}
-\KOMAoption{fontsize}{10pt}
+\RedeclareSectionCommand[
+	beforeskip=1\baselineskip,
+	afterskip=0.25\baselineskip
+]{subsection}
+
 
 \newcommand{\TopicHeader}{\begin{flushleft}{\fontsize{19}{25}\selectfont\vspace*{0.8mm}\ThesisTopic}\end{flushleft}}
 \newcommand{\MinorHeader}[1]{\textbf{#1}\vspace*{-\baselineskip}}
 
-\AtBeginLetter{%
+\newcommand{\ChairHeader}{%
 	\begin{flushleft}
 		% Dreizeiler:
 		\begin{textblock*}{\textwidth}(0cm, 0cm)%
@@ -204,29 +197,235 @@ head=0cm
 		% Logo:
 		\begin{textblock*}{\UniversitaetLogoBreite}[1,0](\textwidth, 0cm)%
 			\raggedleft%
-			\includegraphics{./Universitaet_Logo_RGB.pdf}%
+			\includegraphics[width=\UniversitaetLogoBreite]{./Universitaet_Logo_RGB.pdf}%
 		\end{textblock*}%
 	\end{flushleft}
 	\setlength{\baselineskip}{\TextZeilenabstand}%
 	\setlength{\parindent}{0mm} % keine Einrückung am Absatzanfang
 	\setlength{\parskip}{\baselineskip} % einzeiliger Abstand nach Absätzen
 	\color{black}
-	
+}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% TUM-Vorlage: Stellenausschreibung
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+% Rechteinhaber:
+%     Technische Universität München
+%     https://www.tum.de
+% 
+% Gestaltung:
+%     ediundsepp Gestaltungsgesellschaft, München
+%     http://www.ediundsepp.de
+% 
+% Technische Umsetzung:
+%     eWorks GmbH, Frankfurt am Main
+%     http://www.eworks.de
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%\input{./Ressourcen/Stellenausschreibung/Praeambel.tex} % !!! NICHT ENTFERNEN !!!
+% Übertragen
+\documentclass[10pt]{scrartcl} % Regular KOMA-Script article with the chair's header layout
+
+\usepackage[utf8]{inputenc} % Textkodierung: UTF-8
+\usepackage[T1]{fontenc} % Zeichensatzkodierung
+
+\usepackage{calc} % Berechnungen
+
+\usepackage[USenglish]{babel}
+\usepackage{csquotes}
+\usepackage{xpatch}
+\usepackage{graphicx} % Grafiken
+\usepackage[absolute]{textpos} % Positionierung
+
+
+% Silbentrennung:
+\usepackage{hyphenat}
+%\tolerance 2414
+%\hbadness 2414
+%\emergencystretch 1.5em
+%\hfuzz 0.3pt
+%\widowpenalty=10000   
+%\clubpenalty=10000    
+%\vfuzz \hfuzz
+
+% Euro-Symbol:
+\usepackage[gen]{eurosym}
+\DeclareUnicodeCharacter{20AC}{\euro{}}
+
+% Schriftart Helvetica:
+\usepackage[scaled]{helvet}
+\renewcommand{\familydefault}{\sfdefault}
+
+%\usepackage{mathptmx} % skalierbare Formelschriften
+\usepackage{xstring} % Textmanipulation
+\usepackage{xcolor} % Farbdefinitionen
+
+\usepackage{etoolbox} % Toggle-Definitionen
+\newtoggle{StellenausschreibungGrafikOpportunities}
+\togglefalse{StellenausschreibungGrafikOpportunities}
+
+% Bibtex
+\usepackage[
+    backend=biber,
+    style=numeric,
+    sorting=none,
+    url=false,
+    giveninits=true
+]{biblatex}
+
+\AtEveryBibitem{%
+  \clearfield{abstract}%
+  \clearfield{keywords}%
+  \clearfield{file}%
+}
+
+\addbibresource{semester_thesis_bibliography.bib}
+
+\DeclareNameAlias{author}{family-given} % Order of names: Last-names, First-name
+\DeclareNameAlias{editor}{family-given} % Order of names: Last-names, First-name
+
+
+% Debugging:
+%\usepackage{layout} % Layout-Informationen
+%\usepackage{printlen} % Längenwerte ausgeben
+
+% entfernt
+%\input{./_Einstellungen.tex}                            % !!! DATEI ANPASSEN !!!
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% Advisor and Topic info:
+\newcommand{\AdvisorFirstname}{Niels}
+\newcommand{\AdvisorSurname}{Hayen}
+\newcommand{\ThesisTopic}{{Hierarchical Reinforcement Learning for Multi-Asset Trading}}
+\newcommand{\ThesisBegin}{as soon as possible}
+
+% Faculty
+\newcommand{\FakultaetName}{TUM School of Management}
+\newcommand{\LehrstuhlName}{Professorship of Business Analytics and Intelligent Systems}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%\input{./Ressourcen/Stellenausschreibung/Anfang.tex} % !!! NICHT ENTFERNEN !!!
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% EINSTELLUNGEN
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% Universität:
+%\newcommand{\UniversitaetName}{Technische Universität München}
+\newcommand{\UniversitaetName}{Technical University of Munich}
+\newcommand{\UniversitaetAbkuerzung}{TUM}
+\newcommand{\UniversitaetWebseite}{www.tum.de}
+\newcommand{\UniversitaetLogoBreite}{19mm}
+\newcommand{\UniversitaetLogoHoehe}{1cm}
+
+\newcommand{\UniversitaetAdresse}{%
+	Arcisstraße~21\\%
+	80333~München%
+}
+
+\definecolor{UniversitaetFarbe}{RGB}{0,101,189}
+
+% Seitenränder:
+\newcommand{\Seitenrand}{1cm}
+\newcommand{\SeitenrandLinks}{2cm}
+
+% Text:
+\newcommand{\TextOben}{24.2mm}
+\newcommand{\TextSchriftgroesse}{11pt}
+\newcommand{\TextZeilenabstand}{13pt}
+
+% Aufzählungen:
+\usepackage{enumitem}
+\setlist[itemize]{topsep=0pt, partopsep=0pt, itemsep=0pt, parsep=0cm, leftmargin=5.2mm, itemindent=0cm} % weniger Platz vor und in Listen
+\def\labelitemi{\raise0.2em\hbox{\fontsize{4pt}{4pt}\selectfont$\bullet$\hspace*{2.2mm}}}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% DOKUMENT
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\usepackage[a4paper,
+top=\TextOben,
+bottom=\Seitenrand,
+inner=\SeitenrandLinks,
+outer=\SeitenrandLinks,
+foot=0cm,
+head=0cm
+]{geometry}
+
+\textblockorigin{\SeitenrandLinks}{\Seitenrand} % Ursprung für Positionierung
+
+% PDF-Einstellungen:
+\usepackage[pdftex]{hyperref}
+\hypersetup{
+	hidelinks,
+	pdfauthor={\AdvisorFirstname{} \AdvisorSurname},
+	pdftitle={\ThesisTopic}
+}
+
+\KOMAoptions{fontsize=\TextSchriftgroesse}
+
+\setcounter{secnumdepth}{2}
+\setcounter{tocdepth}{2}
+\setkomafont{disposition}{\normalfont\bfseries}
+
+\RedeclareSectionCommand[
+	beforeskip=1.5\baselineskip,
+	afterskip=0.5\baselineskip
+]{section}
+
+\RedeclareSectionCommand[
+	beforeskip=1\baselineskip,
+	afterskip=0.25\baselineskip
+]{subsection}
+
+\newcommand{\ChairHeader}{%
+	\begin{flushleft}
+		% Dreizeiler:
+		\begin{textblock*}{\textwidth}(0cm, 0cm)%
+			\color{UniversitaetFarbe}%
+			\fontsize{9}{11}\selectfont%
+			\LehrstuhlName\\%
+			\FakultaetName\\%
+			\UniversitaetName%
+		\end{textblock*}%
+		\iftoggle{StellenausschreibungGrafikOpportunities}{%
+			\begin{textblock*}{\textwidth}[1,0](\textwidth, 28.5mm-\Seitenrand)%
+				\raggedleft%
+				\includegraphics{./Ressourcen/Stellenausschreibung/Bilder/Opportunities.jpg}%
+			\end{textblock*}%
+		}{}
+		% Logo:
+		\begin{textblock*}{\UniversitaetLogoBreite}[1,0](\textwidth, 0cm)%
+			\raggedleft%
+			\includegraphics[width=\UniversitaetLogoBreite]{./Universitaet_Logo_RGB.pdf}%
+		\end{textblock*}%
+	\end{flushleft}
+	\setlength{\baselineskip}{\TextZeilenabstand}%
+	\setlength{\parindent}{0mm} % keine Einrückung am Absatzanfang
+	\setlength{\parskip}{\baselineskip} % einzeiliger Abstand nach Absätzen
+	\color{black}
 }
 
 \begin{document}
-	\begin{letter}{}
-		\opening{}
-		
+\pagestyle{empty}
+\ChairHeader
+
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 \TopicHeader
 
-\input{introduction.tex}
-\input{literature_review.tex}
-\input{system_design_and_methodology.tex}
-\input{experimental_validation_and_testing.tex}
-\input{conclusion_and_future_work.tex}
+\input{semesterthesis_writing/1_introduction}
+\input{semesterthesis_writing/2_literature_review}
+\input{semesterthesis_writing/3_system_design_and_methodology}
+\input{semesterthesis_writing/4_experimental_validation_and_testing}
+\input{semesterthesis_writing/5_conclusion_and_future_work}
 
 
 %\textbf{Begin}: \ThesisBegin
@@ -241,6 +440,21 @@ head=0cm
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-\end{letter}   % !!! NICHT ENTFERNEN !!!
+\end{document} % !!! NICHT ENTFERNEN !!!
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+%\textbf{Begin}: \ThesisBegin
+
+%\textbf{Advisor}: \AdvisorFirstname~\AdvisorSurname
+
+\newpage
+
+\MinorHeader{Literature References}% This file was created with Citavi 7.2.0.41
+
+\printbibliography[heading=none] %Print bibliography
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \end{document} % !!! NICHT ENTFERNEN !!!
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%

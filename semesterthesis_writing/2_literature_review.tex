@@ -1,0 +1,30 @@
+\section{Literature Review}
+This section evaluates the state-of-the-art methodologies underlying the proposed PyTrade architecture. The system isolates temporal signal extraction from cross-sectional portfolio allocation. This review justifies each architectural component through existing research.
+
+\subsection{Quantitative Finance and Deep Reinforcement Learning}
+Quantitative finance has historically relied on static statistical forecasting and rule-based optimization. Deep learning introduced high-capacity function approximators capable of extracting non-linear market features \cite{Goodfellow-et-al-2016}. However, static prediction fails to capture the sequential nature of portfolio management. Deep Reinforcement Learning (DRL) models this as a Markov Decision Process (MDP). The agent iteratively processes states, executes actions, and receives rewards.
+
+Wu et al. demonstrate the viability of DRL for portfolio management \cite{Junfeng.2024}. The FinRL library further standardizes environments for automated trading \cite{liu2022finrldeepreinforcementlearning}. A critical architectural choice in DRL is the action space. Traditional financial machine learning often discretizes trades into distinct events. For example, López de Prado introduced the triple-barrier method to classify discrete entry and exit thresholds \cite{LopezdePrado.2018}.
+
+In contrast, modern portfolio allocators require continuous control. Continuous action spaces natively represent target portfolio weights or position changes. Proximal Policy Optimization (PPO) effectively stabilizes learning in continuous domains by clipping large policy updates \cite{JohnSchulmanFilipWolskiPrafullaDhariwalAlecRadfordOlegKlimov.2017}. Charkhestani and Esfahanipour highlight that continuous control agents can also successfully embed behavioral constraints, such as loss aversion \cite{Charkestani.2026}.
+
+\subsection{Temporal Memory in Financial Series}
+Financial markets are partially observable environments, as not even the most professional data feeds can explain all occurring events \cite{LopezdePrado.2018}. Standard feed-forward networks assume Markovian states, ignoring distributed temporal evidence. Recurrent architectures resolve this by maintaining hidden states. Hausknecht and Stone established Deep Recurrent Q-Learning to solve Partially Observable MDPs \cite{DBLP:journals/corr/HausknechtS15}.
+
+Long Short-Term Memory (LSTM) networks provide robust noise filtering and regime detection. They gate information to maintain long-range dependencies. However, financial time series present a fundamental conflict between memory and stationarity. Standard integer differentiation achieves stationarity but destroys historical memory. López de Prado advocates for fractional differentiation to retain memory while satisfying statistical stationarity. Proper feature engineering eliminates this conflict \cite{LopezdePrado.2018}.
+
+Recent advances propose Temporal Fusion Transformers (TFT) for interpretable, multi-horizon forecasting \cite{lim2020tft}. Similarly, Shen et al. explore Transformer architectures for long-term time series \cite{LefeiShen.2025}. Despite these innovations, recurrent algorithms remain highly effective for continuous state updates in sequential control.
+
+\subsection{Attention Mechanisms}
+Attention mechanisms dynamically weight input significance. Transformers utilize self-attention to process entire sequences simultaneously \cite{vaswani2023attentionneed}. While originally designed for natural language, attention is highly effective for cross-asset financial modeling.
+
+In portfolio management, an asset's value depends on its relation to other available assets. Attention mechanisms map these cross-asset dependencies without requiring predefined correlation matrices. Xue and Ye demonstrate attention-enhanced RL for dynamic portfolio optimization \cite{Xue.2026}. Coulter specifically proposes attention-based Transformers to process distinct asset tokens for cross-asset allocation \cite{Coulter2025}.
+
+Attention is also increasingly integrated into general DRL frameworks. Hu et al. detail the developmental trajectory of Transformer-based RL \cite{Hu.2024}. Kachaev et al. adapt Transformers for online continuous control \cite{NikitaKachaev.2025}.
+
+\subsection{Hierarchical \& Modular RL}
+Monolithic DRL agents struggle with competing objectives. Learning local temporal signals and global portfolio constraints simultaneously causes policy instability. Hierarchical RL decomposes complex tasks into specialized modules.
+
+In quantitative finance, this allows independent processing of asset-specific patterns and macroeconomic regimes. Jun and Yugopuspito propose hybrid LSTM-PPO networks for dynamic portfolio optimization \cite{JunKevin.2025}. Raj explores regime-aware RL, further validating the need to separate distinct market contexts \cite{GabrielNixonRaj.2025}. Adapting to distinct volatility regimes requires localized expert signals \cite{Bennett.2014}.
+
+The proposed architecture leverages this modularity. Single-Asset Agents operate as isolated temporal experts. A separate allocator mechanism fuses these experts. This design restricts the responsibility of each network layer, stabilizing gradient updates and reducing sample complexity.
