@@ -1825,10 +1825,30 @@ class TradingEnv(gym.Env):
         self.saa_sortino_warmup_steps = int(config["environment"].get("saa_sortino_warmup_steps", 10))
         self.saa_min_trade_value_floor = float(config["environment"].get("saa_min_trade_value_floor", 50.0))
 
+        # PAA (portfolio allocator) reward knobs - same methodology as the SAA reward
+        # (calculate_saa_step_reward), refitted to the multi-asset portfolio-weights context.
+        # See calculate_allocator_step_reward for how each knob is used.
+        self.paa_excess_log_return_scale = float(config["environment"].get("paa_excess_log_return_scale", 10.0))
+        self.paa_linear_sortino_net_reward_scale = float(config["environment"].get("paa_linear_sortino_net_reward_scale", 2.5))
+        self.paa_sortino_warmup_steps = int(config["environment"].get("paa_sortino_warmup_steps", 8))
+        self.paa_drawdown_level_penalty_coeff = float(config["environment"].get("paa_drawdown_level_penalty_coeff", 0.0))
+        self.paa_realized_exit_bonus_coeff = float(config["environment"].get("paa_realized_exit_bonus_coeff", 0.0))
+        self.paa_reward_tanh_divisor = float(config["environment"].get("paa_reward_tanh_divisor", 2.0))
+        self.paa_reward_tanh_scale = float(config["environment"].get("paa_reward_tanh_scale", 1.0))
+        self.paa_under_exec_penalty_mult = float(config["environment"].get("paa_under_exec_penalty_mult", 0.8))
+        self.paa_over_exec_penalty_mult = float(config["environment"].get("paa_over_exec_penalty_mult", 1.0))
+
         self.previous_max_drawdown = None
         self.saa_previous_max_drawdown = None
         self.episode_peak_value = None
         self.trans_act_pen = None  # Initialize transaction action penalty variable
+        self.paa_average_entry_price = None  # [num_assets] per-asset avg entry price, NaN = no open position
+        self.paa_realized_positive_pnl_cum = 0.0
+        self.paa_realized_exit_bonus_cum = 0.0
+        self.paa_last_realized_positive_pnl = 0.0
+        self.paa_last_realized_exit_bonus = 0.0
+        self._last_paa_weight_delta = None     # set by _apply_soft_execution each step (raw desired delta, incl. cash)
+        self._last_paa_executed_delta = None   # set by _apply_soft_execution each step (realized delta, incl. cash)
 
         # Store references
         self.market_data_cache = market_data_cache
@@ -1841,8 +1861,10 @@ class TradingEnv(gym.Env):
         # Execution-mode config (backwards compatible defaults)
         self.execution_mode = config["environment"]["execution_mode"] # "single_asset_target_pos" | "simple" | "tranche" | "portfolio_weights"
 
-        if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
-            self.min_initial_cash_allocation = config["environment"]["min_initial_cash_allocation"]  # e.g., 0.1 for at least 10% cash at start
+        # Used by reset() in ALL modes (cash-allocation floor for random portfolio-weight starts too),
+        # not just SINGLE_ASSET_TARGET_POS. Must never be conditionally set or PORTFOLIO_WEIGHTS mode
+        # crashes with AttributeError on the "random allocation" reset branch.
+        self.min_initial_cash_allocation = float(config["environment"].get("min_initial_cash_allocation", 0.1))
 
         self.quantity_type = config["environment"].get("quantity_type", "shares")
         self.price_source = config["environment"].get("price_source", "next_open")  # "next_open" | "current_close"
@@ -2158,6 +2180,13 @@ class TradingEnv(gym.Env):
         self.saa_realized_exit_bonus_cum = 0.0
         self.saa_last_realized_positive_pnl = 0.0
         self.saa_last_realized_exit_bonus = 0.0
+        self.paa_average_entry_price = np.full(num_assets, np.nan, dtype=np.float32)
+        self.paa_realized_positive_pnl_cum = 0.0
+        self.paa_realized_exit_bonus_cum = 0.0
+        self.paa_last_realized_positive_pnl = 0.0
+        self.paa_last_realized_exit_bonus = 0.0
+        self._last_paa_weight_delta = np.zeros(num_assets + 1, dtype=np.float32)
+        self._last_paa_executed_delta = np.zeros(num_assets + 1, dtype=np.float32)
 
         # Episode accumulators for diagnostics
         self._ep_turnover_notional = 0.0
@@ -3408,21 +3437,24 @@ class TradingEnv(gym.Env):
             portfolio_after, comparison_before, comparison_after, benchmark_before, benchmark_after, action: np.ndarray
             ) -> Tuple[float, Dict[str, float]]:
         """
+        Calculate the allocator (PAA) reward for this step.
 
-        Calculate the allocator reward for this step. Its a combined metric of:
-        - alpha over benchmark 
-        - risk_features: sharpe-ratio, drawdown, volatility
-        - penalty for inactivity / overactivity
-        
-        
+        Ported from calculate_saa_step_reward: same component methodology (excess log-return
+        over a passive benchmark, differential Sortino, incremental + level-based drawdown
+        penalties, execution-gap penalty, realized-profit exit bonus, tanh squash), refitted
+        from the single-asset scalar-action context to the multi-asset portfolio-weights
+        context. See docstring of calculate_saa_step_reward and the class-level explanation
+        in the accompanying documentation for why each component helps training.
+
         Args:
             execution_result: Result of the trade execution step
-            old_portfolio_value: Portfolio value before time advancement
-            new_portfolio_value: Portfolio value after time advancement
-            action: Target portfolio weights [num_assets + 1] including cash
+            portfolio_before/after: Live portfolio value before/after this step's price move
+            comparison_before/after: Static buy-and-hold-from-same-init reference portfolio value
+            benchmark_before/after: Fixed custom-weights benchmark portfolio value
+            action: Target portfolio weights [num_assets + 1] including cash (PORTFOLIO_WEIGHTS only)
         Returns:
             Scalar reward value for this step
-            Reward_parts: Dict of individual reward components for diagnostics
+            Reward_parts: Dict of individual reward components for diagnostics/observation feed
         """
 
         # Calculate basic returns
@@ -3434,29 +3466,30 @@ class TradingEnv(gym.Env):
             benchmark_return = (benchmark_after / benchmark_before)
         else:
             benchmark_return = 0.0
-        
-        # ---------- Differential Sortino ratio components ----------
-        # Get simple returns
+
+        # ---------- Differential Sortino ratio components (identical EMA math to SAA) ----------
         portfolio_return_absolut = portfolio_return - 1.0
-        # portfolio_return_log = np.log(portfolio_return) if portfolio_return > 0 else -np.inf
-        # 1. Update EMAs
         delta = portfolio_return_absolut - self.running_mean_ema
         self.running_mean_ema += self.sortino_eta * delta
 
-        # Alternative: use squared downside returns
         downside_sq = (min(portfolio_return_absolut, 0.0))**2
         self.running_downside_variance_ema += self.sortino_eta * (downside_sq - self.running_downside_variance_ema)
         downside_var_floor = 0.005
         downside_var = max(self.running_downside_variance_ema, downside_var_floor)
         current_sortino = self.running_mean_ema / np.sqrt(downside_var)
 
-        # 3. Calc Differential Sortino for reward
-        sortino_reward = current_sortino - self.previous_sortino
-        self.previous_sortino = current_sortino
+        # Delay the differential-Sortino reward contribution until the EMAs have warmed up,
+        # to avoid an initialization spike from previous_sortino=0.0 (mirrors SAA warmup gate).
+        sortino_warmup = max(2, int(self.paa_sortino_warmup_steps))
+        if self.current_step < sortino_warmup:
+            delta_sortino_linear = 0.0
+            self.previous_sortino = current_sortino
+        else:
+            delta_sortino_linear = current_sortino - self.previous_sortino
+            self.previous_sortino = current_sortino
+        scaled_delta_sortino_linear = float(self.paa_linear_sortino_net_reward_scale * delta_sortino_linear)
 
-        # Mix Sortino with other metrics to get risk-aware non-deterministic policy
-        """Calculate dynamic risk window. Use self.reward_risk_window and the current step to produce
-        behaviour which starts at 2 raises with the steps up to maximum risk_reward_window"""
+        # Dynamic risk window: starts small, grows with the episode up to max_reward_risk_window.
         if self.current_step <= 2:
             risk_metric_window = 2
         else:
@@ -3466,100 +3499,106 @@ class TradingEnv(gym.Env):
             window=risk_metric_window
         )
 
-        max_drawdown_delta = max(0.0, np.log(max_drawdown) - np.log(self.previous_max_drawdown))
+        # Incremental drawdown penalty: linear delta (matches calculate_saa_step_reward exactly).
+        # No log() involved, so no -inf/nan risk when drawdown is legitimately 0.0 at a new peak.
+        max_drawdown_delta = max(0.0, max_drawdown - self.previous_max_drawdown)
         self.previous_max_drawdown = max_drawdown
         max_drawdown_penalty = float(self.lambda_drawdown * max_drawdown_delta)
 
-        # 4. Mix in raw return & windowed drawdown level penalty
-        # first_reward = (self.sortino_net_reward_mix * sortino_reward + 
-        #           (1 - self.sortino_net_reward_mix) * portfolio_return_absolut) - max_drawdown_penalty
-        # reward = first_reward
+        # Persistent drawdown-level penalty: keeps penalizing while underwater (mirrors SAA).
+        if self.episode_peak_value is None:
+            self.episode_peak_value = float(max(portfolio_after, 1e-12))
+        peak_before = float(max(self.episode_peak_value, 1e-12))
+        current_drawdown_level = max(0.0, 1.0 - (float(portfolio_after) / peak_before))
+        drawdown_level_penalty = float(self.paa_drawdown_level_penalty_coeff * current_drawdown_level)
+        self.episode_peak_value = float(max(peak_before, float(portfolio_after)))
 
-        """ New reward try """
-        # TODO: Consider reintroducing mix with diff sortino but based on the comparison log diff returns!
-        # Core objective: outperform static comparison portfolio from same random init
+        # Core objective: outperform the static comparison portfolio from the same random init
+        # (the PAA's "passive benchmark", analogous to the SAA's same-asset buy-and-hold).
         eps = 1e-12
         port_log_ret = np.log(max(float(portfolio_after), eps)) - np.log(max(float(portfolio_before), eps))
         comp_log_ret = np.log(max(float(comparison_after), eps)) - np.log(max(float(comparison_before), eps))
         excess_log_ret = port_log_ret - comp_log_ret
+        excess_return_scaled = float(self.paa_excess_log_return_scale * excess_log_ret)
 
-        # Risk control: penalize worsening drawdown (incremental only)
-        reward = float(excess_log_ret - max_drawdown_penalty)
+        # Execution-gap penalty and realized-profit exit bonus: portfolio-weights mode only,
+        # since _apply_soft_execution/per-asset entry-price tracking are only populated there.
+        excess_gap_total = 0.0
+        net_signed_gap = 0.0
+        execution_gap_penalty = 0.0
+        realized_positive_pnl_total = 0.0
+        realized_exit_bonus = 0.0
 
-        # # 4b. Concentration term on executed normalized weights.
-        # # action is expected to be the already-normalized execution target w.
-        # concentration_pen = 0.0
-        # if action is not None:
-        #     w_exec = np.asarray(action, dtype=np.float32)
-        #     if w_exec.ndim == 1 and w_exec.size == (self.market_data_cache.num_assets + 1):
-        #         w_exec = np.clip(w_exec, 0.0, 1.0)
-        #         w_exec = w_exec / np.maximum(np.sum(w_exec), 1e-8)
-        #         concentration_pen = float(
-        #             -self.lambda_spread * np.sum(w_exec * np.log(w_exec + 1e-8))
-        #         )
-        #         second_reward = concentration_pen + first_reward
-        #         reward = second_reward
+        if self.execution_mode == EXECUTION_PORTFOLIO_WEIGHTS:
+            # Execution gap: how much of the raw desired weight change was left unexecuted this
+            # step due to the deadband/soft-step execution mechanics (asset legs only; cash
+            # mirrors the sum of asset deltas so including it would double-count).
+            gap = self._last_paa_weight_delta[1:] - self._last_paa_executed_delta[1:]
+            deadband = float(self.config['environment'].get('execution_deadband', 0.002))
+            excess_gap_total = float(np.sum(np.maximum(np.abs(gap) - deadband, 0.0)))
+            net_signed_gap = float(np.sum(gap))  # >0: net under-executed intended exposure increase
+            lambda_exec_gap = float(self.lambda_execution_gap) if self.lambda_execution_gap is not None else 0.0
+            penalty_mult = self.paa_under_exec_penalty_mult if net_signed_gap > 0 else self.paa_over_exec_penalty_mult
+            execution_gap_penalty = float(lambda_exec_gap * penalty_mult * excess_gap_total)
 
-        # # 4c. Transaction cost penalty (scaled by lambda_cost)
-        # transaction_cost_level = 0.0001*self.initial_portfolio_value
-        # if execution_result.transaction_cost > transaction_cost_level:
-        #     self.trans_act_pen = self.lambda_transaction_cost * (execution_result.transaction_cost - transaction_cost_level)
-        #     third_reward = reward - self.trans_act_pen
-        #     reward = third_reward
-        # else: 
-        #     self.trans_act_pen = 0.0
+            # Realized-profit exit bonus: per-asset average-entry-price tracking, only pays out
+            # on a sell/reduction when the sell price is above that asset's average buy price.
+            num_assets = self.market_data_cache.num_assets
+            for a in range(num_assets):
+                trade_shares = float(execution_result.trades_executed[a])
+                execution_price = float(execution_result.executed_prices[a])
+                post_trade_shares = float(self.portfolio_state.positions[a])
+                pre_trade_shares = max(0.0, post_trade_shares - trade_shares)
+                avg_entry = self.paa_average_entry_price[a]
 
-        # # 5. Clip and amplify reward
-        # gain = float(3.5)
-        # reward = float(np.tanh(gain * reward))
+                if trade_shares > 0.0 and execution_price > 0.0:
+                    if not np.isfinite(avg_entry) or pre_trade_shares <= 0.0:
+                        self.paa_average_entry_price[a] = execution_price
+                    else:
+                        self.paa_average_entry_price[a] = (
+                            (avg_entry * pre_trade_shares + execution_price * trade_shares)
+                            / max(pre_trade_shares + trade_shares, eps)
+                        )
+                elif trade_shares < 0.0 and np.isfinite(avg_entry) and pre_trade_shares > 0.0 and execution_price > 0.0:
+                    sold_shares = min(-trade_shares, pre_trade_shares)
+                    realized_positive_pnl_total += max(0.0, (execution_price - avg_entry) * sold_shares)
+                    if post_trade_shares <= 1e-8:
+                        self.paa_average_entry_price[a] = np.nan
+
+            realized_exit_bonus = float(
+                self.paa_realized_exit_bonus_coeff * (realized_positive_pnl_total / max(self.initial_portfolio_value, eps))
+            )
+
+        self.paa_last_realized_positive_pnl = float(realized_positive_pnl_total)
+        self.paa_last_realized_exit_bonus = float(realized_exit_bonus)
+        self.paa_realized_positive_pnl_cum += float(realized_positive_pnl_total)
+        self.paa_realized_exit_bonus_cum += float(realized_exit_bonus)
+
+        # Combine components (same structure as calculate_saa_step_reward) and squash.
+        reward_raw = (
+            excess_return_scaled
+            + scaled_delta_sortino_linear
+            - max_drawdown_penalty
+            - drawdown_level_penalty
+            - execution_gap_penalty
+            + realized_exit_bonus
+        )
+        tanh_div = max(self.paa_reward_tanh_divisor, 1e-8)
+        reward = float(np.tanh(reward_raw / tanh_div) * self.paa_reward_tanh_scale)
 
         # Track Sortino internals for episode-level stats
         self._sortino_mean_hist.append(float(self.running_mean_ema))
         self._sortino_down_hist.append(float(self.running_downside_variance_ema))
         self._sortino_raw_hist.append(float(reward))
 
-        # START OF OLD REWARD CALCULATION LOGIC: Metrics are needed to fill episode buffer portfolio metrics
-        # ============================================
-        # 1. ALPHA CALCULATION (PRIMARY SIGNAL)
-        # ============================================
-
+        # ===== Diagnostics kept for observation feed / TensorBoard (not part of the reward above) =====
         alpha = (portfolio_return - benchmark_return)  # daily alpha
         portfolio_return = portfolio_return - 1.0  # daily portfolio return
-        
-        # ============================================
-        # 2. RISK-ADJUSTED PERFORMANCE METRICS
-        # ============================================
-        risk_adjustment = 0.0
 
-        # Use episode buffer's efficient methods
-        sharpe_ratio = self.episode_buffer.calculate_sharpe_ratio(
-            window=risk_metric_window
-        )
-        
-        # Get recent returns for volatility
-        recent_returns = self.episode_buffer.get_returns_window(
-            window=risk_metric_window
-        )
+        sharpe_ratio = self.episode_buffer.calculate_sharpe_ratio(window=risk_metric_window)
+        recent_returns = self.episode_buffer.get_returns_window(window=risk_metric_window)
         volatility = np.std(recent_returns) * np.sqrt(252) if len(recent_returns) > 1 else 0.0  # Annualized
-        
-        # Risk adjustment components
-        sharpe_bonus = np.tanh(sharpe_ratio/ 1.5) * 0.01        # Bounded bonus for good Sharpe
-        drawdown_penalty = max_drawdown * 0.025                  # Penalty for large drawdowns
-        volatility_penalty = max(0, volatility - 0.25) * 0.025   # Penalty only if vol > 25%
-        
-        risk_adjustment = sharpe_bonus - drawdown_penalty - volatility_penalty
-        
-        # ============================================
-        # 3. TRANSACTION COST PENALTY
-        # ============================================
-        cost_penalty = 0.0
-        if execution_result.transaction_cost > 0:
-            raw_cost_ratio = execution_result.transaction_cost / portfolio_before if portfolio_before > 0 else 0.0
-            cost_penalty = 2.0 * min(raw_cost_ratio, 0.05) # Cap penalty at 5% cost ratio
-        
-        # ============================================
-        # 4. TURNOVER 
-        # ============================================
+
         current_weights = self.portfolio_state.get_weights()
         if self.current_step > 0:
             if self.maybe_provide_sequence:
@@ -3570,62 +3609,33 @@ class TradingEnv(gym.Env):
             turnover = float(np.sum(np.abs(current_weights[1:] - prev_w[1:]))) / 2.0
         else:
             turnover = 0.0
-        # Normalize to [0, 1]: cap at 1.0 (max possible turnover is 2.0, div by 2 gives max 1.0)
-        turnover = float(np.clip(turnover, 0.0, 1.0))
-
-        # ============================================
-        # 7. COMBINE ALL COMPONENTS WITH PROPER WEIGHTS
-        # ============================================
-        # factors to scale components
-        alpha_factor = 0.0
-        portfolio_return_factor = 2.0
-        risk_adjustment_factor = 1.0
-        cost_penalty_factor = 0.0
-
-        # Old disfunctional reward combination (too noisy, hard to tune, not effective)
-        # reward = (
-        #     alpha * alpha_factor +                    # Primary objective: alpha generation (scaled up)
-        #     portfolio_return * portfolio_return_factor +          # Also reward general portfolio return
-        #     risk_adjustment * risk_adjustment_factor +           # Risk-adjusted performance bonus
-        #     -cost_penalty * cost_penalty_factor +             # Transaction cost efficiency
-        #     -turnover_penalty * turnover_penalty_factor +         # Turnover management
-        #     -concentration_penalty * concentration_penalty_factor +      # Position risk management
-        #     + survival_bonus                  # Small survival bonus
-        # )
-
-        # # If you want to skip detailed sub-component calculations, create minimal parts dict
-        # parts = {
-        #     "alpha_component": 0.0,
-        #     "risk_component": 0.0,
-        #     "portfolio_return_component": 0.0,
-        #     "cost_component": 0.0,
-        #     "turnover_component": 0.0,
-        #     "concentration_component": concentration_penalty,
-        #     "survival_component": 0.0,
-        #     "raw_alpha": 0.0,
-        #     "raw_portfolio_return": 0.0,
-        #     "raw_benchmark_return": 0.0,
-        #     "sharpe_ratio": 0.0,
-        #     "max_drawdown": 0.0
-        # }
+        turnover = float(np.clip(turnover, 0.0, 1.0))  # max possible turnover is 2.0, div by 2 gives max 1.0
 
         parts = {
-            "alpha_component": alpha * alpha_factor,
-            "risk_component": risk_adjustment * risk_adjustment_factor,
-            "portfolio_return_component": portfolio_return * portfolio_return_factor,
-            "cost_component": -cost_penalty * cost_penalty_factor,
-            "turnover": turnover,
             "raw_alpha": alpha,
             "raw_portfolio_return": portfolio_return,
             "raw_benchmark_return": benchmark_return,
             "sharpe_ratio": sharpe_ratio,
+            "volatility": volatility,
+            "turnover": turnover,
             "max_drawdown_delta": max_drawdown_delta,
             "previous_sortino": self.previous_sortino,
             "current_sortino": current_sortino,
             "running_mean_ema": self.running_mean_ema,
             "downside_var_sqrt": np.sqrt(downside_var),
-            "previous_max_drawdown": self.previous_max_drawdown
-
+            "previous_max_drawdown": self.previous_max_drawdown,
+            "excess_log_ret": excess_log_ret,
+            "excess_return_scaled": excess_return_scaled,
+            "scaled_delta_sortino_linear": scaled_delta_sortino_linear,
+            "max_drawdown_penalty": max_drawdown_penalty,
+            "drawdown_level": current_drawdown_level,
+            "drawdown_level_penalty": drawdown_level_penalty,
+            "execution_gap_excess": excess_gap_total,
+            "execution_gap_net_signed": net_signed_gap,
+            "execution_gap_penalty": execution_gap_penalty,
+            "realized_positive_pnl": realized_positive_pnl_total,
+            "realized_exit_bonus": realized_exit_bonus,
+            "realized_exit_bonus_cum": self.paa_realized_exit_bonus_cum,
         }
 
         return float(reward), parts
@@ -4222,7 +4232,12 @@ class TradingEnv(gym.Env):
         else:
             # Fallback: if all weights vanish, stay put
             executed_weights = current_weights.copy()
-        
+
+        # Snapshot for the execution-gap reward term (raw intended vs. actually realized delta,
+        # BEFORE the post-trade renormalization above so cash/asset deltas stay additive).
+        self._last_paa_weight_delta = weight_delta.astype(np.float32).copy()
+        self._last_paa_executed_delta = executed_delta.astype(np.float32).copy()
+
         return executed_weights.astype(np.float32)
 
     def execute_instructions(self, instructions: List[TradeInstruction]) -> Tuple[ExecutionResult, List[Dict[str, Any]]]:

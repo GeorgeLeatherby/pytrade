@@ -1031,7 +1031,8 @@ class SAASignalWrapper(VecEnvWrapper):
     """
     def __init__(self, venv: VecEnv, saa_model, saa_vecnormalize: Optional[VecNormalize],
                 num_assets: int, device: torch.device,
-                config: Mapping[str, Any], feature_to_index: Mapping[str, int]):
+                config: Mapping[str, Any], feature_to_index: Mapping[str, int],
+                action_limiting_factor: float):
         
         super().__init__(venv)
 
@@ -1041,6 +1042,11 @@ class SAASignalWrapper(VecEnvWrapper):
         # keep config and feature mapping locally (DummyVecEnv has no .config)
         self.config = config
         self.feature_to_index = feature_to_index
+        # Rescales raw SAA policy output into the target_position_change range the SAA was
+        # actually trained/executed with (env.step never saw raw actions during SAA training).
+        self.action_limiting_factor = float(action_limiting_factor)
+        # Precomputed one-hot asset-ID rows; SAA's InputMLPFeatures expects this trailing block.
+        self._asset_one_hot = np.eye(self.num_assets, dtype=np.float32)
 
         # Infer dimensions from selected market features and env observation shape.
         # The raw env emits: N * raw_feat_dim + portfolio_dim (before SAA signal injection).
@@ -1196,16 +1202,12 @@ class SAASignalWrapper(VecEnvWrapper):
         # Collect SAA signals per asset using distinct models/states
         signals = []
         for a in range(self.num_assets):
-            asset_obs = saa_obs[:, a, :]
-            per_asset_obs = asset_obs
-            if self.saa_vecnormalize is not None and hasattr(self.saa_vecnormalize, "obs_rms"):
-                rms = self.saa_vecnormalize.obs_rms
-                mean = torch.as_tensor(rms.mean, device=self.device, dtype=torch.float32)
-                var = torch.as_tensor(rms.var, device=self.device, dtype=torch.float32)
-                eps = 1e-8
-                per_asset_obs_t = torch.as_tensor(asset_obs, device=self.device, dtype=torch.float32)
-                per_asset_obs_t = (per_asset_obs_t - mean) / torch.sqrt(var + eps)
-                per_asset_obs = per_asset_obs_t.cpu().numpy()
+            # Append trailing one-hot asset-ID block to exactly match SAA training observation
+            # layout: [features, portfolio_features(6), one_hot_asset_id(N)]. Without this block
+            # InputMLPFeatures.forward() slices the wrong tail as the asset-ID one-hot.
+            one_hot = np.tile(self._asset_one_hot[a], (num_envs, 1))                # (B, N)
+            asset_obs = np.concatenate([saa_obs[:, a, :], one_hot], axis=-1)        # (B, F_saa+6+N)
+            per_asset_obs = _normalize_obs_with_vecnormalize(asset_obs, self.saa_vecnormalize)
 
             with torch.no_grad():
                 torch_obs = torch.as_tensor(per_asset_obs, device=self.device, dtype=torch.float32)
@@ -1219,7 +1221,10 @@ class SAASignalWrapper(VecEnvWrapper):
                 self.saa_states[a] = state_out
 
             actions_np = actions if isinstance(actions, np.ndarray) else actions.detach().cpu().numpy()
-            signals.append(actions_np[:, 0:1])  # (B, 1)
+            raw_signal = np.clip(actions_np[:, 0:1], -1.0, 1.0)
+            # Rescale to the target_position_change range actually seen by env.step() during
+            # SAA training/inference (see SingleAssetEpisodeAdapter.step() action_factor_fn).
+            signals.append(raw_signal * self.action_limiting_factor)  # (B, 1)
 
         saa_sig = np.stack(signals, axis=1)  # (B, N, 1)
         
@@ -1507,10 +1512,17 @@ class SAATokenizer(BaseFeaturesExtractor):
 
     
 # Utility function to load SAA model and VecNormalize stats from config
-def _load_saa_from_config(saa_config: Dict[str, Any]) -> Tuple[Any, Optional[VecNormalize], torch.device]:
+def _load_saa_from_config(saa_config: Dict[str, Any]) -> Tuple[Any, Optional[VecNormalize], torch.device, float]:
     """
-    Load the frozen SAA (RecurrentPPO preferred, fallback to PPO) plus VecNormalize stats.
+    Load the frozen SAA (RecurrentPPO) plus VecNormalize stats and its training-time
+    action_limiting_factor_end (needed to rescale raw policy outputs into the same
+    target_position_change range the SAA was actually trained/executed with).
+
     Expects keys: saa_run_id, saa_base_dir, saa_config_id, device.
+    Optional key: saa_checkpoint_name (default "best_model_pv_minus_selected_asset_bh_abs_mean"),
+    matching the "<stem>.zip" / "<stem>_vecnormalize.pkl" naming contract used by
+    save_checkpoint_with_vecnormalize() in the SAA training script. The historical
+    "best_model.zip" / "vecnormalize.pkl" filenames are no longer produced by the SAA trainer.
     """
     required = ("saa_run_id", "saa_base_dir", "saa_config_id")
     missing = [k for k in required if k not in saa_config]
@@ -1522,33 +1534,60 @@ def _load_saa_from_config(saa_config: Dict[str, Any]) -> Tuple[Any, Optional[Vec
     base_dir = saa_config["saa_base_dir"]
     config_id = str(saa_config["saa_config_id"])
     saa_run_date = saa_config.get("saa_run_date", "unknown_date")
+    checkpoint_name = str(saa_config.get("saa_checkpoint_name", "best_model_pv_minus_selected_asset_bh_abs_mean"))
 
     model_dir = os.path.join(base_dir, f"{run_id}_config_{config_id}_{saa_run_date}")
-    model_path = os.path.join(model_dir, "best_model.zip")
-    vecnorm_path = os.path.join(model_dir, "vecnormalize.pkl")
+    model_path = os.path.join(model_dir, f"{checkpoint_name}.zip")
+    vecnorm_path = os.path.join(model_dir, f"{checkpoint_name}_vecnormalize.pkl")
 
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"SAA model not found at: {model_path}")
 
+    # Read the SAA's own training config to recover action_limiting_factor_end. This is the
+    # same inheritance pattern main.py._maybe_inherit_saa_training_config uses for test_agent runs:
+    # saved_models/<run_dir_name> sits under <saa_agent_root>/saved_models, config lives at
+    # <saa_agent_root>/config_<config_id>.json.
+    saa_agent_root = os.path.dirname(base_dir)
+    saa_training_config_path = os.path.join(saa_agent_root, f"config_{config_id}.json")
+    if not os.path.isfile(saa_training_config_path):
+        raise FileNotFoundError(f"SAA training config not found: {saa_training_config_path}")
+    with open(saa_training_config_path, "r") as f:
+        saa_training_config = json.load(f)
+    agent_cfg = saa_training_config.get("agent", {})
+    if "action_limiting_factor_end" not in agent_cfg:
+        raise ValueError(
+            f"SAA training config {saa_training_config_path} is missing "
+            "'agent.action_limiting_factor_end', required to rescale raw SAA actions."
+        )
+    action_limiting_factor = float(agent_cfg["action_limiting_factor_end"])
+
     load_errors: List[str] = []
     saa_model = None
+    # Override potentially-unpicklable schedule callables for inference-only loads (mirrors
+    # test_saa_inference_shadow_portfolios.py._load_saa_model).
+    safe_custom_objects = {
+        "learning_rate": 3e-5,
+        "lr_schedule": lambda _p: 3e-5,
+        "clip_range": lambda _p: 0.2,
+        "clip_range_vf": None,
+    }
     try:
-        saa_model = RecurrentPPO.load(model_path, device=device)
+        saa_model = RecurrentPPO.load(model_path, device=device, custom_objects=safe_custom_objects)
     except Exception as e:
         load_errors.append(f"RecurrentPPO.load failed: {e}")
         raise RuntimeError(f"Failed to load SAA model. Errors: {load_errors}")
 
     saa_vecnormalize = None
     if os.path.exists(vecnorm_path):
-        dummy_env = _ObsNormDummyEnv(
-            saa_model.observation_space if hasattr(saa_model, "observation_space")
+        obs_space = saa_model.observation_space if hasattr(saa_model, "observation_space") \
             else gym.spaces.Box(low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32)
-        )
+        # VecNormalize.load() requires a VecEnv (needs .num_envs); wrap the dummy obs-space env.
+        dummy_env = DummyVecEnv([lambda: _ObsNormDummyEnv(obs_space)])
         saa_vecnormalize = VecNormalize.load(vecnorm_path, dummy_env)
         saa_vecnormalize.training = False
         saa_vecnormalize.norm_reward = False
 
-    return saa_model, saa_vecnormalize, device
+    return saa_model, saa_vecnormalize, device, action_limiting_factor
 
 # Build PPO model 
 def build_allocator_model(
@@ -1771,9 +1810,9 @@ def build_allocator_model(
     # Log model configuration for debugging
     if verbose > 0:
         print("[build_allocator_model] PPO model instantiated with TransformerAllocatorPolicy:")
-        print(f"  Learning rate: {lr_start} → {lr_end} (warmup: {lr_warmup_pct}, ramp: {lr_ramping_pct})")
+        print(f"  Learning rate: {lr_start} -> {lr_end} (warmup: {lr_warmup_pct}, ramp: {lr_ramping_pct})")
         print(f"  Entropy coef: {ent_coef_start} (initial, scheduled via callback)")
-        print(f"  Clip range: {clip_range_start}" + (f" → {clip_range_end}" if clip_range_start != clip_range_end else ""))
+        print(f"  Clip range: {clip_range_start}" + (f" -> {clip_range_end}" if clip_range_start != clip_range_end else ""))
         print(f"  n_steps: {n_steps}, batch_size: {batch_size}, n_epochs: {n_epochs}")
         print(f"  gamma: {gamma}, gae_lambda: {gae_lambda}")
         print(f"  Transformer: d_model={transformer_cfg.get('d_model', 128)}, "
@@ -2132,7 +2171,7 @@ def run(cache: MarketDataCache, config: Dict[str, Any]) -> Dict[str, Any]:
     do_pretrain = bool(critic_cfg.get("enabled", False))
     
     # Load frozen SAA once
-    saa_model, saa_vecnorm, saa_device = _load_saa_from_config(saa_config)
+    saa_model, saa_vecnorm, saa_device, saa_action_limiting_factor = _load_saa_from_config(saa_config)
 
     # --- Build Environments for train/validation ---
     print("[run] Building training and evaluation environments...")
@@ -2150,11 +2189,11 @@ def run(cache: MarketDataCache, config: Dict[str, Any]) -> Dict[str, Any]:
     # Wrap envs with SAA signal injection
     vec_train_saa = SAASignalWrapper(
         vec_train_raw, saa_model, saa_vecnorm, num_assets, saa_device, config=config, 
-        feature_to_index=cache.feature_to_index
+        feature_to_index=cache.feature_to_index, action_limiting_factor=saa_action_limiting_factor
         )
     vec_eval_saa = SAASignalWrapper(
         vec_eval_raw, saa_model, saa_vecnorm, num_assets, saa_device, config=config, 
-        feature_to_index=cache.feature_to_index
+        feature_to_index=cache.feature_to_index, action_limiting_factor=saa_action_limiting_factor
         )
     
     # Normalize allocator (PAA) obs and/or reward after SAA augmentation
@@ -2499,7 +2538,7 @@ def continue_run(cache: MarketDataCache, config: Dict[str, Any], model_path: str
     raw_feature_dim = cache.num_features
     
     # Load frozen SAA once (required for PAA to function)
-    saa_model, saa_vecnorm, saa_device = _load_saa_from_config(saa_config)
+    saa_model, saa_vecnorm, saa_device, saa_action_limiting_factor = _load_saa_from_config(saa_config)
 
     # --- Build Environments for train/validation ---
     print("[continue_run] Building training and evaluation environments...")
@@ -2517,11 +2556,11 @@ def continue_run(cache: MarketDataCache, config: Dict[str, Any], model_path: str
     # Wrap envs with SAA signal injection
     vec_train_saa = SAASignalWrapper(
         vec_train_raw, saa_model, saa_vecnorm, num_assets, saa_device, config=config, 
-        feature_to_index=cache.feature_to_index
+        feature_to_index=cache.feature_to_index, action_limiting_factor=saa_action_limiting_factor
     )
     vec_eval_saa = SAASignalWrapper(
         vec_eval_raw, saa_model, saa_vecnorm, num_assets, saa_device, config=config, 
-        feature_to_index=cache.feature_to_index
+        feature_to_index=cache.feature_to_index, action_limiting_factor=saa_action_limiting_factor
     )
     
     # Create VecNormalize wrappers

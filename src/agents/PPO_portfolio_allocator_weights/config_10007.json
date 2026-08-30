@@ -1,9 +1,10 @@
 {
     "saa_config":{
-        "saa_run_id": "00076",
+        "saa_run_id": "00239",
         "saa_base_dir":"src/agents/RecurrPPO_target_position_agent/saved_models",
-        "saa_config_id": "00010",
-        "saa_run_date": "26_02_28",
+        "saa_config_id": "01057",
+        "saa_run_date": "26_08_13",
+        "saa_checkpoint_name": "best_model_pv_minus_selected_asset_bh_abs_mean",
         "device": "cpu"
     },
 
@@ -115,13 +116,26 @@
         "block_buffer_multiplier": 1.0,
         "test_val_split_ratio": 0.20,
 
-        "sortino_eta": 0.015,
-        "lambda_drawdown": 0.001,
+        "sortino_eta": 0.035,
+        "lambda_drawdown": 0.15,
         "sortino_net_reward_mix": 0.3,
+        "log_sortino_net_reward_mix": 0.3,
         "lambda_spread": 0.0,
         "lambda_transaction_cost": 0.001,
+        "lambda_execution_gap": 0.04,
+
+        "paa_excess_log_return_scale": 10.0,
+        "paa_linear_sortino_net_reward_scale": 2.5,
+        "paa_sortino_warmup_steps": 8,
+        "paa_drawdown_level_penalty_coeff": 0.0,
+        "paa_realized_exit_bonus_coeff": 0.0,
+        "paa_reward_tanh_divisor": 2.0,
+        "paa_reward_tanh_scale": 1.0,
+        "paa_under_exec_penalty_mult": 0.8,
+        "paa_over_exec_penalty_mult": 1.0,
 
         "percentage_of_cash_only_starts": 0.10,
+        "min_initial_cash_allocation": 0.1,
 
         "execution_min_share_threshold": 0.1,
         "execution_min_trade_value_threshold": 50.0,
