@@ -2,10 +2,10 @@
     "saa_config":{
         "saa_run_id": "00239",
         "saa_base_dir":"src/agents/RecurrPPO_target_position_agent/saved_models",
-        "saa_config_id": "01057",
+        "saa_config_id": "01058",
         "saa_run_date": "26_08_13",
         "saa_checkpoint_name": "best_model_pv_minus_selected_asset_bh_abs_mean",
-        "device": "cpu"
+        "device": "cuda"
     },
 
   "allocator_transformer": {
@@ -106,7 +106,7 @@
     "environment": {
         "assets": ["SPY", "EWG", "EWH", "EWJ", "EWQ", "EWS", "EWT", "EWU", "EWY", "Crude", "Gold"],
         "execution_mode": "portfolio_weights",
-        "initial_portfolio_value": 10000,
+        "initial_portfolio_value": 100000,
         "episode_length_days": 252,
         "lookback_window": 0,
         "early_stopping_threshold": 0.2,
@@ -159,7 +159,7 @@
     },
 
     "critic_pretraining": {
-        "enabled": true,
+        "enabled": false,
         "warmup_steps": 20000,
         "train_episodes": 100,
         "validation_episodes": 10,
@@ -174,7 +174,7 @@
     },
 
     "portfolio_allocator_agent":{
-        "device": "cpu",
+        "device": "cuda",
         "verbose": 1,
         "n_epochs": 3,
         "n_steps": 4096,

@@ -1209,18 +1209,22 @@ class SAASignalWrapper(VecEnvWrapper):
             asset_obs = np.concatenate([saa_obs[:, a, :], one_hot], axis=-1)        # (B, F_saa+6+N)
             per_asset_obs = _normalize_obs_with_vecnormalize(asset_obs, self.saa_vecnormalize)
 
-            with torch.no_grad():
-                torch_obs = torch.as_tensor(per_asset_obs, device=self.device, dtype=torch.float32)
-                episode_start = torch.as_tensor(self.episode_start[a], device=self.device, dtype=torch.bool)
-                actions, state_out = self.saa_models[a].policy.predict(
-                    torch_obs,
-                    state=self.saa_states[a],
-                    episode_start=episode_start,
-                    deterministic=True,
-                )
-                self.saa_states[a] = state_out
+            # SB3 recurrent policies expect NumPy-based observations for .predict().
+            # Passing a CUDA torch tensor here triggers stable_baselines3 policy.obs_to_tensor ->
+            # np.array(torch_tensor), which raises "can't convert cuda:0 device type tensor to numpy".
+            episode_start = np.asarray(self.episode_start[a], dtype=bool)
+            actions, state_out = self.saa_models[a].policy.predict(
+                per_asset_obs,
+                state=self.saa_states[a],
+                episode_start=episode_start,
+                deterministic=True,
+            )
+            self.saa_states[a] = state_out
 
-            actions_np = actions if isinstance(actions, np.ndarray) else actions.detach().cpu().numpy()
+            if isinstance(actions, torch.Tensor):
+                actions_np = actions.detach().cpu().numpy()
+            else:
+                actions_np = np.asarray(actions)
             raw_signal = np.clip(actions_np[:, 0:1], -1.0, 1.0)
             # Rescale to the target_position_change range actually seen by env.step() during
             # SAA training/inference (see SingleAssetEpisodeAdapter.step() action_factor_fn).
