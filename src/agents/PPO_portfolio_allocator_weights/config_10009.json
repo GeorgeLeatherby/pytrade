@@ -122,7 +122,7 @@
         "log_sortino_net_reward_mix": 0.3,
         "lambda_spread": 0.0,
         "lambda_transaction_cost": 0.001,
-        "lambda_execution_gap": 0.04,
+        "lambda_execution_gap": 0.0,
 
         "paa_excess_log_return_scale": 10.0,
         "paa_linear_sortino_net_reward_scale": 2.5,
@@ -143,8 +143,8 @@
         "execution_weight_change_threshold": 0.0,
         "execution_min_per_asset_weight_change": 0.0,
 
-        "execution_deadband": 0.002,
-        "execution_step_size": 0.30,
+        "execution_deadband": 0.005,
+        "execution_step_size": 0.7,
 
         "allow_short": false,
         "price_source": "current_close",
@@ -188,28 +188,28 @@
         "log_std_init": -1.0,
         "clip_range_vf": 0.2,
         
-        "clip_range_start": 0.2,
+        "clip_range_start": 0.15,
         "clip_range_end": 0.05,
-        "clip_schedule_warmup_pct": 0.2,
-        "clip_schedule_ramping_pct": 0.6,
+        "clip_schedule_warmup_pct": 0.3,
+        "clip_schedule_ramping_pct": 0.9,
 
         "learning_rate_start":  5.0e-5,
         "learning_rate_end": 1.0e-6,
         "lr_schedule_type": "linear",
         "lr_schedule_warmup_pct": 0.3,
-        "lr_schedule_ramping_pct": 0.6,
+        "lr_schedule_ramping_pct": 0.9,
 
         "ent_coef_start": 0.01,
         "ent_coef_end": 0.0005,
         "ent_coef_schedule_type": "linear",
         "ent_coef_schedule_warmup_pct": 0.3,
-        "ent_coef_schedule_ramping_pct": 0.6,
+        "ent_coef_schedule_ramping_pct": 0.9,
 
         "action_limiting_factor_start": 0.06,
         "action_limiting_factor_end": 0.09,
         "action_limiting_factor_schedule_type": "linear",
         "action_limiting_factor_schedule_warmup_pct": 0.3,
-        "action_limiting_factor_schedule_ramping_pct": 0.6
+        "action_limiting_factor_schedule_ramping_pct": 0.9
 
     },
 
@@ -217,14 +217,14 @@
         "seed": 42,
         "n_envs": 8,
         "vec_env_start_method": "spawn",
-        "total_timesteps": 8000000,
+        "total_timesteps": 10000000,
         "train_log_freq": 10,
         "eval_freq": 12500,
         "patience": 30,
         "min_delta_reward": 0.0,
         "min_delta_sharpe": 0.0,
         "progress_bar": true,
-        "config_id": 10007,
+        "config_id": 10009,
         "tensorboard_log": "src/agents/PPO_portfolio_allocator_weights/tb_logs"
     }
 
