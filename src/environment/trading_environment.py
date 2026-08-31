@@ -3705,7 +3705,7 @@ class TradingEnv(gym.Env):
             + scaled_delta_sortino_linear
             - max_drawdown_penalty
             - drawdown_level_penalty
-            - execution_gap_penalty
+            # - execution_gap_penalty
             + realized_exit_bonus
         )
         tanh_div = max(self.paa_reward_tanh_divisor, 1e-8)
