@@ -108,7 +108,8 @@ def _normalize_obs_with_vecnormalize(obs: np.ndarray, vecnorm: VecNormalize) -> 
 class AllocatorPortfolioLoggerCallback(BaseCallback):
     """
     Aggregates allocator portfolio metrics from every parallel env and emits their means
-    to TensorBoard every `log_freq` rollouts.
+    to TensorBoard once per rollout, matching SB3's own train/* logging cadence so both
+    appear at the same x-axis density/position in TensorBoard.
     """
 
     _METRIC_KEYS = (
@@ -142,17 +143,15 @@ class AllocatorPortfolioLoggerCallback(BaseCallback):
         "excess_return_over_spy_pct",
     )
 
-    def __init__(self, tag_prefix: str = "train", log_freq: int = 10, verbose: int = 0):
+    def __init__(self, tag_prefix: str = "train", verbose: int = 0):
         """
         Args:
             tag_prefix: TensorBoard metric prefix (e.g., "train")
-            log_freq: Emit aggregated metrics every N rollouts
             verbose: Verbosity level (0=silent, 1=info, 2=debug)
         """
         super().__init__(verbose)
 
         self.tag_prefix = tag_prefix
-        self.log_freq = max(1, int(log_freq))
         self.episode_count = 0
         self.rollout_count = 0
         self._buffers: Dict[str, List[float]] = {k: [] for k in self._METRIC_KEYS}
@@ -176,9 +175,9 @@ class AllocatorPortfolioLoggerCallback(BaseCallback):
         return True
 
     def _on_rollout_end(self) -> bool:
+        # Flush unconditionally every rollout; SB3 logs train/policy_gradient_loss etc.
+        # at the same cadence, so throttling here would desync the two on the x-axis.
         self.rollout_count += 1
-        if self.rollout_count % self.log_freq != 0:
-            return True
 
         for key, values in self._buffers.items():
             if values:
@@ -1149,7 +1148,8 @@ class SAATokenizer(BaseFeaturesExtractor):
         Asset token:
             selected asset features (len(asset_feature_idx)) + SAA signal (1)
             + shadow-portfolio holding percentage (1) + live PAA asset_weight (1)
-            => expected size: len(asset_feature_idx) + 3
+            + last target weight (1) + shadow Sortino (1) + shadow drawdown (1)
+            => expected size: len(asset_feature_idx) + 6
 
         Portfolio token:
             time features (len(portfolio_time_idx)) taken from asset-0 raw features
@@ -1169,11 +1169,13 @@ class SAATokenizer(BaseFeaturesExtractor):
             raise ValueError(f"Observation too small. obs_len={obs_len}, asset_block={asset_block}")
         self.portfolio_dim = obs_len - asset_block
 
+        # Portfolio block layout (must match EpisodeBuffer.get_observation_at_step in trading_environment.py):
+        # [weights(N+1), 14 scalar metrics, last_target_weights(N), shadow_sortino(N), shadow_drawdown(N)]
+        self.paa_extra_offset = self.n_assets + 1 + 14
+
         # Validate target sizes
-        asset_token_in_dim = len(self.asset_feature_idx) + 3   # + SAA signal + shadow holding % + asset_weight
-        # if asset_token_in_dim != 26:
-        #     raise ValueError(f"Asset token dim mismatch: got {asset_token_in_dim}, expected 26 "
-        #                      f"(len(asset_feature_idx)={len(self.asset_feature_idx)})")
+        asset_token_in_dim = len(self.asset_feature_idx) + 6   # + SAA signal + shadow holding % + asset_weight
+                                                                # + last target weight + shadow sortino + shadow drawdown
         portfolio_token_in_dim = len(self.portfolio_time_idx) + self.portfolio_dim
         # Total features out = (N assets + 1 portfolio) * d_model
         total_features_dim = (self.n_assets + 1) * d_model
@@ -1236,8 +1238,18 @@ class SAATokenizer(BaseFeaturesExtractor):
         if asset_weights.shape[1] != self.n_assets:
             raise ValueError("Asset weights shape mismatch")
 
+        # Per-asset PAA diagnostics appended after weights + 14 scalar metrics (see paa_extra_offset)
+        off = self.paa_extra_offset
+        last_target_weights = portfolio_block[:, off : off + self.n_assets].unsqueeze(-1)              # (B, N, 1)
+        shadow_sortino = portfolio_block[:, off + self.n_assets : off + 2 * self.n_assets].unsqueeze(-1)      # (B, N, 1)
+        shadow_drawdown = portfolio_block[:, off + 2 * self.n_assets : off + 3 * self.n_assets].unsqueeze(-1)  # (B, N, 1)
+
         # Build asset tokens: selected feats + SAA signal + shadow holding % + live asset_weight
-        asset_token_inputs = torch.cat([asset_feats_sel, saa_sig, shadow_weight, asset_weights], dim=-1)
+        # + last target weight + shadow sortino + shadow drawdown
+        asset_token_inputs = torch.cat(
+            [asset_feats_sel, saa_sig, shadow_weight, asset_weights, last_target_weights, shadow_sortino, shadow_drawdown],
+            dim=-1,
+        )
 
         asset_tokens = self.asset_embedding(asset_token_inputs)            # (B, N, d_model)
 
@@ -1389,8 +1401,6 @@ def build_allocator_model(
     # --- Extract agent configuration section ---
     agent_cfg = config.get("portfolio_allocator_agent", {})
     transformer_cfg = config.get("allocator_transformer", {})
-    pi_mpl_hidden_dims = transformer_cfg.get("pi_mpl_hidden_dims", [128, 64])
-    vf_mpl_hidden_dims = transformer_cfg.get("vf_mpl_hidden_dims", [128, 64])
     log_std_init = agent_cfg.get("log_std_init", -1.0)  # Initial log std for action distribution (tune for exploration)
     clip_range_vf = agent_cfg.get("clip_range_vf", None)  # Optional separate clip range for value function
     
@@ -1435,6 +1445,8 @@ def build_allocator_model(
     
     # Build policy_kwargs
     # These parameters are passed directly to the policy class constructor
+    # NOTE: no net_arch here - TransformerAllocatorPolicy._build_mlp_extractor always uses
+    # AttentionEngine and ignores self.net_arch entirely.
     policy_kwargs = dict(
         features_extractor_class=SAATokenizer,
         features_extractor_kwargs=dict(
@@ -1444,7 +1456,6 @@ def build_allocator_model(
             asset_feature_idx=paa_asset_token_idx,
             portfolio_time_idx=paa_portfolio_token_idx
         ),
-        net_arch=dict(pi=pi_mpl_hidden_dims, vf=vf_mpl_hidden_dims),            
         log_std_init=log_std_init # Initial log std for action distribution (can be tuned for exploration)
     )
 
@@ -2223,13 +2234,11 @@ def run(cache: MarketDataCache, config: Dict[str, Any]) -> Dict[str, Any]:
         ent_callback = None
         print("[run] Entropy schedule callback disabled (missing config keys)")
     
-    # Training metrics callback: logs portfolio metrics to TensorBoard per episode
+    # Training metrics callback: logs portfolio metrics to TensorBoard every rollout
     train_cfg = config.get("training", {})
-    train_log_freq = int(train_cfg.get("train_log_freq", 10))
-    
+
     train_callback = AllocatorPortfolioLoggerCallback(
         tag_prefix="train",
-        log_freq=train_log_freq,  # Log every N episodes
         verbose=int(agent_cfg.get("verbose", 1))
     )
     
@@ -2429,11 +2438,9 @@ def continue_run(cache: MarketDataCache, config: Dict[str, Any], model_path: str
     
     # Training metrics callback
     train_cfg = config.get("training", {})
-    train_log_freq = int(train_cfg.get("train_log_freq", 10))
-    
+
     train_callback = AllocatorPortfolioLoggerCallback(
         tag_prefix="train",
-        log_freq=train_log_freq,
         verbose=int(agent_cfg.get("verbose", 1))
     )
     

@@ -9,14 +9,12 @@
     },
 
   "allocator_transformer": {
-        "d_model": 64,
-        "dim_feedforward": 128,
-        "n_heads": 4,
-        "n_layers": 2,
+        "d_model": 128,
+        "dim_feedforward": 512,
+        "n_heads": 8,
+        "n_layers": 4,
         "transformer_encoder_dropout": 0.0,
-        "transformer_activation_fn": "gelu",
-        "pi_mpl_hidden_dims": [64],
-        "vf_mpl_hidden_dims": [64]
+        "transformer_activation_fn": "gelu"
   },
 
     "saa_features": {

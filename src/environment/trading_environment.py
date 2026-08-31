@@ -278,7 +278,10 @@ class EpisodeBuffer:
         # If num_features is not available, set to 0
         num_features = getattr(self, "num_features", 0)
         self.current_step = 0
-        self.num_portfolio_features = self.num_assets + 1 + 14  # weights + 14 portfolio metrics used by get_observation_at_step
+        # weights(N+1) + 14 scalar portfolio metrics + 3 per-asset PAA blocks (last_target_weights,
+        # shadow_sortino, shadow_drawdown) - see get_observation_at_step for the exact layout, which
+        # SAATokenizer.forward (ppo_portfolio_allocator_weights_agent.py) depends on positionally.
+        self.num_portfolio_features = self.num_assets + 1 + 14 + 3 * self.num_assets
         self.action_entropy = np.zeros(self.episode_buffer_length_days, dtype=dtype) 
         # Reward component tracking (per-step)
         self.reward_alpha = np.zeros(self.episode_buffer_length_days, dtype=dtype)
@@ -305,6 +308,9 @@ class EpisodeBuffer:
         self.saa_sub_shares       = np.zeros((self.episode_buffer_length_days, self.num_assets), dtype=dtype)  # shares held per asset
         self.saa_sub_last_action  = np.zeros((self.episode_buffer_length_days, self.num_assets), dtype=dtype)  # previous SAA scalar action per asset
         self.saa_sub_daily_return = np.zeros((self.episode_buffer_length_days, self.num_assets), dtype=dtype)  # $-delta matching env.saa_returns formula
+        # Per-asset shadow sub-portfolio diagnostics fed to the PAA asset tokens (PORTFOLIO_WEIGHTS mode).
+        self.shadow_sortino  = np.zeros((self.episode_buffer_length_days, self.num_assets), dtype=dtype)  # clipped per-asset Sortino ratio
+        self.shadow_drawdown = np.zeros((self.episode_buffer_length_days, self.num_assets), dtype=dtype)  # per-asset rolling max drawdown
 
     def record_step(self, external_step: int, portfolio_value: float, weights: np.ndarray, portfolio_positions: np.ndarray,
                    daily_return: float, saa_return: float, reward_to_record: float,action: np.ndarray,
@@ -404,6 +410,41 @@ class EpisodeBuffer:
                 self.saa_sub_shares[internal_offset_step],
                 self.saa_sub_last_action[internal_offset_step],
                 self.saa_sub_daily_return[internal_offset_step])
+
+    def record_shadow_diagnostics(self, external_step: int, sortino: np.ndarray, drawdown: np.ndarray) -> None:
+        """Store the per-asset shadow sub-portfolio Sortino ratio and drawdown for this step."""
+        internal_offset_step = external_step + self.lookback_window if self.maybe_provide_sequence else external_step
+        self.shadow_sortino[internal_offset_step] = sortino
+        self.shadow_drawdown[internal_offset_step] = drawdown
+
+    def shadow_calculate_max_drawdown(self, external_step: int, window: int, current_step_prices: np.ndarray) -> np.ndarray:
+        """
+        Per-asset max drawdown of each shadow sub-portfolio (cash + that asset's notional) over
+        the last `window` steps, ending at `external_step` (inclusive). saa_sub_cash/shares for
+        `external_step` must already be written (via set_saa_sub_state_mtm) before calling this;
+        `current_step_prices` substitutes for asset_prices[external_step], which record_step()
+        for this step hasn't run yet at the point this is normally called.
+        """
+        internal_end = external_step + self.lookback_window if self.maybe_provide_sequence else external_step
+        if internal_end <= 0:
+            return np.zeros(self.num_assets, dtype=np.float32)
+        internal_start = max(0, internal_end - window)
+
+        cash_slice = self.saa_sub_cash[internal_start:internal_end + 1]        # [T, N]
+        shares_slice = self.saa_sub_shares[internal_start:internal_end + 1]    # [T, N]
+        prices_slice = self.asset_prices[internal_start:internal_end + 1].copy()  # [T, N]
+        prices_slice[-1] = current_step_prices
+
+        values = cash_slice + shares_slice * prices_slice
+        if values.shape[0] < 2:
+            return np.zeros(self.num_assets, dtype=np.float32)
+
+        peaks = np.maximum.accumulate(values, axis=0)
+        peaks = np.maximum(peaks, 1e-12)
+        drawdowns = (peaks - values) / peaks
+        drawdowns = np.nan_to_num(drawdowns, nan=0.0, posinf=0.0, neginf=0.0)
+        max_dd = np.max(drawdowns, axis=0)
+        return np.clip(max_dd, 0.0, None).astype(np.float32)
     
     def get_returns_window(self, window: int) -> np.ndarray:
         """Get last N returns for risk calculations (no wrap-around, no ring buffer)"""
@@ -592,6 +633,10 @@ class EpisodeBuffer:
         rf_zscore_seq = self.risk_free_rate_zscore_60d[start_idx:end_idx+1].reshape(-1, 1)
         rf_daily_seq = self.risk_free_rate_daily[start_idx:end_idx+1].reshape(-1, 1)
         rf_daily_raw_seq = self.risk_free_rate_daily_raw[start_idx:end_idx+1].reshape(-1, 1)
+        # Per-asset PAA blocks: last target weights (cash-excluded slice of actions), shadow Sortino, shadow drawdown
+        last_target_weights_seq = self.actions[start_idx:end_idx+1, 1:1 + self.num_assets]
+        shadow_sortino_seq = self.shadow_sortino[start_idx:end_idx+1]
+        shadow_drawdown_seq = self.shadow_drawdown[start_idx:end_idx+1]
 
         # Concatenate all features along last axis
         features_seq = np.concatenate([
@@ -610,6 +655,9 @@ class EpisodeBuffer:
             rf_zscore_seq,
             rf_daily_seq,
             rf_daily_raw_seq,
+            last_target_weights_seq,
+            shadow_sortino_seq,
+            shadow_drawdown_seq,
         ], axis=1)
 
         # Place into output array (pad at beginning if needed)
@@ -649,11 +697,19 @@ class EpisodeBuffer:
         # rewards = self.allocator_rewards[internal_step] # Why feed reward.
         effective_asset_concentration_norm = self.effective_asset_concentration_norm[internal_step]
 
+        # Per-asset PAA blocks: last target weights (cash-excluded slice of actions), shadow Sortino, shadow drawdown
+        last_target_weights = self.actions[internal_step, 1:1 + self.num_assets]
+        shadow_sortino = self.shadow_sortino[internal_step]
+        shadow_drawdown = self.shadow_drawdown[internal_step]
+
         observation = np.concatenate([
             weights,
             [alpha, sharpe, drawdown, volatility, turnover, effective_asset_concentration_norm, previous_sortino, 
             current_sortino, running_mean_ema, downside_var_sqrt, previous_max_drawdown, risk_free_rate_zscore_60d, risk_free_rate_daily,
-            risk_free_rate_daily_raw]
+            risk_free_rate_daily_raw],
+            last_target_weights,
+            shadow_sortino,
+            shadow_drawdown,
         ]).astype(np.float32)
 
         return observation
@@ -2135,6 +2191,12 @@ class TradingEnv(gym.Env):
         self.saa_running_mean_ema = 1e-6
         self.saa_running_downside_variance_ema = 2.5e-5
 
+        # Per-asset shadow sub-portfolio Sortino EMAs (PORTFOLIO_WEIGHTS mode observation feature).
+        # Same init values as the scalar SAA/PAA EMAs above so the first steps can't spike.
+        num_assets_for_reset = self.market_data_cache.num_assets
+        self.shadow_running_mean_ema = np.full(num_assets_for_reset, 1e-6, dtype=np.float32)
+        self.shadow_running_downside_variance_ema = np.full(num_assets_for_reset, 2.5e-5, dtype=np.float32)
+
         # Init & reset episode accumulators for sortino diagnostics
         self._sortino_mean_hist, self._sortino_down_hist, self._sortino_raw_hist = [], [], []
 
@@ -3054,6 +3116,37 @@ class TradingEnv(gym.Env):
             )
             # Cache for the NEXT step's "before_notional" read (avoids indexing into buffer again)
             self._saa_sub_prev_value = (cash_after_drag + notional_after).astype(np.float32)
+
+            # --- Per-asset shadow-portfolio Sortino + drawdown (feeds PAA asset tokens) ---
+            # Same EMA/floor/clip setup as the SAA reward's own Sortino (calculate_saa_step_reward),
+            # just vectorized across assets and applied to each shadow sub-portfolio's own return.
+            prev_sub_value = cash_before_drag + prev_shares * self._saa_sub_prev_prices  # [N] value before this step
+            shadow_step_return = saa_sub_ret / np.maximum(prev_sub_value, 1e-8)          # [N] pct return, not $-delta
+
+            shadow_delta = shadow_step_return - self.shadow_running_mean_ema
+            self.shadow_running_mean_ema = self.shadow_running_mean_ema + self.sortino_eta * shadow_delta
+            shadow_downside_sq = np.minimum(shadow_step_return, 0.0) ** 2
+            self.shadow_running_downside_variance_ema = self.shadow_running_downside_variance_ema + self.sortino_eta * (
+                shadow_downside_sq - self.shadow_running_downside_variance_ema
+            )
+            shadow_downside_std = np.maximum(
+                np.sqrt(np.maximum(self.shadow_running_downside_variance_ema, 0.0)), 0.005
+            )
+            shadow_sortino = np.clip(self.shadow_running_mean_ema / shadow_downside_std, -3.0, 3.0)
+
+            if self.current_step <= 2:
+                shadow_risk_window = 2
+            else:
+                shadow_risk_window = min(self.current_step, self.max_reward_risk_window)
+            shadow_drawdown = ebuf.shadow_calculate_max_drawdown(
+                external_step=self.current_step, window=shadow_risk_window, current_step_prices=new_prices
+            )
+
+            ebuf.record_shadow_diagnostics(
+                external_step=self.current_step,
+                sortino=shadow_sortino.astype(np.float32),
+                drawdown=shadow_drawdown.astype(np.float32),
+            )
 
         # Calculate new portfolio value after price changes
         portfolio_value_after = self.portfolio_state.get_total_value()
