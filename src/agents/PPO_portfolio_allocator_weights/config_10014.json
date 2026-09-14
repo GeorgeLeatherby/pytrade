@@ -144,14 +144,14 @@
         "execution_min_per_asset_weight_change": 0.0,
 
         "execution_deadband": 0.005,
-        "execution_step_size": 0.7,
+        "execution_step_size": 0.4,
 
         "allow_short": false,
         "price_source": "current_close",
         "quantity_type": "shares",
 
         "fixed_fee_per_order": 0.0,
-        "commission_bps": 0.00001,
+        "commission_bps": 0.00005,
         "half_spread_bps": 0.00002,
         "impact_coeff": 0.01170,
         "adv_window": 21,
@@ -188,28 +188,28 @@
         "log_std_init": -1.0,
         "clip_range_vf": 0.2,
         
-        "clip_range_start": 0.2,
+        "clip_range_start": 0.15,
         "clip_range_end": 0.05,
-        "clip_schedule_warmup_pct": 0.2,
-        "clip_schedule_ramping_pct": 0.6,
+        "clip_schedule_warmup_pct": 0.3,
+        "clip_schedule_ramping_pct": 0.9,
 
         "learning_rate_start":  5.0e-5,
         "learning_rate_end": 1.0e-6,
         "lr_schedule_type": "linear",
         "lr_schedule_warmup_pct": 0.3,
-        "lr_schedule_ramping_pct": 0.6,
+        "lr_schedule_ramping_pct": 0.9,
 
         "ent_coef_start": 0.01,
         "ent_coef_end": 0.0005,
         "ent_coef_schedule_type": "linear",
         "ent_coef_schedule_warmup_pct": 0.3,
-        "ent_coef_schedule_ramping_pct": 0.6,
+        "ent_coef_schedule_ramping_pct": 0.9,
 
         "action_limiting_factor_start": 0.06,
         "action_limiting_factor_end": 0.09,
         "action_limiting_factor_schedule_type": "linear",
         "action_limiting_factor_schedule_warmup_pct": 0.3,
-        "action_limiting_factor_schedule_ramping_pct": 0.6
+        "action_limiting_factor_schedule_ramping_pct": 0.9
 
     },
 
@@ -217,14 +217,14 @@
         "seed": 42,
         "n_envs": 8,
         "vec_env_start_method": "spawn",
-        "total_timesteps": 10000000,
+        "total_timesteps": 14000000,
         "train_log_freq": 10,
-        "eval_freq": 50000,
-        "patience": 10,
+        "eval_freq": 12500,
+        "patience": 30,
         "min_delta_reward": 0.0,
         "min_delta_sharpe": 0.0,
         "progress_bar": true,
-        "config_id": 10008,
+        "config_id": 10014,
         "tensorboard_log": "src/agents/PPO_portfolio_allocator_weights/tb_logs"
     }
 
