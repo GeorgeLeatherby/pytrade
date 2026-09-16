@@ -518,22 +518,19 @@ def _plot_main_subplot(
     asset_name: str,
     portfolio_values: np.ndarray,
     bh_values: np.ndarray,
-    prices: np.ndarray,
 ) -> None:
-    """Plot normalised equity curves (price / agent / B&H) on a single primary axis."""
+    """Plot normalised agent and buy-and-hold equity curves."""
     T = len(portfolio_values)
     x = np.arange(T)
 
     pv_idx = _index_to_100(portfolio_values)
     bh_idx = _index_to_100(bh_values)
-    price_idx = _index_to_100(prices)
 
-    ax.plot(x, price_idx, color="#444444", linewidth=0.9, label="Price", zorder=3)
     ax.plot(x, pv_idx, color="#1f77b4", linewidth=1.4, label="Agent", zorder=4)
-    ax.plot(x, bh_idx, color="#ff7f0e", linewidth=1.2, linestyle="--", label="B&H 100%", zorder=3)
+    ax.plot(x, bh_idx, color="#ff7f0e", linewidth=1.2, label="B&H", zorder=3)
     ax.set_ylabel("Index (t₀=100)", fontsize=7)
     ax.set_title(asset_name, fontsize=9, fontweight="bold", pad=3)
-    ax.legend(fontsize=6.5, loc="upper left", frameon=False)
+    ax.legend(fontsize=6.5, loc="best", frameon=True, framealpha=0.75)
 
 
 def _plot_volume_subplot(
@@ -625,7 +622,6 @@ def _plot_asset_specific_pages(
                 asset_name=asset_name,
                 portfolio_values=rec["portfolio_values"],
                 bh_values=rec["bh_values"],
-                prices=rec["prices"],
             )
             _plot_volume_subplot(ax=ax_vol, signed_volume=rec["signed_volume"])
 
@@ -718,8 +714,9 @@ def _plot_aggregate_page(
     date_file: str,
     output_dir: str,
     timestamp: str,
+    cache: MarketDataCache,
 ) -> str:
-    """Produce one aggregate PNG comparing combined agent portfolio vs S&P 500 B&H."""
+    """Produce one aggregate PNG comparing agent, SPY B&H, and cash carry."""
     _apply_paper_style()
 
     # Combined portfolio = equal-weight average of all shadow sub-portfolios.
@@ -736,13 +733,28 @@ def _plot_aggregate_page(
 
     combined_idx = _index_to_100(combined_pv)
 
+    # Cash benchmark compounds the same date-aligned EFFR carry applied by TradingEnv.
+    cash_values = np.empty(T, dtype=np.float64)
+    if T > 0:
+        cash_values[0] = 1.0
+        start_step = int(episode_record["start_step"])
+        for step in range(1, T):
+            absolute_step = min(start_step + step, cache.num_days - 1)
+            cash_values[step] = cash_values[step - 1] * (
+                1.0 + float(cache.risk_free_rate_daily[absolute_step])
+            )
+    cash_idx = _index_to_100(cash_values) if T > 0 else cash_values
+
     fig, ax = plt.subplots(figsize=(8.27, 4.5))
     ax.plot(x, combined_idx, color="#1f77b4", linewidth=1.6, label="Combined agent portfolio (equal-weight)")
 
     spy_idx_vals = None
     if spy_bh is not None and len(spy_bh) == T:
         spy_idx_vals = _index_to_100(spy_bh)
-        ax.plot(x, spy_idx_vals, color="#d62728", linewidth=1.4, linestyle="--", label="SPY Buy-and-hold")
+        ax.plot(x, spy_idx_vals, color="#d62728", linewidth=1.4, label="SPY B&H")
+
+    if T > 0:
+        ax.plot(x, cash_idx, color="#2ca02c", linewidth=1.3, label="100% Cash (EFFR)")
 
     final_agent = float(combined_idx[-1] - 100.0) if len(combined_idx) > 0 else 0.0
     final_spy = float(spy_idx_vals[-1] - 100.0) if spy_idx_vals is not None else None
@@ -750,6 +762,8 @@ def _plot_aggregate_page(
     summary_lines = [f"Agent: {final_agent:+.1f}%"]
     if final_spy is not None:
         summary_lines.append(f"SPY B&H: {final_spy:+.1f}%")
+    if T > 0:
+        summary_lines.append(f"Cash (EFFR): {cash_idx[-1] - 100.0:+.1f}%")
     ax.text(
         0.99, 0.03, "\n".join(summary_lines),
         transform=ax.transAxes,
@@ -764,7 +778,7 @@ def _plot_aggregate_page(
     )
     ax.set_xlabel("Trading day")
     ax.set_ylabel("Index (t₀=100)")
-    ax.legend(fontsize=9, loc="upper left", frameon=False)
+    ax.legend(fontsize=9, loc="best", frameon=True, framealpha=0.75)
     ax.axhline(100.0, color="grey", linewidth=0.6, linestyle=":")
 
     fname = f"aggregate_saa_portfolio_test_{date_file}_{timestamp}.png"
@@ -825,7 +839,9 @@ def _generate_all_reports(
 
         # PNG — aggregate page.
         try:
-            agg_path = _plot_aggregate_page(ep_rec, asset_names, date_display, date_file, output_dir, timestamp)
+            agg_path = _plot_aggregate_page(
+                ep_rec, asset_names, date_display, date_file, output_dir, timestamp, cache
+            )
             all_png_paths.append(agg_path)
         except Exception:
             print(f"[Shadow-Test] WARNING: aggregate plot failed for episode {ep_rec['episode_id']}:")
