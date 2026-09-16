@@ -1,1 +1,2 @@
 pandas_datareader>=0.10.0
+tbparse>=0.0.9
