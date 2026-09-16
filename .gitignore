@@ -23,9 +23,6 @@ runs/
 # Exclude the full report section for now.
 reports/
 
-# utils
-utils/
-
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
