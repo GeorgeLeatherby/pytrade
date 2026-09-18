@@ -20,12 +20,21 @@ from tbparse import SummaryReader
 # ----------------------------------------------------------------------------
 # Configuration - edit these before running the script
 # ----------------------------------------------------------------------------
-AGENT_NAME = "PPO_portfolio_allocator_weights"
-CONFIG_IDENTS = ["10002", "10003"]
-METRIC_NAMES = [
-    "train/loss",
-    "eval/mean_reward",
+AGENT_NAME = "RecurrPPO_target_position_agent"
+CONFIG_IDENTS = [
+    "00233_config_01056_26_08_04_1",
+    "00234_config_01057_26_08_07_1",
+    "00239_config_01058_26_08_13_1"
 ]
+METRIC_NAMES = [
+    "validation/pv_minus_selected_asset_bh_abs_mean",
+    "train/pv_minus_selected_asset_bh_abs_mean",
+    "train/explained_variance",
+    "train/value_loss",
+    "train/policy_gradient_loss",
+    "train/approx_kl"
+]
+TRAIN_SMOOTHING_WINDOW = 25
 # ----------------------------------------------------------------------------
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -43,30 +52,63 @@ def _extract_config_ident(dir_name: str) -> str | None:
 
 
 def load_scalars(tb_logs_dir: str, config_idents: list[str]):
-    """Read all scalar events under tb_logs_dir and keep only the requested config_idents."""
+    """Read scalars for requested config identifiers or complete run names."""
     reader = SummaryReader(tb_logs_dir, extra_columns={"dir_name"})
     df = reader.scalars
-    idents = set(config_idents)
-    mask = df["dir_name"].apply(lambda d: _extract_config_ident(d) in idents)
+    requested = set(config_idents)
+    mask = df["dir_name"].apply(
+        lambda d: d in requested or _extract_config_ident(d) in requested
+    )
     return df[mask]
 
 
 def plot_metric(df, metric: str, graphs_dir: str):
-    """Plot one line per matching run for the given metric and save it as a PNG."""
+    """Plot matching runs for a metric and save the figure as a PNG."""
     metric_df = df[df["tag"] == metric]
     if metric_df.empty:
         print(f"[warn] no data found for metric '{metric}', skipping.")
         return None
 
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for dir_name, run_df in metric_df.groupby("dir_name"):
+    fig, ax = plt.subplots(figsize=(6.4, 4.8), dpi=150)
+    colors = plt.get_cmap("tab10").colors
+    smooth_train = metric.startswith("train/")
+
+    for run_number, (dir_name, run_df) in enumerate(metric_df.groupby("dir_name")):
         run_df = run_df.sort_values("step")
         ident = _extract_config_ident(dir_name)
-        ax.plot(run_df["step"], run_df["value"], label=f"config_{ident} ({dir_name})")
+        label = f"config_{ident}"
+        color = colors[run_number % len(colors)]
+
+        if smooth_train:
+            ax.plot(
+                run_df["step"],
+                run_df["value"],
+                color=color,
+                alpha=0.3,
+                linewidth=0.8,
+                label="_nolegend_",
+            )
+            smoothed_values = run_df["value"].rolling(
+                window=TRAIN_SMOOTHING_WINDOW,
+                min_periods=1,
+                center=True,
+            ).mean()
+            ax.plot(
+                run_df["step"],
+                smoothed_values,
+                color=color,
+                linewidth=2,
+                label=f"{label} (rolling mean)",
+            )
+        else:
+            ax.plot(run_df["step"], run_df["value"], color=color, label=label)
 
     ax.set_title(metric)
     ax.set_xlabel("step")
     ax.set_ylabel(metric)
+    ax.minorticks_on()
+    ax.grid(True, which="major", axis="both", linestyle="-", linewidth=0.7, alpha=0.35)
+    ax.grid(True, which="minor", axis="both", linestyle=":", linewidth=0.5, alpha=0.25)
     ax.legend(fontsize="small")
     fig.tight_layout()
 
