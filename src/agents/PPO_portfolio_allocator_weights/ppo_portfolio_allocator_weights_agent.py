@@ -1170,8 +1170,11 @@ class SAATokenizer(BaseFeaturesExtractor):
         self.portfolio_dim = obs_len - asset_block
 
         # Portfolio block layout (must match EpisodeBuffer.get_observation_at_step in trading_environment.py):
-        # [weights(N+1), 14 scalar metrics, last_target_weights(N), shadow_sortino(N), shadow_drawdown(N)]
-        self.paa_extra_offset = self.n_assets + 1 + 14
+        # [weights(N+1), K scalar metrics, last_target_weights(N), shadow_sortino(N), shadow_drawdown(N)].
+        # Derived from portfolio_dim rather than hardcoding K, so this offset self-corrects whenever
+        # the env's scalar metric count changes (it previously hardcoded K=14 and would silently
+        # misalign the per-asset slices below if the env's portfolio block grew).
+        self.paa_extra_offset = self.portfolio_dim - 3 * self.n_assets
 
         # Validate target sizes
         asset_token_in_dim = len(self.asset_feature_idx) + 6   # + SAA signal + shadow holding % + asset_weight
@@ -1238,7 +1241,7 @@ class SAATokenizer(BaseFeaturesExtractor):
         if asset_weights.shape[1] != self.n_assets:
             raise ValueError("Asset weights shape mismatch")
 
-        # Per-asset PAA diagnostics appended after weights + 14 scalar metrics (see paa_extra_offset)
+        # Per-asset PAA diagnostics appended after weights + scalar metrics (see paa_extra_offset)
         off = self.paa_extra_offset
         last_target_weights = portfolio_block[:, off : off + self.n_assets].unsqueeze(-1)              # (B, N, 1)
         shadow_sortino = portfolio_block[:, off + self.n_assets : off + 2 * self.n_assets].unsqueeze(-1)      # (B, N, 1)
