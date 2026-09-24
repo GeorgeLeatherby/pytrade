@@ -1101,8 +1101,11 @@ class MarketDataCache:
 
         # Build annualized and daily rates on the full expanded timeline first.
         risk_free_rate_pa_full = effr_full / 100.0
-        # Fed funds is conventionally an overnight annualized rate on ACT/360.
-        risk_free_rate_daily_full = risk_free_rate_pa_full / 360.0
+        # Deliberate deviation from real-world ACT/360: the env only accrues cash carry on
+        # trading days (no weekend/holiday catch-up), so dividing by 252 instead of 360
+        # spreads the nominal annualized rate evenly across a trading year, converging to
+        # ~rate_pa after 252 daily compoundings (matches get_log_risk_free_rate_daily_at_step).
+        risk_free_rate_daily_full = risk_free_rate_pa_full / 252.0
 
         # Compute rolling z-score on the expanded timeline so the first cache day
         # can use a proper 60-day history.
