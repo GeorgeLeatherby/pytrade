@@ -2809,6 +2809,9 @@ class TradingEnv(gym.Env):
             "rf_zscore": np.float32(
                 self.market_data_cache.get_risk_free_rate_zscore_at_step(self.current_absolute_step)
             ),
+            "rf_level_scaled": np.float32(
+                self.market_data_cache.get_risk_free_rate_pa_at_step(self.current_absolute_step) / 0.1
+            ),
             "excess_log_return_over_rf": np.asarray(
                 self.market_data_cache.get_all_assets_excess_log_return_over_rf_at_step(self.current_absolute_step),
                 dtype=np.float32,

@@ -781,6 +781,19 @@ class SAASignalWrapper(VecEnvWrapper):
                 f"max_idx={int(np.max(self.saa_idx))}"
             )
 
+        # Derive the SAA portfolio block from the loaded checkpoint rather than assuming
+        # a fixed six-feature layout. The trailing one-hot asset block is excluded.
+        saa_obs_shape = getattr(saa_model.observation_space, "shape", None)
+        if not saa_obs_shape or len(saa_obs_shape) != 1:
+            raise ValueError("Loaded SAA model has no flat one-dimensional observation space.")
+        self.saa_portfolio_dim = int(saa_obs_shape[0]) - int(self.saa_idx.size) - self.num_assets
+        if self.saa_portfolio_dim < 6 or self.saa_portfolio_dim > 7:
+            raise ValueError(
+                "Unsupported SAA portfolio observation width. "
+                f"Expected 6 or 7 features, got {self.saa_portfolio_dim} "
+                f"from observation shape {saa_obs_shape}."
+            )
+
         # One frozen SAA shared by every (env, asset) row; the LSTM state carries the batch
         # dimension, so separate model copies would be redundant.
         self.saa_model = saa_model
@@ -888,12 +901,19 @@ class SAASignalWrapper(VecEnvWrapper):
         ).astype(np.float32)
 
         rf_z_rep = np.repeat(rf_z_all[:, None], repeats=N, axis=1)
-        mem_block = np.stack(
-            [cash_log_value, asset_log_value, dret_all, last_act_all, rf_z_rep, alpha_rf_all], axis=-1
-        )  # (B, N, 6)
+        portfolio_features = [cash_log_value, asset_log_value, dret_all, last_act_all]
+        if self.saa_portfolio_dim == 7:
+            rf_level_all = np.asarray([b["rf_level_scaled"] for b in bundles], dtype=np.float32)
+            portfolio_features.extend([
+                rf_z_rep,
+                alpha_rf_all,
+                np.repeat(rf_level_all[:, None], repeats=N, axis=1),
+            ])
+        else:
+            portfolio_features.append(alpha_rf_all)
+        mem_block = np.stack(portfolio_features, axis=-1)
 
-        # Flatten to rows r = b * N + a and append the trailing one-hot asset-ID block so the
-        # layout matches SAA training: [features, portfolio_features(6), one_hot_asset_id(N)].
+        # Flatten to rows r = b * N + a and append the trailing one-hot asset-ID block.
         saa_obs = np.concatenate([saa_market_feats, mem_block], axis=-1).reshape(B * N, -1)
         one_hot = self._asset_one_hot_batch if B == self.venv.num_envs else np.tile(self._asset_one_hot, (B, 1))
         batch_obs = np.concatenate([saa_obs, one_hot], axis=-1).astype(np.float32)
@@ -1315,9 +1335,27 @@ def _load_saa_from_config(saa_config: Dict[str, Any]) -> Tuple[Any, Optional[Vec
     # saved_models/<run_dir_name> sits under <saa_agent_root>/saved_models, config lives at
     # <saa_agent_root>/config_<config_id>.json.
     saa_agent_root = os.path.dirname(base_dir)
-    saa_training_config_path = os.path.join(saa_agent_root, f"config_{config_id}.json")
-    if not os.path.isfile(saa_training_config_path):
-        raise FileNotFoundError(f"SAA training config not found: {saa_training_config_path}")
+    configured_filename = saa_config.get("saa_config_filename")
+    if configured_filename:
+        config_candidates = [str(configured_filename)]
+    else:
+        config_id_without_prefix = config_id[1:] if config_id[:1].isalpha() else config_id
+        config_candidates = [
+            f"config_{config_id}.json",
+            f"config_A{config_id_without_prefix}.json",
+        ]
+    config_candidates = list(dict.fromkeys(config_candidates))
+    saa_training_config_path = next(
+        (
+            path if os.path.isabs(path) else os.path.join(saa_agent_root, path)
+            for path in config_candidates
+            if os.path.isfile(path if os.path.isabs(path) else os.path.join(saa_agent_root, path))
+        ),
+        None,
+    )
+    if saa_training_config_path is None:
+        expected_paths = [os.path.join(saa_agent_root, path) for path in config_candidates]
+        raise FileNotFoundError(f"SAA training config not found. Tried: {expected_paths}")
     with open(saa_training_config_path, "r") as f:
         saa_training_config = json.load(f)
     agent_cfg = saa_training_config.get("agent", {})
