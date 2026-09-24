@@ -743,28 +743,18 @@ class EvalCallbackWithMetrics(BaseCallback):
                 self.eval_step_callback.globals = globals_
                 return bool(self.eval_step_callback.on_step())
 
-            # 0) Deterministic validation sweep: one run per asset per validation block,
-            #    forced cash-only starts. Mirrors shadow-portfolio inference setup.
+            # Deterministic validation sweep only: one run per asset per validation block,
+            # forced cash-only starts. Mirrors shadow-portfolio inference setup. Randomized
+            # validation episodes (random initial cash/asset split) were removed since their
+            # noise could dominate the averaged checkpoint-selection metric.
             det_rewards, det_lengths, n_det_episodes = self._run_deterministic_validation_grid(_step_cb)
-
-            # 1) Keep existing randomized validation episodes.
-            rand_rewards, rand_lengths = evaluate_policy(
-                self.model,
-                self.eval_env,
-                n_eval_episodes=self.n_eval_episodes,
-                deterministic=self.deterministic,
-                render=self.render,
-                return_episode_rewards=True,
-                warn=self.warn,
-                callback=_step_cb,
-            )
-            episode_rewards = det_rewards + [float(r) for r in rand_rewards]
-            episode_lengths = det_lengths + [int(l) for l in rand_lengths]
+            episode_rewards = det_rewards
+            episode_lengths = det_lengths
             self.n_eval_calls += 1
 
             # Flush aggregated validation metrics after all eval episodes complete
             if self.eval_step_callback is not None:
-                total_eval_episodes = int(n_det_episodes + self.n_eval_episodes)
+                total_eval_episodes = int(n_det_episodes)
                 self.eval_step_callback.flush_metrics(total_eval_episodes)
                 
             # Log standard SB3 eval metrics
