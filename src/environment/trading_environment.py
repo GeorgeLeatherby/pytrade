@@ -5065,8 +5065,8 @@ class TradingEnv(gym.Env):
             asset_notional = asset_weight * self.episode_buffer.portfolio_values[internal_step]
             initial_portfolio_value = self.initial_portfolio_value
 
-            cash_log_value = np.log(cash_notional / initial_portfolio_value) if cash_notional > 0 else 0.0
-            asset_log_value = np.log(asset_notional / initial_portfolio_value) if asset_notional > 0 else 0.0
+            cash_log_value = np.log(cash_notional / initial_portfolio_value) if cash_notional > 0.005 else 0.0
+            asset_log_value = np.log(asset_notional / initial_portfolio_value) if asset_notional > 0.005 else 0.0
 
 
             # Daily return of the full portfolio for this step
