@@ -2117,19 +2117,30 @@ class TradingEnv(gym.Env):
                 # 2. Portfolio features: [num_portfolio_features]
                 portfolio_obs_size = num_portfolio_features  # Single step portfolio features
             
-        # Single flattened observation space for maximum performance
-        # EXECUTION_SINGLE_ASSET_TARGET_POS appends a one-hot asset-ID block (num_assets dims)
-        # so the policy can learn asset-specific behaviour via nn.Embedding inside the extractor.
+        # Keep the categorical asset ID separate so VecNormalize cannot transform it.
         if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
-            total_obs_size = asset_obs_size + portfolio_obs_size + num_assets
+            self.observation_space = spaces.Dict({
+                "numeric": spaces.Box(
+                    low=-np.inf,
+                    high=np.inf,
+                    shape=(asset_obs_size + portfolio_obs_size,),
+                    dtype=np.float32,
+                ),
+                "asset_id": spaces.Box(
+                    low=0.0,
+                    high=1.0,
+                    shape=(num_assets,),
+                    dtype=np.float32,
+                ),
+            })
         else:
             total_obs_size = asset_obs_size + portfolio_obs_size
-        self.observation_space = spaces.Box(
-            low=-np.inf, 
-            high=np.inf, 
-            shape=(total_obs_size,), 
-            dtype=np.float32
-        )
+            self.observation_space = spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=(total_obs_size,),
+                dtype=np.float32,
+            )
         
         print(f"\nObservation space setup complete: {self.observation_space}")
 
@@ -3366,7 +3377,13 @@ class TradingEnv(gym.Env):
 
         # ------------------ Prepare next observation if not terminated ------------------------
         if terminated or truncated:
-            next_observation = np.zeros(self.observation_space.shape, dtype=np.float32)
+            if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
+                next_observation = {
+                    "numeric": np.zeros(self.observation_space.spaces["numeric"].shape, dtype=np.float32),
+                    "asset_id": np.zeros(self.observation_space.spaces["asset_id"].shape, dtype=np.float32),
+                }
+            else:
+                next_observation = np.zeros(self.observation_space.shape, dtype=np.float32)
             # Internal index range for actual episode steps (exclude warmup)
             if self.maybe_provide_sequence:
                 internal_start = self.lookback_window
@@ -5089,18 +5106,14 @@ class TradingEnv(gym.Env):
                 portfolio_features = np.nan_to_num(portfolio_features, nan=0.0, posinf=0.0, neginf=0.0)
                 print(f"Warning: Non-finite portfolio feature values encountered at step {internal_step}. Replaced with zeros.")
                 
-            # One-hot asset-ID vector: shape [num_assets]. Argmax is invariant to VecNormalize
-            # affine transforms, so the embedding lookup inside InputMLPFeatures is always correct.
+            # Keep the categorical asset ID separate so VecNormalize can leave it unchanged.
             one_hot_asset_id = np.zeros(self.market_data_cache.num_assets, dtype=np.float32)
             one_hot_asset_id[self.selected_asset_index] = 1.0
 
-            observation = np.concatenate([
-                features,
-                portfolio_features,
-                one_hot_asset_id,
-            ]).astype(np.float32)
-
-            return observation
+            return {
+                "numeric": np.concatenate([features, portfolio_features]).astype(np.float32),
+                "asset_id": one_hot_asset_id,
+            }
 
         else:    
             # Get features for current step: shape [num_assets, num_selected_features]

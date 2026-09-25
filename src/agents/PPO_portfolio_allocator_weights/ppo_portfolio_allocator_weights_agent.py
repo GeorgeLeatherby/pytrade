@@ -69,11 +69,16 @@ class _ObsNormDummyEnv(gym.Env):
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
-        obs = np.zeros(self.observation_space.shape, dtype=np.float32)
+        obs = {
+            key: np.zeros(space.shape, dtype=np.float32)
+            for key, space in self.observation_space.spaces.items()
+        } if isinstance(self.observation_space, gym.spaces.Dict) else np.zeros(
+            self.observation_space.shape, dtype=np.float32
+        )
         return obs, {}
 
     def step(self, action):
-        obs = np.zeros(self.observation_space.shape, dtype=np.float32)
+        obs, _ = self.reset()
         reward = 0.0
         terminated = True
         truncated = False
@@ -81,13 +86,18 @@ class _ObsNormDummyEnv(gym.Env):
         return obs, reward, terminated, truncated, info
 
 
-def _normalize_obs_with_vecnormalize(obs: np.ndarray, vecnorm: VecNormalize) -> np.ndarray:
+def _normalize_obs_with_vecnormalize(obs, vecnorm: VecNormalize):
     """
     Standalone equivalent of VecNormalize.normalize_obs(obs) using saved obs_rms.
-    Works for 1D obs vectors (the SAA case here).
+    Supports the structured SAA observation and legacy flat observations.
     """
     if vecnorm is None or getattr(vecnorm, "obs_rms", None) is None:
         return obs
+
+    if isinstance(obs, dict):
+        if vecnorm is None or getattr(vecnorm, "obs_rms", None) is None:
+            return {key: np.asarray(value, dtype=np.float32) for key, value in obs.items()}
+        return vecnorm.normalize_obs(obs)
 
     obs = np.asarray(obs, dtype=np.float32)
     mean = vecnorm.obs_rms.mean
@@ -739,7 +749,7 @@ class SAASignalWrapper(VecEnvWrapper):
         # Rescales raw SAA policy output into the target_position_change range the SAA was
         # actually trained/executed with (env.step never saw raw actions during SAA training).
         self.action_limiting_factor = float(action_limiting_factor)
-        # Precomputed one-hot asset-ID rows; SAA's InputMLPFeatures expects this trailing block.
+        # Precomputed raw one-hot asset-ID rows for the structured SAA observation.
         self._asset_one_hot = np.eye(self.num_assets, dtype=np.float32)
 
         if not hasattr(self.venv, "env_method"):
@@ -781,17 +791,18 @@ class SAASignalWrapper(VecEnvWrapper):
                 f"max_idx={int(np.max(self.saa_idx))}"
             )
 
-        # Derive the SAA portfolio block from the loaded checkpoint rather than assuming
-        # a fixed six-feature layout. The trailing one-hot asset block is excluded.
-        saa_obs_shape = getattr(saa_model.observation_space, "shape", None)
-        if not saa_obs_shape or len(saa_obs_shape) != 1:
-            raise ValueError("Loaded SAA model has no flat one-dimensional observation space.")
-        self.saa_portfolio_dim = int(saa_obs_shape[0]) - int(self.saa_idx.size) - self.num_assets
+        # Derive the SAA portfolio block from the structured checkpoint.
+        saa_spaces = getattr(saa_model.observation_space, "spaces", {})
+        numeric_shape = getattr(saa_spaces.get("numeric"), "shape", None)
+        asset_id_shape = getattr(saa_spaces.get("asset_id"), "shape", None)
+        if numeric_shape is None or asset_id_shape != (self.num_assets,):
+            raise ValueError("Loaded SAA model must use numeric and asset_id Dict observations.")
+        self.saa_portfolio_dim = int(numeric_shape[0]) - int(self.saa_idx.size)
         if self.saa_portfolio_dim < 6 or self.saa_portfolio_dim > 7:
             raise ValueError(
                 "Unsupported SAA portfolio observation width. "
                 f"Expected 6 or 7 features, got {self.saa_portfolio_dim} "
-                f"from observation shape {saa_obs_shape}."
+                f"from numeric observation shape {numeric_shape}."
             )
 
         # One frozen SAA shared by every (env, asset) row; the LSTM state carries the batch
@@ -913,11 +924,16 @@ class SAASignalWrapper(VecEnvWrapper):
             portfolio_features.append(alpha_rf_all)
         mem_block = np.stack(portfolio_features, axis=-1)
 
-        # Flatten to rows r = b * N + a and append the trailing one-hot asset-ID block.
+        # Flatten to rows r = b * N + a while keeping the categorical ID separate.
         saa_obs = np.concatenate([saa_market_feats, mem_block], axis=-1).reshape(B * N, -1)
         one_hot = self._asset_one_hot_batch if B == self.venv.num_envs else np.tile(self._asset_one_hot, (B, 1))
-        batch_obs = np.concatenate([saa_obs, one_hot], axis=-1).astype(np.float32)
-        batch_obs = _normalize_obs_with_vecnormalize(batch_obs, self.saa_vecnormalize)
+        batch_obs = _normalize_obs_with_vecnormalize(
+            {
+                "numeric": saa_obs.astype(np.float32),
+                "asset_id": one_hot.astype(np.float32),
+            },
+            self.saa_vecnormalize,
+        )
 
         # SB3 recurrent policies expect NumPy observations; a CUDA tensor would break
         # policy.obs_to_tensor's internal np.array() conversion.

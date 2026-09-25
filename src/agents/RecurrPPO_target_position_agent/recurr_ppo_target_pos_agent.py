@@ -53,7 +53,7 @@ import torch.nn as nn
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 from sb3_contrib import RecurrentPPO
-from sb3_contrib.ppo_recurrent import MlpLstmPolicy
+from sb3_contrib.ppo_recurrent import MultiInputLstmPolicy
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv, SubprocVecEnv
@@ -1043,7 +1043,7 @@ def build_policy_kwargs(config: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def build_model(env: gym.Env, config: Dict[str, Any]) -> RecurrentPPO:
+def build_model(env: gym.Env, config: Dict[str, Any], seed: Optional[int] = None) -> RecurrentPPO:
     """
     Instantiate RecurrentPPO with schedules and hyperparameters from config.
 
@@ -1092,7 +1092,7 @@ def build_model(env: gym.Env, config: Dict[str, Any]) -> RecurrentPPO:
 
     # --- Actual model instantiation ---
     model = RecurrentPPO(
-        policy=MlpLstmPolicy,
+        policy=MultiInputLstmPolicy,
         env=env,
         learning_rate=lr_sched,
         ent_coef=ent_start, # initially float, will be updated using EntropyScheduleCallback
@@ -1107,6 +1107,7 @@ def build_model(env: gym.Env, config: Dict[str, Any]) -> RecurrentPPO:
         max_grad_norm=max_grad_norm, # gradient clipping: prevents exploding gradients
         policy_kwargs=policy_kwargs, # LSTM and MLP architecture
         device=device,
+        seed=seed,
         normalize_advantage=normalize_advantage,
         verbose=int(agent_cfg.get("verbose", 1)),
         tensorboard_log=r"src\agents\RecurrPPO_target_position_agent\tb_logs",
@@ -1156,10 +1157,12 @@ class InputMLPFeatures(BaseFeaturesExtractor):
     def __init__(self, observation_space, features_dim=64, mlp_hidden_sizes=None, mlp_dropouts=None,
                  mlp_activation="SiLU", num_assets: int = 11, embedding_dim: int = 6):
         super().__init__(observation_space, features_dim)
-        n_in = observation_space.shape[0]
+        n_in = observation_space.spaces["numeric"].shape[0]
+        asset_id_shape = observation_space.spaces["asset_id"].shape
+        if asset_id_shape != (num_assets,):
+            raise ValueError(f"Expected asset_id shape {(num_assets,)}, got {asset_id_shape}")
         self.num_assets = num_assets
-        # Learnable asset embedding: maps the one-hot asset-ID block (last num_assets dims of obs)
-        # to a dense embedding_dim vector. Trained jointly with the rest of the policy by PPO.
+        # Learnable asset embedding trained jointly with the policy by PPO.
         self.asset_embedding = nn.Embedding(num_assets, embedding_dim)
         if mlp_hidden_sizes is None:
             mlp_hidden_sizes = [128, 128]  # Default
@@ -1172,8 +1175,7 @@ class InputMLPFeatures(BaseFeaturesExtractor):
         activation_class = activation_map.get(mlp_activation, nn.SiLU)
         
         layers = []
-        # Replace the one-hot block (num_assets dims) with the embedding (embedding_dim dims).
-        prev_size = (n_in - num_assets) + embedding_dim
+        prev_size = n_in + embedding_dim
         for i, hidden_size in enumerate(mlp_hidden_sizes):
             layers.extend([
                 nn.Linear(prev_size, hidden_size),
@@ -1192,10 +1194,8 @@ class InputMLPFeatures(BaseFeaturesExtractor):
         self.mlp = nn.Sequential(*layers)
 
     def forward(self, x):
-        # Slice out the one-hot asset-ID block from the end of the observation.
-        # argmax recovers the asset index even after VecNormalize affine scaling.
-        features = x[:, :-self.num_assets]
-        asset_id = x[:, -self.num_assets:].argmax(dim=-1)  # (batch,)
+        features = x["numeric"]
+        asset_id = x["asset_id"].argmax(dim=-1)  # (batch,)
         emb = self.asset_embedding(asset_id)               # (batch, embedding_dim)
         return self.mlp(torch.cat([features, emb], dim=-1))
     
@@ -1262,6 +1262,7 @@ def run(cache, config: Dict[str, Any]) -> Dict[str, Any]:
     vec_train = VecNormalize(
         base_train_vec,
         norm_obs=True,
+        norm_obs_keys=["numeric"],
         norm_reward=True,
         clip_obs=10.0,
         clip_reward=np.inf,
@@ -1273,6 +1274,7 @@ def run(cache, config: Dict[str, Any]) -> Dict[str, Any]:
         DummyVecEnv([make_eval]),
         training=False,
         norm_obs=True,
+        norm_obs_keys=["numeric"],
         norm_reward=False,
         clip_obs=10.0,
         clip_reward=np.inf,
@@ -1280,7 +1282,7 @@ def run(cache, config: Dict[str, Any]) -> Dict[str, Any]:
     )
     
     # Build model
-    model = build_model(vec_train, config)
+    model = build_model(vec_train, config, seed=seed)
     print("\nModel successfully built with the following configuration:")
     print(f"\nModel device: {next(model.policy.parameters()).device}")
 
@@ -1477,6 +1479,7 @@ def continue_run(cache, config: Dict[str, Any], model_path: str, saved_models_di
     vec_train = VecNormalize(
         base_train_vec,
         norm_obs=True,
+        norm_obs_keys=["numeric"],
         norm_reward=True,
         clip_obs=10.0,
         clip_reward=np.inf,
@@ -1487,6 +1490,7 @@ def continue_run(cache, config: Dict[str, Any], model_path: str, saved_models_di
         base_eval_vec,
         training=False,
         norm_obs=True,
+        norm_obs_keys=["numeric"],
         norm_reward=False,
         clip_obs=10.0,
         clip_reward=np.inf,

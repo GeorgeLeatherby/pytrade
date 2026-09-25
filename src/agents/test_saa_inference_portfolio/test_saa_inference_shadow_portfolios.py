@@ -99,16 +99,24 @@ class _ObsNormDummyEnv(gym.Env):
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
-        return np.zeros(self.observation_space.shape, dtype=np.float32), {}
+        obs = {
+            key: np.zeros(space.shape, dtype=np.float32)
+            for key, space in self.observation_space.spaces.items()
+        } if isinstance(self.observation_space, gym.spaces.Dict) else np.zeros(
+            self.observation_space.shape, dtype=np.float32
+        )
+        return obs, {}
 
     def step(self, action):  # never called
-        return np.zeros(self.observation_space.shape, dtype=np.float32), 0.0, True, False, {}
+        obs, _ = self.reset()
+        return obs, 0.0, True, False, {}
 
 
-def _normalize_obs(obs: np.ndarray, vecnorm: Optional[VecNormalize]) -> np.ndarray:
-    """Apply saved VecNormalize obs_rms to a (1, obs_dim) array. Returns float32."""
+def _normalize_obs(obs, vecnorm: Optional[VecNormalize]):
+    """Apply saved VecNormalize stats to a structured SAA observation."""
     if vecnorm is None or getattr(vecnorm, "obs_rms", None) is None:
-        return np.asarray(obs, dtype=np.float32)
+        return {key: np.asarray(value, dtype=np.float32) for key, value in obs.items()}
+    return vecnorm.normalize_obs(obs)
     obs = np.asarray(obs, dtype=np.float32)
     mean = vecnorm.obs_rms.mean
     var = vecnorm.obs_rms.var
@@ -148,7 +156,7 @@ def _load_saa_model(
     print(f"[Shadow-Test] Loading RecurrentPPO from: {model_zip_path}", flush=True)
     model = RecurrentPPO.load(model_zip_path, device=device, custom_objects=safe_custom_objects)
     print(
-        f"[Shadow-Test] Model loaded. obs_dim={model.observation_space.shape[0]} "
+        f"[Shadow-Test] Model loaded. observation_space={model.observation_space} "
         f"action_dim={model.action_space.shape[0]} device={device}",
         flush=True,
     )
@@ -254,7 +262,13 @@ def _run_asset_episode(
     step_info: Dict[str, Any] = {}
 
     while not (terminated or truncated):
-        norm_obs = _normalize_obs(obs[np.newaxis], vecnorm)  # (1, obs_dim)
+        norm_obs = _normalize_obs(
+            {
+                "numeric": obs["numeric"][None, :],
+                "asset_id": obs["asset_id"][None, :],
+            },
+            vecnorm,
+        )
         with torch.no_grad():
             action_out, lstm_state = model.predict(
                 norm_obs,
