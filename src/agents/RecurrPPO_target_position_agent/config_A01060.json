@@ -32,8 +32,8 @@
         "saa_under_exec_penalty_mult": 0.8,
         "saa_over_exec_penalty_mult": 1.0,
 
-        "percentage_of_cash_only_starts": 0.2,
-        "min_initial_cash_allocation": 0.1,
+        "percentage_of_cash_only_starts": 0.3,
+        "min_initial_cash_allocation": 0.05,
 
         "execution_min_share_threshold": 0,
         "execution_min_trade_value_threshold": 50.0,
@@ -44,9 +44,9 @@
         "quantity_type": "shares",
 
         "fixed_fee_per_order": 0.0,
-        "commission_bps": 0.00002,
+        "commission_bps": 0.00005,
         "half_spread_bps": 0.0001,
-        "impact_coeff": 0.0001,
+        "impact_coeff": 0.01170,
         "adv_window": 21,
 
         "z_score_60_effr": true
@@ -153,7 +153,7 @@
         "n_eval_episodes": 50,
         "eval_deterministic": true,
         "progress_bar": true,
-        "config_id": 1059,
+        "config_id": 1060,
         "action_l2_penalty_coeff": 0.0
     }
 }
