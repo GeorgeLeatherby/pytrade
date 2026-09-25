@@ -3668,7 +3668,16 @@ class TradingEnv(gym.Env):
             else:
                 next_observation = self.get_observation_single_step()
             # Validation layer
-            if not np.all(np.isfinite(next_observation)):
+            if isinstance(next_observation, dict):
+                non_finite = {
+                    key: int(np.count_nonzero(~np.isfinite(value)))
+                    for key, value in next_observation.items()
+                }
+                if any(count > 0 for count in non_finite.values()):
+                    raise ValueError(
+                        f"Next observation contains non-finite values: {non_finite}"
+                    )
+            elif not np.all(np.isfinite(next_observation)):
                 print(f"NaNs: {np.isnan(next_observation).sum()}, Infs: {np.isinf(next_observation).sum()}")
                 raise ValueError("Next observation contains non-finite values (NaN or Inf)")
 
