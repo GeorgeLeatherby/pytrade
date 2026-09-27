@@ -1101,8 +1101,9 @@ class MarketDataCache:
 
         # Build annualized and daily rates on the full expanded timeline first.
         risk_free_rate_pa_full = effr_full / 100.0
-        # Fed funds is conventionally an overnight annualized rate on ACT/360.
-        risk_free_rate_daily_full = risk_free_rate_pa_full / 360.0
+        # Fed funds is conventionally an overnight annualized rate on ACT/360. Since we only have
+        # 252 trading days in a full year we divide by 252 to get correct yearly readings
+        risk_free_rate_daily_full = risk_free_rate_pa_full / 252.0
 
         # Compute rolling z-score on the expanded timeline so the first cache day
         # can use a proper 60-day history.
@@ -1950,8 +1951,9 @@ class TradingEnv(gym.Env):
         self.min_initial_cash_allocation = float(config["environment"].get("min_initial_cash_allocation", 0.1))
 
         # Toggle for the 60-day EFFR z-score observation feature (SINGLE_ASSET_TARGET_POS mode).
-        # The raw EFFR level feature (scaled by /0.1) is always included regardless of this flag.
         self.include_risk_free_zscore_feature = bool(config["environment"].get("z_score_60_effr", True))
+        # Raw EFFR level is opt-in so older checkpoints retain their observation shape.
+        self.effr_level_active = bool(config["environment"].get("effr_level_active", False))
 
         self.quantity_type = config["environment"].get("quantity_type", "shares")
         self.price_source = config["environment"].get("price_source", "next_open")  # "next_open" | "current_close"
@@ -2088,9 +2090,12 @@ class TradingEnv(gym.Env):
 
         if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
             asset_obs_size = num_features # Single step asset features for selected asset
-            # Base 6: log cash ratio, log asset ratio, agent return, last_action, daily_asset_alpha_risk_free,
-            # raw effr level (always on). Plus 1 more if the 60d z-score toggle (z_score_60_effr) is enabled.
-            portfolio_obs_size = 6 + (1 if self.include_risk_free_zscore_feature else 0)
+            # Base 5: log cash ratio, log asset ratio, agent return, last_action, daily_asset_alpha_risk_free.
+            portfolio_obs_size = (
+                5
+                + (1 if self.include_risk_free_zscore_feature else 0)
+                + (1 if self.effr_level_active else 0)
+            )
 
         else:
             if self.maybe_provide_sequence:
@@ -2794,6 +2799,9 @@ class TradingEnv(gym.Env):
             "shares": np.asarray(shares, dtype=np.float32).copy(),
             "last_action": np.asarray(last_action, dtype=np.float32).copy(),
             "daily_return": np.asarray(daily_return, dtype=np.float32).copy(),
+            "effr_level": np.float32(
+                self.market_data_cache.get_risk_free_rate_pa_at_step(self.current_absolute_step)
+            ) / np.float32(0.1),
             "prices": np.asarray(self.portfolio_state.prices, dtype=np.float32).copy(),
             "rf_zscore": np.float32(
                 self.market_data_cache.get_risk_free_rate_zscore_at_step(self.current_absolute_step)
@@ -5046,12 +5054,6 @@ class TradingEnv(gym.Env):
                     asset_index,
                 )
             )
-            # Raw EFFR level, e.g. an actual rate of 5% -> 0.05 / 0.1 = 0.5. Unlike the 60d z-score,
-            # this stays informative during long stable-rate regimes (see z_score_60_effr toggle below).
-            effr_level_scaled = float(
-                self.market_data_cache.get_risk_free_rate_pa_at_step(self.current_absolute_step)
-            ) / 0.1
-
             # Build minimal portfolio features for single-asset mode.
             portfolio_feature_list = [
                 cash_log_value,
@@ -5062,7 +5064,11 @@ class TradingEnv(gym.Env):
             if self.include_risk_free_zscore_feature:
                 portfolio_feature_list.append(risk_free_rate_zscore_60d)
             portfolio_feature_list.append(daily_asset_alpha_risk_free)
-            portfolio_feature_list.append(effr_level_scaled)
+            if self.effr_level_active:
+                effr_level_scaled = float(
+                    self.market_data_cache.get_risk_free_rate_pa_at_step(self.current_absolute_step)
+                ) / 0.1
+                portfolio_feature_list.append(effr_level_scaled)
 
             portfolio_features = np.array(portfolio_feature_list, dtype=np.float32)
 

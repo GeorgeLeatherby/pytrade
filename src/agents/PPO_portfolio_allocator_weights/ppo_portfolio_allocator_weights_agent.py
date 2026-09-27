@@ -726,7 +726,7 @@ class SAASignalWrapper(VecEnvWrapper):
     def __init__(self, venv: VecEnv, saa_model, saa_vecnormalize: Optional[VecNormalize],
                 num_assets: int, device: torch.device,
                 config: Mapping[str, Any], feature_to_index: Mapping[str, int],
-                action_limiting_factor: float):
+                action_limiting_factor: float, effr_level_active: bool):
         
         super().__init__(venv)
 
@@ -735,6 +735,7 @@ class SAASignalWrapper(VecEnvWrapper):
         self.device = device
         # keep config and feature mapping locally (DummyVecEnv has no .config)
         self.config = config
+        self.effr_level_active = bool(effr_level_active)
         self.feature_to_index = feature_to_index
         # Rescales raw SAA policy output into the target_position_change range the SAA was
         # actually trained/executed with (env.step never saw raw actions during SAA training).
@@ -871,6 +872,7 @@ class SAASignalWrapper(VecEnvWrapper):
         prices_all = np.stack([b["prices"] for b in bundles], axis=0)                   # (B, N)
         rf_z_all = np.asarray([b["rf_zscore"] for b in bundles], dtype=np.float32)      # (B,)
         alpha_rf_all = np.stack([b["excess_log_return_over_rf"] for b in bundles], axis=0)  # (B, N)
+        effr_level_all = np.asarray([b["effr_level"] for b in bundles], dtype=np.float32)  # (B,)
 
         asset_notional = shares_all * prices_all
         # Log-ratios with gating at 0 (matches get_observation_single_step L3973-3976)
@@ -888,12 +890,14 @@ class SAASignalWrapper(VecEnvWrapper):
         ).astype(np.float32)
 
         rf_z_rep = np.repeat(rf_z_all[:, None], repeats=N, axis=1)
-        mem_block = np.stack(
-            [cash_log_value, asset_log_value, dret_all, last_act_all, rf_z_rep, alpha_rf_all], axis=-1
-        )  # (B, N, 6)
+        mem_features = [cash_log_value, asset_log_value, dret_all, last_act_all, rf_z_rep, alpha_rf_all]
+        if self.effr_level_active:
+            effr_level_rep = np.repeat(effr_level_all[:, None], repeats=N, axis=1)
+            mem_features.append(effr_level_rep)
+        mem_block = np.stack(mem_features, axis=-1)
 
         # Flatten to rows r = b * N + a and append the trailing one-hot asset-ID block so the
-        # layout matches SAA training: [features, portfolio_features(6), one_hot_asset_id(N)].
+        # layout matches SAA training.
         saa_obs = np.concatenate([saa_market_feats, mem_block], axis=-1).reshape(B * N, -1)
         one_hot = self._asset_one_hot_batch if B == self.venv.num_envs else np.tile(self._asset_one_hot, (B, 1))
         batch_obs = np.concatenate([saa_obs, one_hot], axis=-1).astype(np.float32)
@@ -1276,7 +1280,7 @@ class SAATokenizer(BaseFeaturesExtractor):
 
     
 # Utility function to load SAA model and VecNormalize stats from config
-def _load_saa_from_config(saa_config: Dict[str, Any]) -> Tuple[Any, Optional[VecNormalize], torch.device, float]:
+def _load_saa_from_config(saa_config: Dict[str, Any]) -> Tuple[Any, Optional[VecNormalize], torch.device, float, bool]:
     """
     Load the frozen SAA (RecurrentPPO) plus VecNormalize stats and its training-time
     action_limiting_factor_end (needed to rescale raw policy outputs into the same
@@ -1324,6 +1328,7 @@ def _load_saa_from_config(saa_config: Dict[str, Any]) -> Tuple[Any, Optional[Vec
             "'agent.action_limiting_factor_end', required to rescale raw SAA actions."
         )
     action_limiting_factor = float(agent_cfg["action_limiting_factor_end"])
+    effr_level_active = bool(saa_training_config.get("environment", {}).get("effr_level_active", False))
 
     load_errors: List[str] = []
     saa_model = None
@@ -1351,7 +1356,7 @@ def _load_saa_from_config(saa_config: Dict[str, Any]) -> Tuple[Any, Optional[Vec
         saa_vecnormalize.training = False
         saa_vecnormalize.norm_reward = False
 
-    return saa_model, saa_vecnormalize, device, action_limiting_factor
+    return saa_model, saa_vecnormalize, device, action_limiting_factor, effr_level_active
 
 # Build PPO model 
 def build_allocator_model(
@@ -1914,6 +1919,7 @@ def _build_saa_wrapped_envs(
     saa_vecnorm: Optional[VecNormalize],
     saa_device: torch.device,
     saa_action_limiting_factor: float,
+    saa_effr_level_active: bool,
     num_assets: int,
     tag: str,
 ) -> Tuple["SAASignalWrapper", "SAASignalWrapper"]:
@@ -1959,11 +1965,13 @@ def _build_saa_wrapped_envs(
 
     vec_train_saa = SAASignalWrapper(
         vec_train_raw, saa_model, saa_vecnorm, num_assets, saa_device, config=config,
-        feature_to_index=cache.feature_to_index, action_limiting_factor=saa_action_limiting_factor
+        feature_to_index=cache.feature_to_index, action_limiting_factor=saa_action_limiting_factor,
+        effr_level_active=saa_effr_level_active
     )
     vec_eval_saa = SAASignalWrapper(
         vec_eval_raw, saa_model, saa_vecnorm, num_assets, saa_device, config=config,
-        feature_to_index=cache.feature_to_index, action_limiting_factor=saa_action_limiting_factor
+        feature_to_index=cache.feature_to_index, action_limiting_factor=saa_action_limiting_factor,
+        effr_level_active=saa_effr_level_active
     )
     return vec_train_saa, vec_eval_saa
 
@@ -2007,7 +2015,7 @@ def run(cache: MarketDataCache, config: Dict[str, Any]) -> Dict[str, Any]:
     do_pretrain = bool(critic_cfg.get("enabled", False))
     
     # Load frozen SAA once
-    saa_model, saa_vecnorm, saa_device, saa_action_limiting_factor = _load_saa_from_config(saa_config)
+    saa_model, saa_vecnorm, saa_device, saa_action_limiting_factor, saa_effr_level_active = _load_saa_from_config(saa_config)
 
     # --- Build Environments for train/validation ---
     print("[run] Building training and evaluation environments...")
@@ -2019,6 +2027,7 @@ def run(cache: MarketDataCache, config: Dict[str, Any]) -> Dict[str, Any]:
         saa_vecnorm=saa_vecnorm,
         saa_device=saa_device,
         saa_action_limiting_factor=saa_action_limiting_factor,
+        saa_effr_level_active=saa_effr_level_active,
         num_assets=num_assets,
         tag="run",
     )
@@ -2364,7 +2373,7 @@ def continue_run(cache: MarketDataCache, config: Dict[str, Any], model_path: str
     raw_feature_dim = cache.num_features
     
     # Load frozen SAA once (required for PAA to function)
-    saa_model, saa_vecnorm, saa_device, saa_action_limiting_factor = _load_saa_from_config(saa_config)
+    saa_model, saa_vecnorm, saa_device, saa_action_limiting_factor, saa_effr_level_active = _load_saa_from_config(saa_config)
 
     # --- Build Environments for train/validation ---
     print("[continue_run] Building training and evaluation environments...")
@@ -2376,6 +2385,7 @@ def continue_run(cache: MarketDataCache, config: Dict[str, Any], model_path: str
         saa_vecnorm=saa_vecnorm,
         saa_device=saa_device,
         saa_action_limiting_factor=saa_action_limiting_factor,
+        saa_effr_level_active=saa_effr_level_active,
         num_assets=num_assets,
         tag="continue_run",
     )

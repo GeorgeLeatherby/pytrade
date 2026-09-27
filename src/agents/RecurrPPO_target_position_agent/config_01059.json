@@ -49,7 +49,8 @@
         "impact_coeff": 0.0001,
         "adv_window": 21,
 
-        "z_score_60_effr": true
+        "z_score_60_effr": true,
+        "effr_level_active": true
     },
 
     "saa_features": {
