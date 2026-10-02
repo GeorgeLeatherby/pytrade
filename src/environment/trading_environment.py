@@ -1926,6 +1926,7 @@ class TradingEnv(gym.Env):
         self.saa_previous_max_drawdown = None
         self.episode_peak_value = None
         self.trans_act_pen = None  # Initialize transaction action penalty variable
+        self._step_cost_breakdown = np.zeros(4, dtype=np.float64)  # commission, spread, impact, fixed
         self.paa_average_entry_price = None  # [num_assets] per-asset avg entry price, NaN = no open position
         self.paa_realized_positive_pnl_cum = 0.0
         self.paa_realized_exit_bonus_cum = 0.0
@@ -2413,7 +2414,7 @@ class TradingEnv(gym.Env):
         # Portfolio mode: random weights across all assets + cash, ensuring minimum cash allocation
         else:
             # Start with cash only and no positions to simulate real trading start
-            if np.random.random() < self.perc_of_cash_only_starts:
+            if force_cash_only_start or np.random.random() < self.perc_of_cash_only_starts:
                 # Cash-only start (no transaction costs)
                 initial_cash = self.initial_portfolio_value
                 initial_positions[:] = 0.0 # all assets zero
@@ -2475,6 +2476,15 @@ class TradingEnv(gym.Env):
         # Update portfolio state instance
         self.portfolio_state.portfolio_reset(
             cash=initial_cash,
+            positions=initial_positions,
+            prices=initial_prices,
+            step=self.current_step,
+            terminated=False
+        )
+
+        # Frictionless mirror starts from the same holdings, without the init costs.
+        self.shadow_portfolio_state.portfolio_reset(
+            cash=float(self.initial_portfolio_value - np.sum(initial_positions * initial_prices, dtype=np.float64)),
             positions=initial_positions,
             prices=initial_prices,
             step=self.current_step,
@@ -2620,16 +2630,16 @@ class TradingEnv(gym.Env):
                   f"(target {self.initial_portfolio_value}, init_tc {total_init_tc})")
 
         # Validate comparison portfolio value (same cash/positions as portfolio_state after init TC)
-        actual_initial_value = self.comparison_portfolio_state.get_total_value()
-        if abs(actual_initial_value - expected_initial_value) > init_tc_tolerance:
-            print(f"\nComparison portfolio initialization error: {actual_initial_value} != {expected_initial_value} "
+        comparison_initial_value = self.comparison_portfolio_state.get_total_value()
+        if abs(comparison_initial_value - expected_initial_value) > init_tc_tolerance:
+            print(f"\nComparison portfolio initialization error: {comparison_initial_value} != {expected_initial_value} "
                   f"(target {self.initial_portfolio_value}, init_tc {total_init_tc})")
 
         # Validate benchmark portfolio value matches configuration net of its own init TC
         expected_benchmark_value = self.initial_portfolio_value - benchmark_tc
-        actual_initial_value = self.benchmark_portfolio_state.get_total_value()
-        if abs(actual_initial_value - expected_benchmark_value) > init_tc_tolerance:
-            print(f"Benchmark portfolio initialization error: {actual_initial_value} != {expected_benchmark_value} "
+        benchmark_initial_value = self.benchmark_portfolio_state.get_total_value()
+        if abs(benchmark_initial_value - expected_benchmark_value) > init_tc_tolerance:
+            print(f"Benchmark portfolio initialization error: {benchmark_initial_value} != {expected_benchmark_value} "
                   f"(target {self.initial_portfolio_value}, init_tc {benchmark_tc})")
 
         # Seed a pre-step entry in the EpisodeBuffer so the first observation contains real weights
@@ -2892,6 +2902,7 @@ class TradingEnv(gym.Env):
         # This is the PAA reward's actual excess-return counterfactual, not comparison_portfolio_state.
         spy_bh_value_before = self.selected_asset_bh_portfolio_state.get_total_value()
         live_portfolio_cash_before = self.portfolio_state.cash
+        self._step_cost_breakdown = np.zeros(4, dtype=np.float64)
 
         trade_results: List[Dict[str, Any]] = []
 
@@ -3045,13 +3056,12 @@ class TradingEnv(gym.Env):
         sells = execution_result.traded_notional_per_asset[execution_result.trades_executed < 0].sum()
         self._ep_buy_notional += float(buys)
         self._ep_sell_notional += float(abs(sells))
-        # Cost breakdown captured in _calculate_transaction_costs
-        if hasattr(self, "_last_cost_breakdown"):
-            c_comm, c_spread, c_imp, c_fix = self._last_cost_breakdown
-            self._ep_cost_commission += c_comm
-            self._ep_cost_spread += c_spread
-            self._ep_cost_impact += c_imp
-            self._ep_cost_fixed += c_fix
+        # Components of the costs actually charged this step (booked by the execution paths)
+        c_comm, c_spread, c_imp, c_fix = (float(c) for c in self._step_cost_breakdown)
+        self._ep_cost_commission += c_comm
+        self._ep_cost_spread += c_spread
+        self._ep_cost_impact += c_imp
+        self._ep_cost_fixed += c_fix
         # Exposure tracking
         invested_fraction = 1.0 - self.portfolio_state.get_weights()[0]
         self._ep_exposure_sum += invested_fraction
@@ -3064,7 +3074,9 @@ class TradingEnv(gym.Env):
             shadow_pos = self.shadow_portfolio_state.positions.copy()
             shadow_pos += execution_result.trades_executed
             self.shadow_portfolio_state.positions = shadow_pos
-            self.shadow_portfolio_state.cash -= execution_result.traded_dollar_value  # no costs
+            # Signed flow: buys pay, sells receive; no costs
+            self.shadow_portfolio_state.cash -= float(np.sum(
+                execution_result.trades_executed * execution_result.executed_prices, dtype=np.float64))
 
         # ADVANCE TIME -----------------------------------------------------
         self.current_step += 1
@@ -3394,7 +3406,7 @@ class TradingEnv(gym.Env):
 
             ep_turnover = self._ep_turnover_notional / max(1e-8, self.initial_portfolio_value)
             avg_exposure = (self._ep_exposure_sum / max(1, self._ep_exposure_steps)) if self._ep_exposure_steps else 0.0
-            start_exposure = 1.0 - self.initial_portfolio_value / max(1e-8, self.initial_portfolio_value)  # 0 if start in cash
+            start_exposure = 1.0 - float(self.episode_buffer.portfolio_weights[internal_start][0])
             end_exposure = 1.0 - self.portfolio_state.get_weights()[0]
             shadow_value = self.shadow_portfolio_state.get_total_value()
             live_value = self.portfolio_state.get_total_value()
@@ -4224,6 +4236,7 @@ class TradingEnv(gym.Env):
                 cash_needed = float(notional_buy + tc_est)
 
             # Apply buy
+            self._book_cost_components(tc_est)
             portfolio_state.positions[asset_index] += shares_to_trade
             portfolio_state.cash -= cash_needed
             trades_executed[asset_index] += shares_to_trade
@@ -4256,6 +4269,7 @@ class TradingEnv(gym.Env):
                 abs_step=self.current_absolute_step,
                 asset_mask=None
             )
+            self._book_cost_components(tc_sell)
             notional_sell = sell_shares * px
 
             # Apply sell
@@ -4370,6 +4384,7 @@ class TradingEnv(gym.Env):
                     abs_step=self.current_absolute_step,
                     asset_mask=sell_mask
                 )
+                self._book_cost_components(tc_sell)
                 total_transaction_costs += tc_sell
                 portfolio_state.cash += float(np.sum(sell_notional) - tc_sell)
 
@@ -4397,6 +4412,8 @@ class TradingEnv(gym.Env):
                 )
                 cost_of_buys = float(np.sum(buy_notional) + tc_buy)
             if np.any(shares_to_buy > 0):
+                # Last computed tc_buy is the charged one (post-scaling if scaled)
+                self._book_cost_components(tc_buy)
                 position_changes[buy_mask] += shares_to_buy
                 trades_executed[buy_mask] += shares_to_buy
                 traded_notional_per_asset[buy_mask] += buy_notional
@@ -4652,6 +4669,7 @@ class TradingEnv(gym.Env):
 
                 # Apply buy
                 if executed_qty > 0:
+                    self._book_cost_components(total_transaction_cost)
                     self.portfolio_state.positions[sym_idx] += executed_qty
                     self.portfolio_state.cash -= (notional + total_transaction_cost)
                     trades_executed[sym_idx] += executed_qty
@@ -4687,6 +4705,7 @@ class TradingEnv(gym.Env):
                     prices=self.market_data_cache.close_prices[price_idx],
                     abs_step=price_idx
                 )
+                self._book_cost_components(total_transaction_cost)
                 # Apply sell
                 self.portfolio_state.positions[sym_idx] -= sell_shares
                 if not self.allow_short:
@@ -4804,6 +4823,11 @@ class TradingEnv(gym.Env):
             float(fixed_cost),
         )
         return total_cost
+
+    def _book_cost_components(self, cost: float) -> None:
+        """Add the components of the cost just computed (and charged) to this step's breakdown."""
+        if cost > 0.0:
+            self._step_cost_breakdown += np.asarray(self._last_cost_breakdown, dtype=np.float64)
     
     def _initialize_portfolio_with_costs(
         self, 
@@ -4863,8 +4887,8 @@ class TradingEnv(gym.Env):
         final_positions = target_positions.copy()
         
         for iteration in range(max_iterations):
-            # Reduce scale factor to fit budget
-            scale_factor *= (initial_value / total_cost) * 0.99  # 1% buffer for convergence
+            # Shrinking positions also shrinks tc, so this lands within budget with a residual of cents
+            scale_factor *= initial_value / total_cost
             final_positions = target_positions * scale_factor
             
             # Recalculate costs with scaled positions
@@ -4878,12 +4902,9 @@ class TradingEnv(gym.Env):
             position_notional = np.sum(final_positions * initial_prices)
             total_cost = position_notional + tc
             
-            # Check if we're within budget
             if total_cost <= initial_value:
                 final_cash = initial_value - total_cost
-                # Accept if cash residual is small (< $20) or we've hit max iterations
-                if final_cash < 20.0 or iteration == max_iterations - 1:
-                    return float(final_cash), final_positions.astype(np.float32), float(tc)
+                return float(final_cash), final_positions.astype(np.float32), float(tc)
         
         # Fallback: return best effort (should rarely reach here)
         final_cash = max(0.0, initial_value - total_cost)

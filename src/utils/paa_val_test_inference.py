@@ -190,12 +190,8 @@ def resolve_checkpoint(family: str, rel_path: str) -> CheckpointSpec:
 
 
 def _inference_config(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Copy of a training config with the overrides needed for deterministic replay."""
-    cfg = copy.deepcopy(config)
-    # TradingEnv.reset() ignores option["force_cash_only_start"] in portfolio_weights mode;
-    # this is the only reliable way to guarantee a 100%-cash start.
-    cfg["environment"]["percentage_of_cash_only_starts"] = 1.0
-    return cfg
+    """Copy of a training config; the cash start comes from the plan's force_cash_only_start flag."""
+    return copy.deepcopy(config)
 
 
 def _reference_saa_config(agent_config: Dict[str, Any]) -> Dict[str, Any]:
@@ -466,9 +462,8 @@ class DailyRecorder(gym.Wrapper):
         cash_sub, sh_sub, _, _ = te.episode_buffer.get_saa_sub_state(t)
         ep["sub_value_mtm"][t] = cash_sub.astype(np.float64) + sh_sub.astype(np.float64) * prices
 
-        # Slot 0 is skipped: TradingEnv.reset() records the env benchmark's value there (env bug).
         buf_v = float(te.episode_buffer.portfolio_values[t])
-        if t > 0 and abs(buf_v - ep["paa_value"][t]) > max(0.05, 1e-6 * abs(buf_v)):
+        if abs(buf_v - ep["paa_value"][t]) > max(0.05, 1e-6 * abs(buf_v)):
             raise RuntimeError(f"EpisodeBuffer value mismatch at t={t}: {buf_v} vs {ep['paa_value'][t]}")
 
     def step(self, action):
@@ -811,6 +806,14 @@ def run_consistency_checks(spec: CheckpointSpec, cache: MarketDataCache, plans: 
         c["spy_final_vs_env_info"] = abs(ep["spy_bh_value"][-1] - info["spy_bh_final_value"])
         c["excess_abs_vs_env_info"] = abs((ep["paa_value"][-1] - ep["spy_bh_value"][-1]) - info["excess_return_over_spy_abs"])
         c["total_tc_vs_env_info"] = abs(np.nansum(ep["paa_tc"]) - info["total_transaction_costs"])
+        env_parts = np.array([info[f"episode_cost_{p}"] for p in TC_PART_NAMES])
+        c["env_tc_parts_vs_recorded"] = float(np.abs(env_parts - np.nansum(ep["paa_tc_parts"], axis=0)).max())
+        c["env_tc_parts_sum_vs_total"] = abs(float(env_parts.sum()) - info["total_transaction_costs"])
+        c["env_exposure_start"] = info["exposure_start"]
+        # Frictionless mirror = live book + every cost paid, carried at the EFFR rate to the end.
+        tc_days = np.nan_to_num(ep["paa_tc"][:-1])
+        carry_to_end = np.array([np.prod(1.0 + ep["rf_daily"][t + 1:]) for t in range(T - 1)])
+        c["frictionless_vs_env_info"] = abs(ep["paa_value"][-1] + float(tc_days @ carry_to_end) - info["shadow_final_value"])
 
         # Weights are a simplex every day (pre- and post-trade).
         w_pre = ep["paa_w"]
@@ -852,7 +855,10 @@ def run_consistency_checks(spec: CheckpointSpec, cache: MarketDataCache, plans: 
         report[bid] = c
 
     tol = {"final_pv_vs_env_info": 0.05, "spy_final_vs_env_info": 0.05, "excess_abs_vs_env_info": 0.1,
-           "total_tc_vs_env_info": 0.05, "max_weight_sum_err": 1e-5, "cash_roll_err": 0.5, "shares_roll_err": 1e-3,
+           "total_tc_vs_env_info": 0.05, "env_tc_parts_vs_recorded": 0.01, "env_tc_parts_sum_vs_total": 0.01,
+           "env_exposure_start": 0.0, "frictionless_vs_env_info": 0.5,
+           "spy_bh_init_residual_cash": 20.0, "ew_bh_init_residual_cash": 20.0,
+           "max_weight_sum_err": 1e-5, "cash_roll_err": 0.5, "shares_roll_err": 1e-3,
            "value_roll_err": 0.5, "cash_benchmark_err": 0.05, "compound_ret_err": 0.05,
            "inj_vs_ref_saa_value_err": 0.05, "inj_vs_ref_saa_signal_err": 1e-5,
            "missing_commits": 0, "nan_in_value_cols": 0, "zero_family_commits": 0}
@@ -983,8 +989,8 @@ def save_results(res: Dict[str, Any]) -> Path:
         "config_path": _rel(spec.config_path),
         "config_sha256": hashlib.sha256(spec.config_path.read_bytes()).hexdigest(),
         "config": spec.config,
-        "inference_overrides": {"environment.percentage_of_cash_only_starts": 1.0, "device": DEVICE,
-                                "policy": "deterministic"},
+        "inference_overrides": {"device": DEVICE, "policy": "deterministic",
+                                "reset_option": "force_cash_only_start=True (100% cash start)"},
         "injected_signal": res["wrapper_info"],
         "reference_saa": res["ref_info"],
         "initial_capital": float(spec.config["environment"]["initial_portfolio_value"]),
@@ -1002,8 +1008,8 @@ def save_results(res: Dict[str, Any]) -> Path:
             "Returns/cumulative returns are measured against the committed capital, so buy-and-hold initial "
             "transaction costs are included on day 0.",
             "SPY and equal-weight buy-and-hold use TradingEnv._initialize_portfolio_with_costs (the routine behind the "
-            "SPY benchmark the PAA was trained/selected against); its 0.99 sizing buffer leaves ~1% residual cash that "
-            "earns the EFFR carry (see consistency_checks.*.*_init_residual_cash).",
+            "SPY benchmark the PAA is trained/selected against); residual cash after the cost-aware init is recorded "
+            "in consistency_checks.*.*_init_residual_cash.",
             "saa_ew_value is the mean of N shadow books each started with the full capital; this equals a 1/N capital "
             "split up to the sqrt market-impact cost term, which is not scale invariant.",
             "AR(1) signals are stochastic; they are reproducible for a fixed seed (see injected_signal.ar1_seed).",
