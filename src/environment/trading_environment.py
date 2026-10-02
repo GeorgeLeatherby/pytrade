@@ -1518,7 +1518,7 @@ class MarketDataCache:
         combined_flags: Dict[str, bool] = {}
         for section in feature_sections.values():
             for feat_name, enabled in section.items():
-                combined_flags[feat_name] = bool(enabled)
+                combined_flags[feat_name] = combined_flags.get(feat_name, False) or bool(enabled)
 
         # Warn only when a feature is explicitly enabled in config but absent in data.
         missing_requested = sorted(
