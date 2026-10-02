@@ -1,0 +1,321 @@
+\section{Experimental Validation and Testing}
+\label{sec:validation}
+
+Section~\ref{sec:system-design} explained how PyTrade is built and why each design choice was made; this chapter reports what happens when the resulting agents are actually run on data they have never been trained on. Every comparison below follows directly from a claim made in Section~\ref{sec:system-design}. The excess-return reward design (Section~\ref{sec:excess-return}) is only meaningful if the agent it trains is actually shown to beat the $100\%$ B\&H it is scored against, not merely a strawman that is easy to beat. The shadow-portfolio mechanism that injects the Single-Asset Agent's (SAA) signal into the Portfolio Allocator Agent (PAA, Section~\ref{sec:info-flow}) is only justified if removing or corrupting that signal measurably hurts the PAA. The modular decomposition itself (Section~\ref{sec:overview}) is only a defensible answer to this thesis's research question if the resulting two-layer system outperforms both a signal-free cross-sectional model and, budget permitting, a monolithic single-network alternative trained end to end with comparable computational budget. Baselines throughout this chapter are therefore chosen to isolate one specific claim each, and the purged, block-level out-of-sample protocol recalled in Section~\ref{sec:oos-protocol} is what makes any of these comparisons trustworthy rather than an artifact of in-sample memorization.
+
+This chapter is organized in the order its two agents were introduced. Section~\ref{sec:oos-protocol} recaps the evaluation protocol shared by both agents and introduces the validation periods used. Section~\ref{sec:saa-results} reports SAA results on the validation periods. Section~\ref{sec:paa-results} reports the PAA results on both validation and test periods.
+
+\subsection{Out-of-Sample Protocol}
+\label{sec:oos-protocol}
+
+Every result in this chapter is reported on the purged, block-level split introduced in Section~\ref{sec:simulator}: repeated purged train/validation cycles carved out of the full 2000--2025 history, each separated from its own preceding training block by a 60-trading-day purge gap, followed by one held-out test block preceded by its own purge gap. Applied to the current dataset, this scheme yields four validation blocks, each spanning a distinct historical regime, and one test block reserved for a single, final evaluation. The distinction between these two evaluation surfaces matters for how the rest of this chapter should be read. The four validation blocks are used iteratively, both for the "peak alpha" checkpoint selection and for every diagnostic plot in this chapter; because they are consulted repeatedly during development, a result reported only on a validation block is evidence of learning, not yet evidence of genuine, unseen-data skill. The test block is touched exactly once, after every design and checkpoint decision has already been made on the validation blocks alone, which is precisely what separates a legitimate out-of-sample result from an inflated, cherry-picked headline number.
+
+
+Table~\ref{tab:oos-blocks} names each validation block by its calendar date range and summarizes the macroeconomic and financial-market conditions realized within it. This step is necessary because a purged split only guarantees that training and evaluation windows do not overlap in time; it does not guarantee that the resulting blocks sample comparable market regimes. An agent evaluated only on calm, trending markets can appear skillful without having learned genuine risk management, since correctly timing entries and exits is easier when volatility and drawdowns are historically low. Conversely, an agent evaluated on a block dominated by a single macroeconomic shock can be penalized for defensive behavior, such as temporarily reducing exposure, that is rational given that shock but is scored harshly by a reward function tuned to reward decisiveness. Naming the realized regime of every block turns this risk into an explicit, auditable property of the evaluation protocol rather than a hidden confound.
+
+Four technical terms recur in Table~\ref{tab:oos-blocks} and are defined here once. \emph{Quantitative easing} (QE) is a central bank's large-scale purchase of government or other securities, undertaken once its short-term policy rate is already near zero, with the aim of lowering long-term interest rates; it matters for an evaluation window because it can suppress volatility and support asset prices independent of the underlying economic performance of any single firm or country. A \emph{yield-curve inversion} occurs when short-maturity government bonds yield more than long-maturity bonds, the reverse of the usual relationship; it is a widely cited leading indicator of recession, because it reflects an expectation among bond investors that the central bank will need to cut rates in the future in response to a weakening economy. The \emph{VIX} is an index of the market's expectation of near-term S\&P 500 volatility, implied by option prices; a sharp rise in the VIX signals a sudden increase in perceived risk and is commonly referred to as a volatility spike. A \emph{carry trade} is a strategy of borrowing in a currency with a low interest rate to invest in higher-yielding assets denominated in another currency; an \emph{unwind} of such a trade, triggered for instance by a rise in the funding currency's interest rate, forces borrowers to close these positions quickly, producing fast, correlated selling across otherwise unrelated asset classes.
+
+The test block (final row of Table~\ref{tab:oos-blocks}) is deliberately not characterized narratively in advance of evaluation. Naming its dominant events before the single, final evaluation pass described above would risk tempting a post-hoc, narrative-driven justification of whatever result that pass produces, which is precisely what the purged protocol is designed to prevent. Its realized composition is instead reported alongside its results.
+
+\begin{table}[p]
+\centering
+\small
+\begin{tabular}{@{}p{2.46cm}p{6.85cm}p{6.85cm}@{}}
+\toprule
+\textbf{Block (dates)} & \textbf{Realized economic and financial-market conditions} & \textbf{Relevance to agent training and evaluation} \\
+\midrule
+val\_00 \newline (2005-12-16 to \newline 2007-02-14) &
+The U.S. policy rate stood at a cyclical peak of 5.25\%. The U.S. yield curve was inverted for much of 2006. U.S. and European equities advanced together at low realized volatility, a period later called the "Great Moderation". Asian equities advanced alongside strong global trade. Oil and gold both trended upward. Late in the block, U.S. subprime-mortgage delinquencies began rising, and a major subprime lender reported large losses. Prices had not yet reacted by the block's end. &
+Nearly every instrument trends in the same direction at low volatility. This is the regime least likely to penalize a non-diversifying policy. The block ends just before, not during, a realized shock. Comparing performance here against val\_02 and val\_03 helps separate general risk management from a fit to one calm regime (Section~\ref{sec:saa-robustness}). \\
+\addlinespace
+val\_01 \newline (2012-01-12 to \newline 2013-03-20) &
+European sovereign-debt stress continued. Greek government debt was restructured in March 2012, and Spanish and Italian bond yields stayed elevated. European equities moved with this stress. The European Central Bank pledged in July 2012 to preserve the euro. The Federal Reserve announced a third round of asset purchases (QE3) in September 2012. Gold traded near record levels. Asian equities recorded inflows attributed to a search for yield. Oil stayed elevated on supply concerns linked to sanctions on Iran. &
+Policy announcements, not firm fundamentals, dominate this block. European equities move together on crisis news, largely apart from Asian equities and commodities. A checkpoint whose relative ranking across instruments differs sharply from val\_00 is responding to regime, not repeating one fixed allocation. \\
+\addlinespace
+val\_02 \newline (2018-02-27 to \newline 2019-04-23) &
+The block opens just after a sharp volatility spike indicated by VIX and the collapse of several short-volatility products in February 2018. The U.S. and China imposed successive tariffs on each other. The Federal Reserve raised its policy rate four times. Export-oriented Asian and European equities moved with the tariff dispute; UK equities also traded through separate withdrawal negotiations from the European Union. Equities fell sharply together in December 2018. Oil fell over the same weeks, while gold rose. From January 2019, after the Fed signaled a pause, equities recovered. &
+This block contains a decline and a recovery inside one window. It is where equity-oil co-movement is clearest, with gold moving the other way. Tests whether the agent can shift from a defensive posture back to a risk-seeking one as conditions improve, rather than only having learned to reduce exposure. \\
+\addlinespace
+val\_03 \newline (2024-02-26 to \newline 2025-04-22) &
+U.S. equity gains concentrated in a few large technology firms. Taiwanese equities, weighted toward semiconductor manufacturing, moved closely with this trend. The Federal Reserve began cutting its policy rate in September 2024. In August 2024, following a Bank of Japan rate increase, Japanese equities recorded their largest single-day decline since 1987, attributed to an unwind of yen-funded carry positions; other equities fell by a smaller amount the same day. Gold reached repeated record levels. In April 2025, new U.S. tariffs were followed by a broad, short-lived decline across nearly all equities and in oil. &
+This block contains two shocks of different origin: a single-country, rate-driven decline, and a broad, trade-policy-driven decline. It also contains a narrow, concentration-driven rally that a diversified allocation is not automatically exposed to. Comparing the response to each shock tests whether risk behavior generalizes, rather than having been fit to one event (Section~\ref{sec:saa-robustness}). \\
+\addlinespace
+test\_00 \newline (2025-07-21 to \newline 2026-08-06) &
+Not characterized in advance of evaluation, for the reason given above. &
+Reserved for the single, final evaluation described later in this section. \\
+\bottomrule
+\end{tabular}
+\caption{Calendar date ranges of the four validation blocks and the single test block, the market conditions observable within each, and their role in selecting a checkpoint (Section~\ref{sec:saa-robustness}).}
+\label{tab:oos-blocks}
+\end{table}
+
+
+\subsection{Single-Asset Agent Results}
+\label{sec:saa-results}
+
+
+This section compares the three final SAA candidates on all four validation blocks. The selection criterion is mean Asset $\alpha$: annualized agent return minus the annualized buy-and-hold return of the same asset. This directly measures the timing information later passed to the PAA. Risk, consistency, and turnover are used as secondary checks.
+
+\begin{table}[htbp]
+\centering
+\small
+\setlength{\tabcolsep}{5pt}
+\begin{tabular}{@{}lSSS@{}}
+\toprule
+{Setting or metric} & {config\_01056} & {config\_01057} & {config\_01058} \\
+\midrule
+SAA linear scale & 10.0 & 10.0 & 2.5 \\
+SAA excess-return scale & 50.0 & 50.0 & 10.0 \\
+Reward tanh divisor & 8.0 & 7.5 & 2.0 \\
+Reward tanh scale & 8.0 & 7.5 & 1.0 \\
+Initial entropy coefficient & 0.0005 & 0.0005 & 0.0008 \\
+\midrule
+Mean Asset $\alpha$ (\si{\percent}) & 8.34 & 7.00 & 1.36 \\
+Mean Market $\alpha$ (\si{\percent}) & 7.71 & 6.37 & 0.74 \\
+Mean Sharpe ratio & 1.40 & 1.28 & 0.76 \\
+Mean MDD (\si{\percent}) & -10.63 & -13.09 & -14.12 \\
+Mean turnover (\si{\percent}) & 3200.31 & 2247.38 & 5050.39 \\
+Positive asset-period cells & 29 & 34 & 20 \\
+\bottomrule
+\end{tabular}
+\caption{Changed settings and corrected four-period inference results for the three SAA candidates. All other environment, feature, architecture, training, and seed settings are shared.}
+\label{tab:saa-config-comparison}
+\end{table}
+
+Configurations \texttt{01056} and \texttt{01057} differ only in the reward squash. Configuration \texttt{01058} also reduces both reward scales and raises initial entropy. The corrected inference results reverse the earlier selection. Configuration \texttt{01056} has the highest Asset $\alpha$, Market $\alpha$, and Sharpe ratio, and the least severe mean maximum drawdown. Configuration \texttt{01057} is positive in more individual asset-period cells and trades less, but its mean Asset $\alpha$ is $1.34$ percentage points lower. Configuration \texttt{01058} has by far the weakest alpha and the highest turnover. Configuration \texttt{01056} is therefore selected for the PAA.
+
+
+\subsubsection{Results}
+\label{sec:saa-results-presentation}
+
+Table~\ref{tab:saa-per-asset-metrics} gives the detailed results for the selected configuration. Returns and both alpha measures are annualized. Asset $\alpha$ uses the assigned asset's buy-and-hold return. Market $\alpha$ uses SPY buy-and-hold. Turnover sums absolute day-to-day action changes. Cost is cumulative transaction cost as a share of initial capital.
+
+% SAA per-asset performance table (BEGIN)
+\begin{table}[p]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{llS[table-format=-3.2]S[table-format=-3.2]S[table-format=-3.2]S[table-format=-3.2]S[table-format=-2.2]S[table-format=-2.2]S[table-format=-3.2]S[table-format=-3.2]S[table-format=5.2]S[table-format=2.2]}
+\toprule
+\textbf{Period} & \textbf{Asset} & {Agt. Ret.} & {B\&H Ret.} & {Asset $\alpha$ } & {Mkt.\ $\alpha$ } & {Sharpe} & {Sortino} & {MDD } & {Calmar} & {Turnover } & {Cost } \\
+\midrule
+\multirow{12}{*}{\makecell{ val\_00 \\ 2005/12/16 to \\ 2007/02/14}} & Crude & 16.19 & -0.04 & 16.23 & 3.06 & 1.29 & 0.94 & -13.75 & 1.18 & 2663.52 & 0.26 \\
+ & EWG & 7.83 & 33.02 & -25.20 & -5.30 & 0.88 & 0.66 & -9.32 & 0.84 & 2334.12 & 0.25 \\
+ & EWH & 22.15 & 24.97 & -2.83 & 9.02 & 2.00 & 2.30 & -6.26 & 3.54 & 3487.59 & 0.37 \\
+ & EWJ & 13.23 & 9.90 & 3.33 & 0.10 & 1.06 & 1.15 & -9.80 & 1.35 & 3900.29 & 0.31 \\
+ & EWQ & 16.04 & 27.73 & -11.69 & 2.91 & 1.46 & 1.62 & -8.79 & 1.82 & 3431.46 & 0.34 \\
+ & EWS & 26.15 & 42.37 & -16.23 & 13.02 & 2.37 & 2.52 & -5.90 & 4.43 & 2745.45 & 0.28 \\
+ & EWT & 31.43 & 16.09 & 15.34 & 18.30 & 1.77 & 2.34 & -8.90 & 3.53 & 4318.82 & 0.51 \\
+ & EWU & 15.81 & 20.68 & -4.87 & 2.68 & 1.79 & 1.52 & -5.70 & 2.77 & 2549.30 & 0.27 \\
+ & EWY & 31.90 & 15.33 & 16.57 & 18.77 & 1.76 & 2.08 & -9.90 & 3.22 & 4393.37 & 0.49 \\
+ & Gold & 28.25 & 27.97 & 0.28 & 15.12 & 1.84 & 2.06 & -8.59 & 3.29 & 2823.06 & 0.37 \\
+ & SPY & 11.87 & 13.13 & -1.26 & -1.26 & 1.63 & 2.01 & -4.21 & 2.82 & 2963.78 & 0.32 \\
+\midrule
+ & \bfseries Period \O{} & \bfseries 20.08 & \bfseries 21.01 & \bfseries -0.94 & \bfseries 6.95 & \bfseries 1.62 & \bfseries 1.75 & \bfseries -8.28 & \bfseries 2.62 & \bfseries 3237.34 & \bfseries 0.34 \\
+\midrule
+\multirow{12}{*}{\makecell{ val\_01 \\ 2012/01/12 to \\ 2013/03/20}} & Crude & 24.26 & -5.39 & 29.65 & 6.96 & 1.45 & 1.82 & -18.07 & 1.34 & 3078.85 & 0.28 \\
+ & EWG & 47.63 & 21.71 & 25.93 & 30.33 & 2.92 & 4.63 & -4.28 & 11.13 & 3767.37 & 0.50 \\
+ & EWH & 18.14 & 19.69 & -1.55 & 0.83 & 1.92 & 2.51 & -9.53 & 1.90 & 2612.50 & 0.29 \\
+ & EWJ & 18.39 & 15.03 & 3.36 & 1.08 & 1.79 & 2.00 & -11.39 & 1.61 & 3295.02 & 0.32 \\
+ & EWQ & 50.95 & 18.06 & 32.89 & 33.64 & 2.60 & 4.25 & -10.08 & 5.06 & 4797.77 & 0.55 \\
+ & EWS & 15.27 & 16.23 & -0.97 & -2.04 & 1.37 & 1.37 & -11.31 & 1.35 & 2975.49 & 0.29 \\
+ & EWT & 19.85 & 6.84 & 13.01 & 2.54 & 1.47 & 1.94 & -6.51 & 3.05 & 3836.57 & 0.36 \\
+ & EWU & 31.72 & 10.03 & 21.69 & 14.41 & 2.56 & 3.06 & -8.10 & 3.91 & 3702.69 & 0.43 \\
+ & EWY & 30.03 & 7.87 & 22.16 & 12.72 & 2.06 & 2.90 & -7.19 & 4.18 & 3932.35 & 0.45 \\
+ & Gold & 5.66 & -2.12 & 7.78 & -11.65 & 0.69 & 0.75 & -7.70 & 0.74 & 2643.64 & 0.21 \\
+ & SPY & 30.48 & 17.31 & 13.17 & 13.17 & 3.16 & 4.41 & -5.08 & 6.00 & 3514.97 & 0.40 \\
+\midrule
+ & \bfseries Period \O{} & \bfseries 26.58 & \bfseries 11.39 & \bfseries 15.19 & \bfseries 9.27 & \bfseries 2.00 & \bfseries 2.69 & \bfseries -9.02 & \bfseries 3.66 & \bfseries 3468.84 & \bfseries 0.37 \\
+\midrule
+\multirow{12}{*}{\makecell{ val\_02 \\ 2018/02/27 to \\ 2019/04/23}} & Crude & 22.19 & 4.59 & 17.60 & 16.39 & 1.04 & 0.84 & -21.23 & 1.05 & 3510.68 & 0.35 \\
+ & EWG & 14.88 & -10.83 & 25.70 & 9.08 & 1.69 & 1.71 & -7.29 & 2.04 & 3571.00 & 0.37 \\
+ & EWH & 24.15 & 2.69 & 21.46 & 18.35 & 2.43 & 3.27 & -4.15 & 5.82 & 4116.75 & 0.44 \\
+ & EWJ & 16.65 & -8.65 & 25.30 & 10.85 & 1.53 & 1.64 & -9.39 & 1.77 & 3287.16 & 0.36 \\
+ & EWQ & 22.38 & -2.91 & 25.29 & 16.58 & 2.22 & 2.53 & -6.23 & 3.59 & 3258.02 & 0.37 \\
+ & EWS & 19.47 & -6.39 & 25.86 & 13.67 & 1.66 & 2.06 & -8.81 & 2.21 & 3355.47 & 0.38 \\
+ & EWT & 20.41 & -2.47 & 22.88 & 14.61 & 1.71 & 2.12 & -7.84 & 2.60 & 4187.22 & 0.40 \\
+ & EWU & 12.45 & -3.25 & 15.70 & 6.65 & 1.16 & 1.56 & -9.65 & 1.29 & 3009.95 & 0.30 \\
+ & EWY & 24.23 & -11.71 & 35.94 & 18.43 & 1.70 & 2.24 & -6.96 & 3.48 & 3754.35 & 0.48 \\
+ & Gold & -0.95 & -3.13 & 2.18 & -6.75 & -0.06 & -0.08 & -11.22 & -0.08 & 2104.55 & 0.16 \\
+ & SPY & 8.74 & 5.80 & 2.94 & 2.94 & 0.76 & 0.78 & -12.46 & 0.70 & 3084.34 & 0.33 \\
+\midrule
+ & \bfseries Period \O{} & \bfseries 16.78 & \bfseries -3.30 & \bfseries 20.08 & \bfseries 10.98 & \bfseries 1.44 & \bfseries 1.70 & \bfseries -9.57 & \bfseries 2.22 & \bfseries 3385.41 & \bfseries 0.36 \\
+\midrule
+\multirow{12}{*}{\makecell{ val\_03 \\ 2024/02/26 to \\ 2025/04/22}} & Crude & 18.59 & -14.42 & 33.01 & 14.92 & 1.11 & 1.36 & -11.69 & 1.59 & 3139.81 & 0.27 \\
+ & EWG & 2.10 & 21.71 & -19.62 & -1.57 & 0.22 & 0.20 & -13.45 & 0.16 & 2173.18 & 0.26 \\
+ & EWH & -5.58 & 1.77 & -7.35 & -9.25 & -0.41 & -0.31 & -16.71 & -0.33 & 1949.80 & 0.22 \\
+ & EWJ & -4.14 & 0.39 & -4.53 & -7.80 & -0.19 & -0.18 & -20.40 & -0.20 & 3013.05 & 0.32 \\
+ & EWQ & -5.15 & -0.83 & -4.32 & -8.82 & -0.28 & -0.28 & -21.08 & -0.24 & 2942.34 & 0.28 \\
+ & EWS & 20.31 & 26.30 & -5.99 & 16.64 & 1.33 & 1.29 & -10.79 & 1.88 & 2605.99 & 0.26 \\
+ & EWT & -0.74 & -3.81 & 3.07 & -4.41 & 0.06 & 0.06 & -23.12 & -0.03 & 3256.36 & 0.35 \\
+ & EWU & 8.93 & 12.19 & -3.26 & 5.27 & 0.79 & 0.56 & -11.75 & 0.76 & 1933.70 & 0.28 \\
+ & EWY & -6.11 & -12.70 & 6.58 & -9.78 & -0.24 & -0.28 & -25.06 & -0.24 & 3142.67 & 0.40 \\
+ & Gold & 41.72 & 57.11 & -15.40 & 38.05 & 2.92 & 3.44 & -5.31 & 7.86 & 2520.88 & 0.27 \\
+ & SPY & 10.63 & 3.67 & 6.96 & 6.96 & 0.72 & 0.78 & -12.95 & 0.82 & 3128.46 & 0.36 \\
+\midrule
+ & \bfseries Period \O{} & \bfseries 7.32 & \bfseries 8.31 & \bfseries -0.99 & \bfseries 3.65 & \bfseries 0.55 & \bfseries 0.60 & \bfseries -15.66 & \bfseries 1.09 & \bfseries 2709.66 & \bfseries 0.30 \\
+\midrule
+\multicolumn{2}{l}{\bfseries 4-Period \O{}} & \bfseries 17.69 & \bfseries 9.35 & \bfseries 8.34 & \bfseries 7.71 & \bfseries 1.40 & \bfseries 1.68 & \bfseries -10.63 & \bfseries 2.40 & \bfseries 3200.31 & \bfseries 0.34 \\
+\bottomrule
+\end{tabular}
+\caption{Per-asset validation metrics for config\_01056. Return, alpha, MDD, turnover, and cost are in \si{\percent}; return and alpha are annualized.}
+\label{tab:saa-per-asset-metrics}
+\end{table}
+% SAA per-asset performance table (END)
+
+Configuration \texttt{01056} earns positive Asset $\alpha$ in 29 of 44 asset-period cells. Its mean Asset $\alpha$ is $8.34\%$, while mean Market $\alpha$ is $7.71\%$. The result is not uniform. Period-average Asset $\alpha$ is $-0.94\%$, $15.19\%$, $20.08\%$, and $-0.99\%$ from val\_00 through val\_03. Val\_02 is especially broad: all eleven assets beat their own passive benchmarks. Val\_03 is the weakest block and has the deepest mean drawdown, $-15.66\%$.
+
+Mean turnover is $3200.31\%$ and mean cost is $0.34\%$ of initial capital. These values are lower than for \texttt{01058}, but they still imply frequent trading. The friction estimate may therefore be optimistic for the less liquid instruments. Cash carry also differs by block. Since the SAA is long-only and can retreat to cash, part of its measured alpha may reflect the prevailing EFFR rather than timing alone.
+
+Val\_02 and val\_03 are retained for the detailed plots. They are the selected model's best and worst blocks by Asset $\alpha$. This contrast shows both the signal's potential and its failure mode. Aggregate plots compare the equal-weight shadow portfolio with uniform buy-and-hold, SPY buy-and-hold, and cash. Asset plots show each shadow portfolio, its own buy-and-hold benchmark, and signed trading volume.
+
+In val\_02, the equal-weight SAA portfolio rises steadily during the first half of the block, then largely preserves its gains through the late-2018 sell-off. It finishes up $19.5\%$, compared with $6.7\%$ for SPY, $2.4\%$ for cash, and a $3.7\%$ loss for uniform asset buy-and-hold. Its maximum drawdown is about $4.4\%$, versus about $20\%$ for SPY and uniform buy-and-hold. The asset panels show that this result is broad rather than attributable to one holding: all eleven agents finish above their own buy-and-hold benchmarks. The largest cumulative agent-minus-benchmark gaps are EWY ($41.56$ percentage points), EWS ($29.92$), EWG ($29.55$), and EWJ ($29.17$); the gaps are smaller for Gold ($2.50$) and SPY ($3.41$). The signed trade bars show repeated position changes, but these are exits and re-entries in a long-only account, not short sales (Section~\ref{sec:saa}). Total transaction costs across the eleven shadow accounts are $\$395.14$.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.95\textwidth]{graphs/aggregate_saa_portfolio_test_20180227_20190423_26_09_27_14_02.png}
+\caption{Aggregate shadow-portfolio inference for config\_01056, val\_02 (2018/02/27 to 2019/04/23).}
+\label{fig:saa-agg-val02}
+\end{figure}
+
+\begin{figure}[p]
+\centering
+\includegraphics[width=\textwidth]{graphs/asset-specific_saa_portfolio_test_page1_20180227_20190423_26_09_27_14_02.png}
+\caption{Per-asset inference for config\_01056, val\_02, page 1 of 2.}
+\label{fig:saa-assets-val02-p1}
+\end{figure}
+
+\begin{figure}[p]
+\centering
+\includegraphics[width=\textwidth]{graphs/asset-specific_saa_portfolio_test_page2_20180227_20190423_26_09_27_14_02.png}
+\caption{Per-asset inference for config\_01056, val\_02, page 2 of 2.}
+\label{fig:saa-assets-val02-p2}
+\end{figure}
+
+Val\_03 shows a different balance between participation and protection. During the equity rally, SPY rises more quickly than the equal-weight SAA portfolio. Both fall sharply in the late-block sell-off, but the SAA portfolio's decline is shallower and it recovers to finish up $8.6\%$. This is below uniform asset buy-and-hold ($9.9\%$), but above SPY ($4.2\%$) and cash ($5.8\%$). The asset panels explain why the block's mean Asset $\alpha$ is slightly negative: Crude and SPY outperform their own benchmarks by $37.95$ and $8.06$ percentage points, respectively, while EWG and Gold lag by $22.87$ and $18.73$ points. EWY and EWT also finish ahead, but seven assets underperform. Thus the strong Crude result does not represent a uniform timing edge, and Gold's high absolute return mostly reflects its exceptional buy-and-hold rally. The trade panels show that exposure changes do not always capture a persistent trend before it advances; the SAA can only resize or exit its own position, not shift capital to another asset. Total transaction costs across the eleven shadow accounts are $\$327.54$.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.95\textwidth]{graphs/aggregate_saa_portfolio_test_20240226_20250422_26_09_27_14_02.png}
+\caption{Aggregate shadow-portfolio inference for config\_01056, val\_03 (2024/02/26 to 2025/04/22).}
+\label{fig:saa-agg-val03}
+\end{figure}
+
+\begin{figure}[p]
+\centering
+\includegraphics[width=\textwidth]{graphs/asset-specific_saa_portfolio_test_page1_20240226_20250422_26_09_27_14_02.png}
+\caption{Per-asset inference for config\_01056, val\_03, page 1 of 2.}
+\label{fig:saa-assets-val03-p1}
+\end{figure}
+
+\begin{figure}[p]
+\centering
+\includegraphics[width=\textwidth]{graphs/asset-specific_saa_portfolio_test_page2_20240226_20250422_26_09_27_14_02.png}
+\caption{Per-asset inference for config\_01056, val\_03, page 2 of 2.}
+\label{fig:saa-assets-val03-p2}
+\end{figure}
+
+Figure~\ref{fig:saa_train_vs_validation} provides a separate checkpoint-level warning. Training alpha rises while validation alpha weakens after early peaks. Configuration \texttt{01057} briefly reaches the highest plotted validation point, about $1.7\%$ near $1.4$ million steps, but adjacent checkpoints do not sustain it. A single peak is therefore weaker evidence than the four-block deterministic inference comparison in Table~\ref{tab:saa-config-comparison}.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.95\textwidth]{semesterthesis_writing/graphs/train_pv_minus_selected_asset_bh_abs_mean.png}%
+  \newline
+  \includegraphics[width=0.95\textwidth, trim={10pt 0 0 0}]{semesterthesis_writing/graphs/validation_pv_minus_selected_asset_bh_abs_mean.png}
+  \caption{Training (top) and validation (bottom) of asset $\alpha$ over training steps for several configurations.}
+  \label{fig:saa_train_vs_validation}
+\end{figure}
+
+The PPO diagnostics do not contradict this choice. Approximate KL remains below the $0.01$ target for all runs (Figure~\ref{fig:train_approx_kl}). Explained variance ends near $0.92$ for \texttt{01056}, compared with $0.86$ for \texttt{01057} and $0.93$ for \texttt{01058} (Figure~\ref{fig:train_explained_variance}). Value loss reaches about $0.10$ for \texttt{01056} and \texttt{01058}, while \texttt{01057} plateaus near $0.16$ (Figure~\ref{fig:train_value_loss}). The losses show stable optimization, but they do not measure trading quality. Corrected inference alpha therefore remains the deciding evidence.
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.95\textwidth]{graphs/train_approx_kl.png}
+    \caption{Training Approximate KL Divergence across Configurations.}
+    \label{fig:train_approx_kl}
+\end{figure}
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.95\textwidth]{graphs/train_explained_variance.png}
+    \caption{Training Explained Variance across Configurations.}
+    \label{fig:train_explained_variance}
+\end{figure}
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.95\textwidth]{graphs/train_policy_gradient_loss.png}
+    \caption{Training Policy Gradient Loss across Configurations.}
+    \label{fig:train_policy_gradient_loss}
+\end{figure}
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.95\textwidth]{graphs/train_value_loss.png}
+    \caption{Training Value Loss across Configurations.}
+    \label{fig:train_value_loss}
+\end{figure}
+
+\subsubsection{Discussion}
+\label{sec:saa-results-discussion}
+
+\label{sec:saa-robustness}
+
+The corrected results support a different checkpoint choice. Run \texttt{00233}, config\_01056, has the highest mean Asset $\alpha$, the best mean Sharpe ratio, and the least severe mean maximum drawdown. Run \texttt{00234}, config\_01057, is positive in more asset-period cells and trades less, but its mean Asset $\alpha$ is lower and its mean drawdown is worse. Run \texttt{00239}, config\_01058, is weaker on the main performance measures.
+
+The selected policy remains regime-dependent: its mean Asset $\alpha$ is strongest in val\_01 and val\_02, and slightly negative in val\_00 and val\_03. This pattern is visible in the two graph periods. In val\_02, the SAA ensemble retreats through a sharp benchmark drawdown; in val\_03, its more defensive exposure limits the fall but also misses part of the Gold and German-equity rallies. Gold's agent portfolio still gains about $49\%$ in val\_03, but buy-and-hold gains about $68\%$, leaving a cumulative graph alpha of $-18.73$ percentage points. This is a useful reminder that high absolute return is not the same as successful timing.
+
+These outcomes follow from the SAA's action design in Section~\ref{sec:saa}. Its scalar action requests a bounded change in position, scaled by $\kappa_t$; it is not a target portfolio weight. The agent is long-only, so its defensive response is to reduce or close its holding and earn cash carry, not to short a falling asset. The drawdown-aware reward (Section~\ref{sec:drawdown}) can favor this risk reduction, while Asset $\alpha$ still records the opportunity cost when an asset continues to rally. Market-relative and cross-asset features (Section~\ref{sec:state}) inform each decision, but the SAA cannot reallocate its capital to another instrument.
+
+The PAA can make that cross-sectional choice. Under the shadow-portfolio design (Section~\ref{sec:info-flow}), each frozen SAA copy maintains its own cash, holdings, and recurrent state, isolated from the live PAA portfolio. Its emitted action and shadow holding fraction $\rho_t^{(i)}$ enter the asset token alongside market features and the asset's live PAA weight (Section~\ref{sec:paa-state}). The action and $\rho_t^{(i)}$ provide different context: the first is a requested position change, while the second describes the shadow account's current exposure. The PAA's attention network can weigh both against the other assets and the portfolio token rather than treating an SAA action as an allocation instruction (Section~\ref{sec:paa-network}).
+
+Config\_01056 therefore supplies a useful, but imperfect, timing signal for continued PAA training. Its positive mean Asset $\alpha$ and broad gains in val\_02 justify carrying it forward; the losses and regime variation in val\_03 justify leaving the PAA free to discount it. Run \texttt{00233} is the checkpoint selected for that purpose. The final test block remains untouched until PAA design and checkpoint choices are fixed.
+
+
+\subsection{Portfolio Allocator Agent Results}
+\label{sec:paa-results}
+
+
+\subsubsection{Implementation Plan for the Three New Agents}
+\label{sec:paa-implementation}
+
+The \textbf{control ablation} never loads or runs the frozen SAA at all, at training time or at inference time, which makes it computationally cheaper than the hierarchical system rather than merely architecturally identical to it. In place of the SAA's own forward pass, the signal injected into each asset's token is drawn from an autoregressive, order-one (AR(1)) noise process, clipped to the same range as the SAA's own action output. An AR(1) process is chosen deliberately over independent, identically distributed (i.i.d.) noise: because it is autocorrelated from one day to the next, it is at least superficially smooth in the way a genuine trading signal is smooth, which is a harder, and therefore more informative, control condition than noise a network could trivially learn to ignore as pure static. Crucially, this noise is still committed to each asset's real, isolated shadow sub-portfolio through the same shadow-portfolio bookkeeping already described in Section~\ref{sec:info-flow}, so the shadow holding percentage and the other shadow-derived diagnostics injected alongside the signal remain populated exactly as they are for the hierarchical system; only the origin of the committed action changes, from a frozen policy to a stochastic process.
+
+The \textbf{cross-sectional-only ablation} is implemented as the zero-valued special case of the same mechanism: the injected signal is held at a constant zero rather than drawn from the AR(1) process, and the corresponding shadow sub-portfolio is simply never traded. This is a deliberate design choice rather than an implementation shortcut. Implementing this ablation as a genuinely smaller network, one whose asset token omits the SAA-signal dimension entirely, would confound two different explanations for any performance gap: a loss of information, and a loss of model capacity. Holding the signal at zero instead keeps this ablation, the control ablation, and the hierarchical system at identical architecture and identical parameter count, differing only in what occupies two input columns of the asset token. This isolates the information content of the SAA's signal specifically, which is the comparison Section~\ref{sec:paa-comparisons} actually needs.
+
+The \textbf{monolithic end-to-end baseline} is the only one of the three that must be built substantially from new code, since neither the shadow-signal injection mechanism nor the split asset/portfolio token design of Section~\ref{sec:paa-state} presuppose a frozen, per-asset temporal specialist to consume. The simulator itself, its reward, its friction model, and its purged evaluation protocol are reused entirely unchanged, as is the surrounding validation and checkpointing infrastructure, since none of that infrastructure depends on what kind of network is being trained. What is genuinely new is a single policy that supplies its own temporal memory over raw, per-asset market features and performs both timing and cross-sectional allocation jointly, without ever being told which sub-decision is which. Wherever possible, this baseline is built to reuse the hierarchical system's own architectural building blocks, for instance replacing the frozen SAA's contribution with a trainable, per-asset recurrent memory feeding directly into the same shared-attention-plus-private-heads structure described in Section~\ref{sec:paa-network}, rather than adopting an unrelated architecture from the literature. The reasoning behind this choice is methodological: if the monolithic baseline is built from wholly different architectural primitives, any performance gap between it and the hierarchical system could be attributed to that unrelated difference rather than to the modular-versus-monolithic distinction this thesis is actually testing. Training compute, measured either in total environment steps or in wall-clock time, is matched explicitly against the budget spent training the hierarchical system, so that the comparison in Section~\ref{sec:paa-comparisons} is not confounded by one system simply being trained longer than the other. Because this baseline is the most implementation-intensive of the three, it is explicitly time-boxed: if training time does not permit it before submission, its omission is reported as a limitation of this thesis (Section~\ref{sec:limitations}) rather than silently left out of this chapter.
+
+
+
+\subsubsection{Multi-Agent Inference and Comparison Harness}
+\label{sec:paa-harness}
+
+
+\subsubsection{Baselines and Ablations to Compare}
+\label{sec:paa-comparisons}
+
+Table~\ref{tab:paa-comparisons} lists the full comparison set the harness of Section~\ref{sec:paa-harness} must produce, ordered from the simplest passive reference to the most demanding architectural alternative. Each row isolates one specific claim, matching this chapter's opening principle that baselines are chosen for what they isolate.
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{@{}p{5cm}p{6.0cm}p{5cm}@{}}
+\toprule
+\textbf{Condition} & \textbf{What it isolates} & \textbf{Status} \\
+\midrule
+100\% cash & Floor: reward from risk-free carry alone & Available (env.\ default) \\
+SPY buy-and-hold & The PAA's own reward counterfactual (Section~\ref{sec:excess-return}) & Available (env.\ default) \\
+Fixed-weight benchmark & A practitioner-style static allocation, no learning at all & Available (env.\ default) \\
+Cross-sectional-only ablation & Whether the SAA's temporal signal adds value at all & Not yet trained \\
+Control ablation (randomized signal) & Whether any gain over the row above is genuine information, not just an extra input column & Not yet trained \\
+Full hierarchical PAA & The proposed system & Trained; not yet evaluated against the rows above \\
+Monolithic end-to-end baseline & The modular-versus-monolithic research question directly & Time-boxed stretch goal (Section~\ref{sec:paa-implementation}) \\
+\bottomrule
+\end{tabular}
+\caption{The full PAA comparison set. Rows are ordered from the simplest passive reference to the most architecturally demanding alternative; each isolates exactly one claim made in Section~\ref{sec:system-design}.}
+\label{tab:paa-comparisons}
+\end{table}
+
+\subsubsection{Statistical Robustness}
+\label{sec:paa-robustness}
+
+Once the comparisons of Table~\ref{tab:paa-comparisons} exist, they are subjected to the same treatment already applied to the SAA in Section~\ref{sec:saa-robustness}: a peak-alpha checkpoint is identified on the four validation blocks, a validation-decay curve is reported around that peak as evidence for or against overfitting, and both are cross-referenced against PAA-specific training diagnostics analogous to those described in Section~\ref{sec:saa-diagnostics}. Two diagnostics are specific to the PAA's own architecture and have no SAA equivalent: the stability of the attention weights the shared \texttt{TransformerEncoder} (Section~\ref{sec:paa-network}) assigns to each asset token across checkpoints, and the degree of divergence between the actor and critic losses described in Section~\ref{sec:actor-critic-theory}, which the private per-head encoder layers of Section~\ref{sec:paa-network} are specifically designed to absorb.

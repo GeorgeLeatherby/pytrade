@@ -3,9 +3,12 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
 import json, importlib
 import pandas as pd
 from tkinter import Tk, Listbox, SINGLE, MULTIPLE, Button, Label, END, Toplevel, messagebox
-from src.environment.single_asset_target_pos_drl_trading_env import MarketDataCache
+from environment.trading_environment import MarketDataCache
 
 AGENTS_DIR = os.path.join(os.path.dirname(__file__), "src", "agents")
+
+# Fix 
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
 def discover_agents():
     agents = []
@@ -29,7 +32,8 @@ def verify_requested_features(df: pd.DataFrame, config: dict) -> None:
     requested = set()
     for key in ["saa_features", "paa_asset_token_features", "paa_portfolio_token_features"]:
         requested.update(name for name, enabled in config.get(key, {}).items() if enabled)
-    missing = requested - set(df.columns)
+    dynamic_features = {"effr_raw_pct", "risk_free_rate_pa", "risk_free_rate_daily", "risk_free_rate_zscore_60d"}
+    missing = (requested - set(df.columns)) - dynamic_features
     if missing:
         raise ValueError(f"Missing requested features in data: {sorted(missing)}")
     print(f"[verify_requested_features] All {len(requested)} requested features are present.")

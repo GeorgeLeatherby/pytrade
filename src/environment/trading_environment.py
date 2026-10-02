@@ -1,0 +1,5139 @@
+"""
+Trading Environment
+============================================
+
+Implements a multi-asset trading environment optimized for Deep Reinforcement Learning (DRL)
+using Gymnasium interface. Supports trading across multiple indices with realistic constraints.
+Assumes that fx_rates have been applied and all data is provided in USD!
+
+Key Design Principles:
+1. Efficient state representation for neural networks (for LSTM layers)
+2. Proper reward shaping for stable PPO training
+3. Realistic trading constraints and costs
+4. Multi-asset portfolio optimization focus
+5. Currency conversion handling for global assets
+
+Uses a given .csv file with daily historical price data for multiple assets.
+This environment is designed for reinforcement learning applications. It provides the
+feedback necessary for training trading agents. Since it is based on Gymnasium, it can be
+easily integrated with various RL libraries. 
+
+It mainly consists of the following components:
+- State Representation: The state includes historical price data, technical indicators,
+  current portfolio holdings, cash balance, and other relevant features
+- Action Space: The action space allows the agent to decide the allocation of funds
+  across different assets, including a cash position
+
+Note: This environment is built to serve sequential data, indicated by the 'lookback_window'
+parameter. A step represents a day. 
+
+Data classes:
+- PortfolioState:   Current state representation
+- EpisodeBuffer:    Step-by-step history within episode
+- MarketDataCache:  Fast market data access
+- TrainingMetrics:  Cross-episode performance tracking
+- ExecutionResult:  Lightweight trade execution results
+
+Function classes:
+- TradingEnv:       Main Gym environment class
+
+"""
+
+# Imports
+from dataclasses import dataclass, field
+import importlib
+import numpy as np
+import pandas as pd
+import gymnasium as gym
+from gymnasium import spaces
+from typing import Dict, Any, Tuple, List, Optional
+
+# Execution mode constants and trade instruction dataclass
+EXECUTION_SINGLE_ASSET_TARGET_POS = "single_asset_target_position"
+EXECUTION_SIMPLE = "simple"
+EXECUTION_TRANCHE = "tranche"
+EXECUTION_PORTFOLIO_WEIGHTS = "portfolio_weights"
+
+@dataclass
+class TradeInstruction:
+    symbol: str
+    action: str  # "BUY" or "SELL"
+    # Either of the following needs to be set:
+    quantity: Optional[float] = None  # number of shares (None for SELL in simple mode) (optional)
+    notional: Optional[float] = None  # dollar value (optional)
+    # Order type
+    order_type: str = "MARKET"  # "MARKET" or "LIMIT"
+    limit_price: Optional[float] = None
+
+def _validate_instruction(instr: TradeInstruction, asset_to_index: Dict[str, int]) -> Optional[str]:
+    if instr.symbol not in asset_to_index:
+        return "unknown_symbol"
+    if instr.action not in {"BUY", "SELL"}:
+        return "invalid_action"
+    if instr.order_type not in {"MARKET", "LIMIT"}:
+        return "invalid_order_type"
+    if instr.order_type == "LIMIT":
+        if instr.limit_price is None or not np.isfinite(instr.limit_price) or instr.limit_price <= 0:
+            return "invalid_limit_price"
+
+    # Exactly one of quantity or notional must be provided (and finite)
+    has_qty = (instr.quantity is not None) and np.isfinite(instr.quantity) and not np.isnan(instr.quantity)
+    has_notional = (instr.notional is not None) and np.isfinite(instr.notional) and not np.isnan(instr.notional)
+
+    if instr.quantity is not None and (not np.isfinite(instr.quantity) or np.isnan(instr.quantity)):
+        print(f"Debug Info - Instruction: {instr}. Quantity is not finite or is NaN.")
+    if instr.notional is not None and (not np.isfinite(instr.notional) or np.isnan(instr.notional)):
+        print(f"Debug Info - Instruction: {instr}. Notional is not finite or is NaN.")
+
+    if has_qty and has_notional:
+        print(f"Debug Info - Instruction: {instr}. Both quantity and notional are set, which is not allowed.")
+        return "both_qty_and_notional_set"
+    if not has_qty and not has_notional:
+        print(f"Debug Info - Instruction: {instr}. Neither quantity nor notional is set, one must be provided.")
+        return "missing_qty_and_notional"
+
+    # Validate BUY specifics
+    if instr.action == "BUY":
+        if has_qty and instr.quantity <= 0:
+            return "invalid_quantity_for_buy"
+        if has_notional and instr.notional <= 0:
+            return "invalid_notional_for_buy"
+        return None  # Quantity-only or notional-only is allowed
+
+    # Validate SELL specifics
+    if instr.action == "SELL":
+        # Accept either quantity-only or notional-only, not both
+        if has_qty:
+            if instr.quantity <= 0:
+                return "invalid_quantity_for_sell"
+            return None  # quantity-only SELL is valid
+        if has_notional:
+            if instr.notional <= 0:
+                return "invalid_notional_for_sell"
+            return None  # notional-only SELL is valid
+        # The neither case is already handled above, but keep a clear fallback
+        return "missing_qty_and_notional"
+
+@dataclass
+class PortfolioState:
+    """Current portfolio state representation using positions and cash balance.
+
+    Safety notes:
+    - Always copies incoming arrays to avoid accidental aliasing (data leaks) between
+      multiple PortfolioState instances or across resets.
+    - Uses default_factory for arrays to avoid shared mutable defaults.
+    """
+    cash: float = 0.0
+    positions: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
+    prices: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
+    step: int = 0
+    terminated: bool = False
+
+    def __post_init__(self) -> None:
+        # Force independent buffers + consistent dtype
+        self.positions = np.asarray(self.positions, dtype=np.float32).copy()
+        self.prices = np.asarray(self.prices, dtype=np.float32).copy()
+
+        if self.positions.shape != self.prices.shape:
+            raise ValueError(
+                f"positions/prices shape mismatch: {self.positions.shape} vs {self.prices.shape}"
+            )
+
+        if not np.isfinite(self.cash):
+            raise ValueError("cash must be finite")
+
+    def get_asset_values(self) -> np.ndarray:
+        # Returns market value of each position excluding cash
+        return self.positions * self.prices
+
+    def get_total_value(self) -> float:
+        # Returns total portfolio value including cash
+        return float(self.cash + np.sum(self.get_asset_values(), dtype=np.float64))
+
+    def get_weights(self) -> np.ndarray:
+        # Returns current portfolio weights including cash
+        total_value = float(self.get_total_value())
+        if total_value <= 1e-8:  # guard against zero
+            return np.zeros(len(self.positions) + 1, dtype=np.float32)
+
+        asset_values = self.get_asset_values()
+        weights = np.concatenate(
+            ([self.cash / total_value], asset_values / total_value)
+        ).astype(np.float32)
+
+        if not np.all(np.isfinite(weights)):
+            print(
+                f"Debug Info - Cash: {self.cash}, Total Value: {total_value}, "
+                f"Asset Values: {asset_values}, Weights: {weights}"
+            )
+            raise ValueError("Non-finite weights detected in portfolio state.")
+        return weights
+
+    def portfolio_reset(
+        self,
+        cash: float,
+        positions: np.ndarray,
+        prices: np.ndarray,
+        step: int,
+        terminated: bool,
+    ) -> None:
+        # Copy to prevent aliasing between portfolio/comparison/benchmark states
+        self.cash = float(cash)
+        self.positions = np.asarray(positions, dtype=np.float32).copy()
+        self.prices = np.asarray(prices, dtype=np.float32).copy()
+        self.step = int(step)
+        self.terminated = bool(terminated)
+
+        if self.positions.shape != self.prices.shape:
+            raise ValueError(
+                f"positions/prices shape mismatch: {self.positions.shape} vs {self.prices.shape}"
+            )
+        if not np.isfinite(self.cash):
+            raise ValueError("cash must be finite")
+
+
+@dataclass
+class EpisodeBuffer:
+    """
+    Buffer for episode data - optimized for DRL training.
+    Stores step-by-step portfolio and market data for efficient access.
+    Pre-allocated storage for len(lookback_window + episode_length) to avoid dynamic resizing.
+    Warmup-phase: zero-padding for any portfolio related metrics.
+
+    Layout:
+    Indices [0 : lookback_window) -> warm-up (market-only; portfolio metrics zero)
+    Indices [lookback_window : lookback_window + episode_length) -> actual episode steps
+
+    External code (TradingEnv) always uses 'external_step' starting at 0 for first REAL trading day.
+    Internally we map: internal_index = lookback_window + external_step
+
+    NOTE: episode_buffer_length_days = lookback_window + episode_length_days
+    """
+    # Needed vars in initialization:
+    episode_buffer_length_days: int
+    num_assets: int
+    lookback_window: int
+    maybe_provide_sequence: bool = False
+
+    # Pre-allocated arrays for vectorized operations
+    portfolio_values: np.ndarray = field(init=False)            # [episode_buffer_length_days] - total portfolio value each step
+    portfolio_weights: np.ndarray = field(init=False)           # [episode_buffer_length_days, num_assets+1] - weights including cash
+    portfolio_positions: np.ndarray = field(init=False)         # [episode_buffer_length_days, num_assets] - number of shares held each step
+    comparison_portfolio_value: np.ndarray = field(init=False)  # [episode_buffer_length_days] - comparison portfolio value each step
+    benchmark_portfolio_value: np.ndarray = field(init=False)   # [episode_buffer_length_days] - benchmark portfolio value each step
+    selected_asset_bh_portfolio_value: np.ndarray = field(init=False)  # [episode_buffer_length_days] - selected asset buy-and-hold portfolio value (SAA mode only)
+    alpha: np.ndarray = field(init=False)                       # [episode_buffer_length_days] - excess returns over benchmark
+    returns: np.ndarray = field(init=False)                     # [episode_buffer_length_days] - daily returns
+    saa_returns: np.ndarray = field(init=False)                 # [episode_buffer_length_days] - daily returns of single-asset-agent (cash + selected asset)
+    rewards: np.ndarray = field(init=False)           # [episode_buffer_length_days] - RL allocator rewards
+    actions: np.ndarray = field(init=False)                     # [episode_buffer_length_days, num_assets+1] - agent actions
+    transaction_costs: np.ndarray = field(init=False)           # [episode_buffer_length_days] - costs per step (agent/allocator)
+    selected_asset_bh_transaction_costs: np.ndarray = field(init=False)  # [episode_buffer_length_days] - costs for selected asset buy-and-hold (SAA mode only)
+    sharpe_ratio: np.ndarray = field(init=False)                # [episode_buffer_length_days] - rolling sharpe ratio
+    drawdown: np.ndarray = field(init=False)                    # [episode_buffer_length_days] - rolling max drawdown
+    volatility: np.ndarray = field(init=False)                  # [episode_buffer_length_days] - rolling volatility
+    turnover: np.ndarray = field(init=False)                    # [episode_buffer_length_days] - portfolio turnover
+    # Market data
+    asset_prices: np.ndarray = field(init=False)                # [episode_buffer_length_days, num_assets] - closing prices
+    traded_dollar_volume: np.ndarray = field(init=False)         # [episode_buffer_length_days, num_assets] - dollar volume traded each step
+    traded_shares_total: np.ndarray = field(init=False)        # [episode_buffer_length_days, num_assets] - total shares traded each step
+    # Metadata
+    current_step: int = 0                   # Current step in episode
+    num_portfolio_features: int = field(init=False)  # Number of portfolio features for observation
+    effective_asset_concentration_norm: np.ndarray = field(init=False)  # [episode_buffer_length_days] - effective asset concentration norm 
+    previous_sortino: np.ndarray = field(init=False)  # [episode_buffer_length_days] - previous Sortino ratio for reward component
+    current_sortino: np.ndarray = field(init=False)   # [episode_buffer_length_days] - current Sortino ratio for reward component
+    running_mean_ema: np.ndarray = field(init=False)  # [episode_buffer_length_days] - running mean EMA of returns for reward component
+    downside_var_sqrt: np.ndarray = field(init=False)  # [episode_buffer_length_days] - sqrt of downside variance for Sortino ratio
+    previous_max_drawdown: np.ndarray = field(init=False)  # [episode_buffer_length_days] - previous max drawdown for reward component
+    risk_free_rate_zscore_60d: np.ndarray = field(init=False)  # [episode_buffer_length_days] - aligned risk-free z-score feature
+    risk_free_rate_daily: np.ndarray = field(init=False)  # [episode_buffer_length_days] - portfolio excess log return over daily risk-free
+    risk_free_rate_daily_raw: np.ndarray = field(init=False)  # [episode_buffer_length_days] - raw daily EFFR-derived carry rate (same source as SAA obs)
+
+    # weights, alpha, sharpe_ratio, drawdown, volatility, turnover, allocator_rewards
+
+    def __post_init__(self):
+        """Initialize all arrays with proper shapes and types"""
+        dtype = np.float32
+        self.portfolio_values = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.portfolio_weights = np.zeros((self.episode_buffer_length_days, self.num_assets + 1), dtype=dtype)
+        self.portfolio_positions = np.zeros((self.episode_buffer_length_days, self.num_assets), dtype=dtype)
+        self.comparison_portfolio_value = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.benchmark_portfolio_value = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.selected_asset_bh_portfolio_value = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.alpha = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.returns = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.saa_returns = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.rewards = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.actions = np.zeros((self.episode_buffer_length_days, self.num_assets + 1), dtype=dtype)
+        self.transaction_costs = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.selected_asset_bh_transaction_costs = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.sharpe_ratio = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.drawdown = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.volatility = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.turnover = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.asset_prices = np.zeros((self.episode_buffer_length_days, self.num_assets), dtype=dtype)
+        self.traded_dollar_volume = np.zeros((self.episode_buffer_length_days, self.num_assets), dtype=dtype)
+        self.traded_shares_total = np.zeros((self.episode_buffer_length_days, self.num_assets), dtype=dtype)
+        # If num_features is not available, set to 0
+        num_features = getattr(self, "num_features", 0)
+        self.current_step = 0
+        # weights(N+1) + 14 scalar portfolio metrics + 3 per-asset PAA blocks (last_target_weights,
+        # shadow_sortino, shadow_drawdown) - see get_observation_at_step for the exact layout, which
+        # SAATokenizer.forward (ppo_portfolio_allocator_weights_agent.py) depends on positionally.
+        self.num_portfolio_features = self.num_assets + 1 + 14 + 3 * self.num_assets
+        self.action_entropy = np.zeros(self.episode_buffer_length_days, dtype=dtype) 
+        # Reward component tracking (per-step)
+        self.reward_alpha = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.reward_risk = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.reward_portfolio_return = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.reward_cost = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.reward_turnover = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.reward_concentration = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.reward_survival = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.effective_asset_concentration_norm = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.previous_sortino = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.current_sortino = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.running_mean_ema = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.downside_var_sqrt = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.previous_max_drawdown = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.risk_free_rate_zscore_60d = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.risk_free_rate_daily = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        self.risk_free_rate_daily_raw = np.zeros(self.episode_buffer_length_days, dtype=dtype)
+        # --- Per-asset hypothetical SAA sub-portfolio containers ---
+        # Used ONLY in PORTFOLIO_WEIGHTS execution mode to feed frozen SAAs inside SAASignalWrapper.
+        # One independent sub-portfolio per asset; each mimics SAA-training obs inputs.
+        # Shapes: [T, N] for per-asset scalars.
+        self.saa_sub_cash         = np.zeros((self.episode_buffer_length_days, self.num_assets), dtype=dtype)  # $ cash per asset
+        self.saa_sub_shares       = np.zeros((self.episode_buffer_length_days, self.num_assets), dtype=dtype)  # shares held per asset
+        self.saa_sub_last_action  = np.zeros((self.episode_buffer_length_days, self.num_assets), dtype=dtype)  # previous SAA scalar action per asset
+        self.saa_sub_daily_return = np.zeros((self.episode_buffer_length_days, self.num_assets), dtype=dtype)  # $-delta matching env.saa_returns formula
+        # Per-asset shadow sub-portfolio diagnostics fed to the PAA asset tokens (PORTFOLIO_WEIGHTS mode).
+        self.shadow_sortino  = np.zeros((self.episode_buffer_length_days, self.num_assets), dtype=dtype)  # clipped per-asset Sortino ratio
+        self.shadow_drawdown = np.zeros((self.episode_buffer_length_days, self.num_assets), dtype=dtype)  # per-asset rolling max drawdown
+
+    def record_step(self, external_step: int, portfolio_value: float, weights: np.ndarray, portfolio_positions: np.ndarray,
+                   daily_return: float, saa_return: float, reward_to_record: float,action: np.ndarray,
+                   transaction_cost: float, prices: np.ndarray,
+                   sharpe_ratio: float = 0.0, drawdown: float = 0.0, volatility: float = 0.0, turnover: float = 0.0, alpha: float = 0.0, benchmark_portfolio_value: float = 0.0,
+                   comparison_portfolio_value: float = 0.0,
+                   traded_dollar_volume: float = 0.0, traded_shares_total: float = 0.0,
+                   action_entropy: float = 0.0, saa_reward_parts: Optional[Dict[str, float]] = None,
+                   reward_parts: Optional[Dict[str, float]] = None,
+                   effective_asset_concentration_norm: float = 0.0, previous_sortino: float = 0.0, current_sortino: float = 0.0,
+                   running_mean_ema: float = 0.0, downside_var_sqrt: float = 0.0, previous_max_drawdown: float = 0.0,
+                   risk_free_rate_zscore_60d: float = 0.0,
+                   risk_free_rate_daily: float = 0.0,
+                   risk_free_rate_daily_raw: float = 0.0,
+                   selected_asset_bh_portfolio_value: float = 0.0, selected_asset_bh_transaction_cost: float = 0.0) -> None:
+        
+        """
+        Record step data efficiently. external_step: 0-based episode day index (first real day = 0)
+        """
+
+        # Internal offset due to lookback warmup
+        if self.maybe_provide_sequence:
+            internal_offset_step = external_step + self.lookback_window
+        else:
+            internal_offset_step = external_step
+
+        assert 0 <= internal_offset_step < self.episode_buffer_length_days, "Step out of bounds of EpisodeBuffer"
+
+        self.portfolio_values[internal_offset_step] = portfolio_value
+        self.portfolio_weights[internal_offset_step] = weights
+        self.portfolio_positions[internal_offset_step] = portfolio_positions
+        self.returns[internal_offset_step] = daily_return
+        self.saa_returns[internal_offset_step] = saa_return
+        self.rewards[internal_offset_step] = reward_to_record
+        self.actions[internal_offset_step] = action
+        self.transaction_costs[internal_offset_step] = transaction_cost
+        self.selected_asset_bh_transaction_costs[internal_offset_step] = selected_asset_bh_transaction_cost
+        self.asset_prices[internal_offset_step] = prices
+        self.sharpe_ratio[internal_offset_step] = sharpe_ratio
+        self.drawdown[internal_offset_step] = drawdown
+        self.volatility[internal_offset_step] = volatility
+        self.turnover[internal_offset_step] = turnover
+        self.alpha[internal_offset_step] = alpha
+        self.comparison_portfolio_value[internal_offset_step] = comparison_portfolio_value
+        self.benchmark_portfolio_value[internal_offset_step] = benchmark_portfolio_value
+        self.selected_asset_bh_portfolio_value[internal_offset_step] = selected_asset_bh_portfolio_value
+        self.traded_dollar_volume[internal_offset_step] = float(traded_dollar_volume)
+        self.traded_shares_total[internal_offset_step] = float(traded_shares_total)
+        self.action_entropy[internal_offset_step] = float(action_entropy)
+        self.effective_asset_concentration_norm[internal_offset_step] = float(effective_asset_concentration_norm)
+        self.previous_sortino[internal_offset_step] = previous_sortino
+        self.current_sortino[internal_offset_step] = current_sortino
+        self.running_mean_ema[internal_offset_step] = running_mean_ema
+        self.downside_var_sqrt[internal_offset_step] = downside_var_sqrt
+        self.previous_max_drawdown[internal_offset_step] = previous_max_drawdown
+        self.risk_free_rate_zscore_60d[internal_offset_step] = risk_free_rate_zscore_60d
+        self.risk_free_rate_daily[internal_offset_step] = risk_free_rate_daily
+        self.risk_free_rate_daily_raw[internal_offset_step] = risk_free_rate_daily_raw
+        # Reward components
+        if reward_parts is not None:
+            self.reward_alpha[internal_offset_step] = reward_parts.get("alpha_component", 0.0)
+            self.reward_risk[internal_offset_step] = reward_parts.get("risk_component", 0.0)
+            self.reward_portfolio_return[internal_offset_step] = reward_parts.get("portfolio_return_component", 0.0)
+            self.reward_cost[internal_offset_step] = reward_parts.get("cost_component", 0.0)
+            self.reward_turnover[internal_offset_step] = reward_parts.get("turnover", 0.0)
+            self.reward_concentration[internal_offset_step] = reward_parts.get("concentration_component", 0.0)
+            self.reward_survival[internal_offset_step] = reward_parts.get("survival_component", 0.0)
+        
+        # Update current step and episode length
+        self.current_step = external_step
+        self.episode_length = min(external_step + 1, self.episode_buffer_length_days)
+
+    def set_saa_sub_state_mtm(self, external_step: int, cash: np.ndarray, shares: np.ndarray,
+                            last_action: np.ndarray, daily_return: np.ndarray) -> None:
+        """
+        Write per-asset sub-portfolio state AFTER price update + cash drag, BEFORE the new SAA action.
+        All arrays expected shape [N].
+        """
+        internal_offset_step = external_step + self.lookback_window if self.maybe_provide_sequence else external_step
+        self.saa_sub_cash[internal_offset_step]         = cash
+        self.saa_sub_shares[internal_offset_step]       = shares
+        self.saa_sub_last_action[internal_offset_step]  = last_action
+        self.saa_sub_daily_return[internal_offset_step] = daily_return
+
+    def set_saa_sub_state_after_action(self, external_step: int, cash: np.ndarray, shares: np.ndarray,
+                                    last_action: np.ndarray) -> None:
+        """Overwrite cash/shares/last_action in the current slot AFTER the SAA action has been applied."""
+        internal_offset_step = external_step + self.lookback_window if self.maybe_provide_sequence else external_step
+        self.saa_sub_cash[internal_offset_step]        = cash
+        self.saa_sub_shares[internal_offset_step]      = shares
+        self.saa_sub_last_action[internal_offset_step] = last_action
+
+    def get_saa_sub_state(self, external_step: int):
+        """Read [cash(N), shares(N), last_action(N), daily_return(N)] at the given external step."""
+        internal_offset_step = external_step + self.lookback_window if self.maybe_provide_sequence else external_step
+        return (self.saa_sub_cash[internal_offset_step],
+                self.saa_sub_shares[internal_offset_step],
+                self.saa_sub_last_action[internal_offset_step],
+                self.saa_sub_daily_return[internal_offset_step])
+
+    def record_shadow_diagnostics(self, external_step: int, sortino: np.ndarray, drawdown: np.ndarray) -> None:
+        """Store the per-asset shadow sub-portfolio Sortino ratio and drawdown for this step."""
+        internal_offset_step = external_step + self.lookback_window if self.maybe_provide_sequence else external_step
+        self.shadow_sortino[internal_offset_step] = sortino
+        self.shadow_drawdown[internal_offset_step] = drawdown
+
+    def shadow_calculate_max_drawdown(self, external_step: int, window: int, current_step_prices: np.ndarray) -> np.ndarray:
+        """
+        Per-asset max drawdown of each shadow sub-portfolio (cash + that asset's notional) over
+        the last `window` steps, ending at `external_step` (inclusive). saa_sub_cash/shares for
+        `external_step` must already be written (via set_saa_sub_state_mtm) before calling this;
+        `current_step_prices` substitutes for asset_prices[external_step], which record_step()
+        for this step hasn't run yet at the point this is normally called.
+        """
+        internal_end = external_step + self.lookback_window if self.maybe_provide_sequence else external_step
+        if internal_end <= 0:
+            return np.zeros(self.num_assets, dtype=np.float32)
+        internal_start = max(0, internal_end - window)
+
+        cash_slice = self.saa_sub_cash[internal_start:internal_end + 1]        # [T, N]
+        shares_slice = self.saa_sub_shares[internal_start:internal_end + 1]    # [T, N]
+        prices_slice = self.asset_prices[internal_start:internal_end + 1].copy()  # [T, N]
+        prices_slice[-1] = current_step_prices
+
+        values = cash_slice + shares_slice * prices_slice
+        if values.shape[0] < 2:
+            return np.zeros(self.num_assets, dtype=np.float32)
+
+        peaks = np.maximum.accumulate(values, axis=0)
+        peaks = np.maximum(peaks, 1e-12)
+        drawdowns = (peaks - values) / peaks
+        drawdowns = np.nan_to_num(drawdowns, nan=0.0, posinf=0.0, neginf=0.0)
+        max_dd = np.max(drawdowns, axis=0)
+        return np.clip(max_dd, 0.0, None).astype(np.float32)
+    
+    def get_returns_window(self, window: int) -> np.ndarray:
+        """Get last N returns for risk calculations (no wrap-around, no ring buffer)"""
+        end_idx = self.current_step
+        start_idx = max(0, end_idx - window)
+        return self.returns[start_idx:end_idx]
+    
+    def calculate_sharpe_ratio(self, window: int) -> float:
+        """Calculate rolling Sharpe ratio efficiently (annualized, no risk-free rate)"""
+        returns_window = self.get_returns_window(window)
+        if len(returns_window) < 2:
+            return 0.0
+        mean_return = np.mean(returns_window)
+        std_return = np.std(returns_window)
+        if std_return == 0:
+            return 0.0
+
+        sharpe = mean_return / std_return
+        if np.any(np.isnan(sharpe)):
+            raise ValueError("NaN value detected in Sharpe ratio calculation.")
+        if np.any(np.isinf(sharpe)):
+            raise ValueError("Infinite value detected in Sharpe ratio calculation.")
+        return sharpe
+    
+    def calculate_max_drawdown(self, window: int) -> float:
+        """
+        Maximum drawdown over the last `window` steps (robust version).
+        Drawdown(t) = (Peak_to_date - Value_t) / Peak_to_date, after first positive value.
+        Returns 0.0 until a positive portfolio value is observed.
+        Completely avoids NaNs/Infs from 0/0 situations in warm-up.
+        """
+        end_idx = self.current_step
+        if end_idx <= 0:
+            return 0.0
+        start_idx = max(0, end_idx - window)
+        values_window = self.portfolio_values[start_idx:end_idx]
+
+        if values_window.size == 0:
+            return 0.0
+
+        # Keep only finite values
+        values_window = values_window[np.isfinite(values_window)]
+        if values_window.size == 0:
+            return 0.0
+
+        # Find first strictly positive portfolio value (ignore initial zeros)
+        positive_mask = values_window > 0
+        if not positive_mask.any():
+            return 0.0  # still only zeros
+
+        first_pos_idx = np.flatnonzero(positive_mask)[0]
+        v = values_window[first_pos_idx:]  # slice from first positive onward
+
+        if v.size < 2:
+            return 0.0
+
+        # Running peak (strictly > 0)
+        peaks = np.maximum.accumulate(v)
+
+        # Compute drawdowns (all denominators > 0, so no 0/0)
+        drawdowns = (peaks - v) / peaks
+
+        # Numerical safety (should not be needed but defensive)
+        drawdowns = np.nan_to_num(drawdowns, nan=0.0, posinf=0.0, neginf=0.0)
+
+        max_dd = float(np.max(drawdowns)) if drawdowns.size else 0.0
+        if max_dd < 0:
+            max_dd = 0.0
+        return max_dd
+    
+    def saa_calculate_max_drawdown(self, selected_asset_idx, window: int) -> float:
+        """
+        Maximum drawdown of the subportfolio (cash + selected asset) over the last `window` steps.
+        
+        Drawdown(t) = (Peak_to_date - Value_t) / Peak_to_date, after first positive value.
+        Returns 0.0 until a positive subportfolio value is observed.
+        Ignores price changes of phantom assets (all non-selected assets).
+        
+        Args:
+            selected_asset_idx: Index of the trading asset (0 to num_assets-1)
+            window: Number of steps to consider for drawdown calculation
+            
+        Returns:
+            Maximum drawdown as float in [0, 1]
+        """
+        end_idx = self.current_step
+        if end_idx <= 0:
+            return 0.0
+        
+        start_idx = max(0, end_idx - window)
+        
+        # Reconstruct subportfolio values: cash + selected asset notional
+        # portfolio_weights[t, 0] = cash_weight = cash[t] / total_portfolio_value[t]
+        # portfolio_positions[t, selected_asset_idx] = shares held
+        # asset_prices[t, selected_asset_idx] = price of selected asset at step t
+        
+        subpf_values = np.zeros(end_idx - start_idx, dtype=np.float32)
+        
+        for i, step_idx in enumerate(range(start_idx, end_idx)):
+            # Total portfolio value at this step
+            total_pv = self.portfolio_values[step_idx]
+            
+            if total_pv <= 0:
+                subpf_values[i] = 0.0
+                continue
+            
+            # Cash value (from weight)
+            cash_weight = self.portfolio_weights[step_idx, 0]  # First element is cash weight
+            cash_value = cash_weight * total_pv
+            
+            # Selected asset notional value
+            position_shares = self.portfolio_positions[step_idx, selected_asset_idx]
+            asset_price = self.asset_prices[step_idx, selected_asset_idx]
+            asset_value = position_shares * asset_price
+            
+            # Subportfolio = cash + selected asset only
+            subpf_values[i] = cash_value + asset_value
+        
+        if subpf_values.size == 0:
+            return 0.0
+        
+        # Keep only finite values
+        subpf_values = subpf_values[np.isfinite(subpf_values)]
+        if subpf_values.size == 0:
+            return 0.0
+        
+        # Find first strictly positive subportfolio value (ignore initial zeros)
+        positive_mask = subpf_values > 0
+        if not positive_mask.any():
+            return 0.0  # still only zeros
+        
+        first_pos_idx = np.flatnonzero(positive_mask)[0]
+        v = subpf_values[first_pos_idx:]  # slice from first positive onward
+        
+        if v.size < 2:
+            return 0.0
+        
+        # Running peak (strictly > 0)
+        peaks = np.maximum.accumulate(v)
+        
+        # Compute drawdowns (all denominators > 0, so no 0/0)
+        drawdowns = (peaks - v) / peaks
+        
+        # Numerical safety (should not be needed but defensive)
+        if np.isnan(drawdowns).any() or np.isinf(drawdowns).any():
+            print("NaN or Inf value detected in SAA drawdown calculation. Clipping to 0.0.")
+            drawdowns = np.nan_to_num(drawdowns, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        max_dd = float(np.max(drawdowns)) if drawdowns.size else 0.0
+        if max_dd < 0:
+            max_dd = 0.0
+        return max_dd
+    
+    def get_observation_lookback(self) -> np.ndarray:
+        """
+        Get portfolio lookback for LSTM input computationally efficient.
+        Sequences of vars:
+        weights, alpha, sharpe_ratio, drawdown, volatility, turnover,
+        effective concentration, previous/current sortino, running mean ema,
+        downside variance sqrt, previous max drawdown, risk-free z-score.
+        - shape [lookback_window, num_portfolio_features]
+        """
+        # Determine start and end indices for lookback (handle circular buffer)
+        end_idx = self.current_step
+        start_idx = max(0, end_idx - self.lookback_window + 1)
+        actual_window = end_idx - start_idx + 1
+
+        # Pre-allocate output array
+        num_portfolio_features = self.num_portfolio_features
+        obs = np.zeros((self.lookback_window, num_portfolio_features), dtype=np.float32)
+
+        # Gather sequences
+        # weights: [lookback_window, num_assets+1]
+        weights_seq = self.portfolio_weights[start_idx:end_idx+1]
+        alpha_seq = self.alpha[start_idx:end_idx+1].reshape(-1, 1)
+        sharpe_seq = self.sharpe_ratio[start_idx:end_idx+1].reshape(-1, 1)
+        drawdown_seq = self.drawdown[start_idx:end_idx+1].reshape(-1, 1)
+        volatility_seq = self.volatility[start_idx:end_idx+1].reshape(-1, 1)
+        turnover_seq = self.turnover[start_idx:end_idx+1].reshape(-1, 1)
+        eff_conc_seq = self.effective_asset_concentration_norm[start_idx:end_idx+1].reshape(-1, 1)
+        prev_sortino_seq = self.previous_sortino[start_idx:end_idx+1].reshape(-1, 1)
+        curr_sortino_seq = self.current_sortino[start_idx:end_idx+1].reshape(-1, 1)
+        running_mean_ema_seq = self.running_mean_ema[start_idx:end_idx+1].reshape(-1, 1)
+        downside_var_sqrt_seq = self.downside_var_sqrt[start_idx:end_idx+1].reshape(-1, 1)
+        prev_max_dd_seq = self.previous_max_drawdown[start_idx:end_idx+1].reshape(-1, 1)
+        rf_zscore_seq = self.risk_free_rate_zscore_60d[start_idx:end_idx+1].reshape(-1, 1)
+        rf_daily_seq = self.risk_free_rate_daily[start_idx:end_idx+1].reshape(-1, 1)
+        rf_daily_raw_seq = self.risk_free_rate_daily_raw[start_idx:end_idx+1].reshape(-1, 1)
+        # Per-asset PAA blocks: last target weights (cash-excluded slice of actions), shadow Sortino, shadow drawdown
+        last_target_weights_seq = self.actions[start_idx:end_idx+1, 1:1 + self.num_assets]
+        shadow_sortino_seq = self.shadow_sortino[start_idx:end_idx+1]
+        shadow_drawdown_seq = self.shadow_drawdown[start_idx:end_idx+1]
+
+        # Concatenate all features along last axis
+        features_seq = np.concatenate([
+            weights_seq,
+            alpha_seq,
+            sharpe_seq,
+            drawdown_seq,
+            volatility_seq,
+            turnover_seq,
+            eff_conc_seq,
+            prev_sortino_seq,
+            curr_sortino_seq,
+            running_mean_ema_seq,
+            downside_var_sqrt_seq,
+            prev_max_dd_seq,
+            rf_zscore_seq,
+            rf_daily_seq,
+            rf_daily_raw_seq,
+            last_target_weights_seq,
+            shadow_sortino_seq,
+            shadow_drawdown_seq,
+        ], axis=1)
+
+        # Place into output array (pad at beginning if needed)
+        if actual_window > 0:
+            obs[-actual_window:] = features_seq
+
+        return obs
+
+    def get_observation_at_step(self, external_step: int) -> np.ndarray:
+        """
+        Get portfolio observation at current step for non-sequence input.
+        Returns:
+            Flattened observation array for current step
+            Shape: (total_observation_size,)
+        """
+        # Set step depending on sequence provision
+        if self.maybe_provide_sequence:
+            internal_step = external_step + self.lookback_window
+        else: 
+            internal_step = external_step
+        # Extract features at the given step
+        weights = self.portfolio_weights[internal_step]
+        alpha = self.alpha[internal_step]
+        sharpe = self.sharpe_ratio[internal_step]
+        drawdown = self.drawdown[internal_step]
+        volatility = self.volatility[internal_step]
+        turnover = self.turnover[internal_step]
+        previous_sortino = self.previous_sortino[internal_step]
+        current_sortino = self.current_sortino[internal_step]
+        running_mean_ema = self.running_mean_ema[internal_step]
+        downside_var_sqrt = self.downside_var_sqrt[internal_step]
+        previous_max_drawdown = self.previous_max_drawdown[internal_step]
+        risk_free_rate_zscore_60d = self.risk_free_rate_zscore_60d[internal_step]
+        risk_free_rate_daily = self.risk_free_rate_daily[internal_step]
+        risk_free_rate_daily_raw = self.risk_free_rate_daily_raw[internal_step]
+
+        # rewards = self.allocator_rewards[internal_step] # Why feed reward.
+        effective_asset_concentration_norm = self.effective_asset_concentration_norm[internal_step]
+
+        # Per-asset PAA blocks: last target weights (cash-excluded slice of actions), shadow Sortino, shadow drawdown
+        last_target_weights = self.actions[internal_step, 1:1 + self.num_assets]
+        shadow_sortino = self.shadow_sortino[internal_step]
+        shadow_drawdown = self.shadow_drawdown[internal_step]
+
+        observation = np.concatenate([
+            weights,
+            [alpha, sharpe, drawdown, volatility, turnover, effective_asset_concentration_norm, previous_sortino, 
+            current_sortino, running_mean_ema, downside_var_sqrt, previous_max_drawdown, risk_free_rate_zscore_60d, risk_free_rate_daily,
+            risk_free_rate_daily_raw],
+            last_target_weights,
+            shadow_sortino,
+            shadow_drawdown,
+        ]).astype(np.float32)
+
+        return observation
+    
+    def ensure_capacity(self, required_buffer_size_days: int) -> None:
+        """
+        Grow the pre-allocated arrays if a longer episode is requested (e.g. a full validation
+        block). Never shrinks, so repeated episodes reuse the largest allocation seen so far.
+        """
+        required = int(required_buffer_size_days)
+        if required <= self.episode_buffer_length_days:
+            return
+        self.episode_buffer_length_days = required
+        self.__post_init__()
+
+    def reset_episode_buffer(self) -> None:
+        """
+        Reset buffer for new episode.
+        By default, reset every numpy array attribute to zero.
+        Preserve only arrays explicitly listed in excluded_arrays.
+        """
+        self.current_step = 0
+        self.episode_length = 0
+
+        # Keep this list short and explicit.
+        # Example: {"asset_prices"} if you want to preserve warm-up prices.
+        excluded_arrays = {
+            # "e.g. but not recommended: asset_prices",
+        }
+
+        for name, value in self.__dict__.items():
+            if name in excluded_arrays:
+                continue
+            if isinstance(value, np.ndarray):
+                value.fill(0.0)
+
+    def warmup_market_data(self, market_data_cache, episode_start_step: int):
+        """
+        Fill the first lookback_window entries with market close prices for warm-up.
+        All portfolio-related metrics remain zero. Uses absolute indices for correct alignment.
+        
+        Args:
+            market_data_cache: MarketDataCache instance for data access
+            episode_start_step: Absolute start index of the episode in the full dataset
+        """
+        if self.lookback_window <= 0:
+            return # No warmup needed
+        
+        for warmup_step in range(self.lookback_window):
+            abs_idx = episode_start_step - self.lookback_window + warmup_step
+            if 0 <= abs_idx < market_data_cache.num_days:
+                self.asset_prices[warmup_step] = market_data_cache.close_prices[abs_idx]
+            else:
+                self.asset_prices[warmup_step] = np.zeros(market_data_cache.num_assets, dtype=np.float32)
+
+
+@dataclass
+class DataBlock:
+    """Represents a continuous data block for time series splitting."""
+    block_id: str
+    block_type: str  # 'train', 'validation', or 'test'
+    start_date_idx: int  # Index in the full dataset
+    end_date_idx: int    # Index in the full dataset (exclusive)
+    start_date: str      # Human readable date
+    end_date: str        # Human readable date
+    num_days: int
+    max_episodes: int    # Maximum episodes possible in this block
+    min_start_step: int  # Minimum episode start step (accounting for lookback)
+    max_start_step: int  # Maximum episode start step
+
+
+@dataclass
+class MarketDataCache:
+    """
+    Cache for fast market data access during DRL training.
+    Resposible for splitting into train and validation set via splitting full data set into blocks
+    containing train and val set with a defined ratio.
+    
+    How to fill with data:
+    Load CSV as df with columns: Date,Symbol,Open,High,Low,Close,Volume,feature1,feature2,...
+    Then call MarketDataCache.from_dataframe(df, config, lookback_window)
+    """
+    # Core data arrays - full dataset cached
+    dates: np.ndarray                   # [num_days] - all trading dates
+    asset_names: List[str]              # Asset identifiers
+    selected_feature_names: List[str]   # Selected feature column names (from config)
+    available_feature_names: List[str]  # All available features in CSV
+    
+    # Market data arrays [num_days, num_assets]
+    open_prices: np.ndarray
+    high_prices: np.ndarray  
+    low_prices: np.ndarray
+    close_prices: np.ndarray            # Primary prices for valuation
+    volumes: np.ndarray
+    
+    # Pre-calculated features [num_days, num_assets, num_selected_features]
+    features: np.ndarray                # Only selected technical indicators, ratios, etc.
+
+    # Daily risk-free series aligned to the env trading dates.
+    effr_raw_pct: np.ndarray            # [num_days] Effective Federal Funds Rate in percent
+    risk_free_rate_pa: np.ndarray       # [num_days] annualized decimal risk-free rate
+    risk_free_rate_daily: np.ndarray    # [num_days] daily decimal carry derived from EFFR
+    risk_free_rate_zscore_60d: np.ndarray  # [num_days] rolling 60-day z-score of annualized risk-free rate
+    
+    # Fast lookup tables
+    date_to_index: Dict[str, int]       # Date -> array index mapping
+    asset_to_index: Dict[str, int]      # Asset -> array index mapping
+    feature_to_index: Dict[str, int]    # Selected feature -> array index mapping
+    
+    # Time series splitting infrastructure
+    train_blocks: List[DataBlock]       # Training data blocks
+    validation_blocks: List[DataBlock]  # Validation data blocks
+    test_blocks: List[DataBlock]        # Out-of-sample test blocks (held out at range end)
+    block_sampling_weights: Dict[str, np.ndarray]  # Sampling weights per block type
+
+    # Metadata
+    num_days: int
+    num_assets: int                     # Number of assets in the market, excluding cash
+    num_features: int                   # Number of selected features
+    num_available_features: int         # Total available features
+
+    # Training parameters (stored for block calculations)
+    episode_length_days: int
+    lookback_window: int
+    train_val_split_ratio: float
+    purge_length_days: int
+
+    # Settings
+    maybe_provide_sequence: bool
+    
+    @classmethod
+    def from_dataframe(cls, df: pd.DataFrame, config: Dict[str, Any], lookback_window: int,
+                       maybe_provide_sequence: bool) -> 'MarketDataCache':
+        """
+        Build cache from full dataset DataFrame efficiently with feature selection.
+        Handles df format: Date,Symbol,Open,High,Low,Close,Volume,feature1,feature2,...
+        
+        Args:
+            df: Full dataset with long format (multiple assets per date)
+            config: Configuration dictionary with feature selection
+            lookback_window: Minimum history needed for episodes
+        """
+        print(f"Caching market data: {df.shape[0]:,} records with {df.shape[1]} columns")
+
+        maybe_provide_sequence = maybe_provide_sequence
+
+        # Check for any NaNs in full dataset
+        if df.isnull().values.any():
+            num_nans = df.isnull().sum().sum()
+            raise ValueError(f"Input DataFrame contains {num_nans} NaN values. Please clean the data before proceeding.")
+        
+        # Verify that for each existing date, all assets have data
+        date_asset_counts = df.groupby('Date')['Symbol'].nunique()
+        expected_asset_count = df['Symbol'].nunique()
+        incomplete_dates = date_asset_counts[date_asset_counts < expected_asset_count]
+        if not incomplete_dates.empty:
+            raise ValueError(f"Incomplete data found for dates: {incomplete_dates.index.tolist()}") 
+        
+        # FIXED: Handle actual CSV column names (capitalized)
+        df = df.copy()
+        column_mapping = {
+            'Date': 'date',
+            'Symbol': 'symbol', 
+            'Open': 'open',
+            'High': 'high',
+            'Low': 'low',
+            'Close': 'close',
+            'Volume': 'volume'
+        }
+        df.rename(columns=column_mapping, inplace=True)
+        
+        # Convert date column to datetime if it's not already
+        if df['date'].dtype == 'object':
+            df['date'] = pd.to_datetime(df['date'])
+        # Normalize timestamps so date-key joins are exact and timezone/time-of-day agnostic.
+        df['date'] = pd.to_datetime(df['date']).dt.tz_localize(None).dt.normalize()
+
+        # Attach dynamic EFFR-derived risk-free series aligned to the exact dates in this dataset.
+        # This keeps alignment robust when some market dates are intentionally missing.
+        unique_dates = sorted(df['date'].unique())
+        rf_df = cls._build_risk_free_features(pd.DatetimeIndex(unique_dates))
+        rf_map_effr_raw_pct = rf_df['effr_raw_pct'].to_dict()
+        rf_map_pa = rf_df['risk_free_rate_pa'].to_dict()
+        rf_map_daily = rf_df['risk_free_rate_daily'].to_dict()
+        rf_map_z60 = rf_df['risk_free_rate_zscore_60d'].to_dict()
+
+        df['effr_raw_pct'] = df['date'].map(rf_map_effr_raw_pct)
+        df['risk_free_rate_pa'] = df['date'].map(rf_map_pa)
+        df['risk_free_rate_daily'] = df['date'].map(rf_map_daily)
+        df['risk_free_rate_zscore_60d'] = df['date'].map(rf_map_z60)
+        rf_cols = ['effr_raw_pct', 'risk_free_rate_pa', 'risk_free_rate_daily', 'risk_free_rate_zscore_60d']
+        if df[rf_cols].isnull().any().any():
+            bad_mask = df[rf_cols].isnull().any(axis=1)
+            missing_dates = sorted(df.loc[bad_mask, 'date'].dt.strftime('%Y-%m-%d').unique().tolist())
+            raise ValueError(
+                "Failed to map EFFR-derived risk-free features to all market rows. "
+                f"Missing dates (sample): {missing_dates[:10]}"
+            )
+        
+        # Extract unique dates and assets
+        unique_dates = sorted(df['date'].unique())
+        assets = sorted(df['symbol'].unique())
+        
+        # Get all available features (exclude raw date and OHLCV columns)
+        base_cols = {'date', 'symbol', 'open', 'high', 'low', 'close', 'volume'}
+        available_feature_cols = [col for col in df.columns if col not in base_cols]
+
+        
+        # Feature selection based on config
+        selected_features = cls._select_features_from_config(available_feature_cols, config)
+        
+        print(f"Found {len(assets)} assets: {assets}")
+        print(f"Available features: {len(available_feature_cols)} ({available_feature_cols[:5]}...)")
+        print(f"Selected features: {len(selected_features)} ({selected_features[:5]}...)")
+        print(f"Unused features: {set(available_feature_cols) - set(selected_features)}")
+        
+        # Create lookup tables
+        date_to_index = {date: i for i, date in enumerate(unique_dates)}
+        asset_to_index = {asset: i for i, asset in enumerate(assets)}
+        feature_to_index = {feat: i for i, feat in enumerate(selected_features)}
+        
+        num_days = len(unique_dates)
+        num_assets = len(assets)  
+        num_features = len(selected_features)
+        
+        print(f"Dimensions: {num_days:,} days × {num_assets} assets × {num_features} features")
+        print(f"Total data points: {num_days * num_assets * (5 + num_features):,}")
+        
+        # Pre-allocate arrays with NaN initialization
+        dtype = np.float32
+        open_prices = np.full((num_days, num_assets), np.nan, dtype=dtype)
+        high_prices = np.full((num_days, num_assets), np.nan, dtype=dtype)
+        low_prices = np.full((num_days, num_assets), np.nan, dtype=dtype)
+        close_prices = np.full((num_days, num_assets), np.nan, dtype=dtype)
+        volumes = np.full((num_days, num_assets), np.nan, dtype=dtype)
+        features = np.full((num_days, num_assets, num_features), np.nan, dtype=dtype)
+        
+        # Fill arrays efficiently
+        print("Filling price and feature arrays...")
+        for asset_idx, asset in enumerate(assets):
+            asset_data = df[df['symbol'] == asset].copy()
+            
+            if asset_data.empty:
+                print(f"Warning: No data found for asset {asset}")
+                continue
+                
+            asset_data = asset_data.sort_values('date')
+            
+            for _, row in asset_data.iterrows():
+                date_idx = date_to_index[row['date']]
+                
+                # Fill OHLCV data
+                open_prices[date_idx, asset_idx] = row['open']
+                high_prices[date_idx, asset_idx] = row['high'] 
+                low_prices[date_idx, asset_idx] = row['low']
+                close_prices[date_idx, asset_idx] = row['close']
+                volumes[date_idx, asset_idx] = row['volume']
+                
+                # Fill ONLY selected feature data
+                for feat_idx, feat_col in enumerate(selected_features):
+                    if feat_col in row and pd.notna(row[feat_col]):
+                        features[date_idx, asset_idx, feat_idx] = row[feat_col]
+        
+        print(f"Initial cache build complete. Memory usage: ~{cls._estimate_memory_mb(num_days, num_assets, num_features):.1f} MB")
+        # Validate data quality
+        nan_pct = np.isnan(close_prices).mean() * 100
+        features_nan_pct = np.isnan(features).mean() * 100
+        print(f"Data quality: {nan_pct:.2f}% NaN in prices, {features_nan_pct:.2f}% NaN in features")
+
+        # Build date-aligned risk-free arrays directly from the aligned series.
+        effr_raw_pct = np.array(
+            [float(rf_map_effr_raw_pct[pd.Timestamp(d)]) for d in unique_dates],
+            dtype=np.float32,
+        )
+        risk_free_rate_pa = np.array(
+            [float(rf_map_pa[pd.Timestamp(d)]) for d in unique_dates],
+            dtype=np.float32,
+        )
+        risk_free_rate_daily = np.array(
+            [float(rf_map_daily[pd.Timestamp(d)]) for d in unique_dates],
+            dtype=np.float32,
+        )
+        risk_free_rate_zscore_60d = np.array(
+            [float(rf_map_z60[pd.Timestamp(d)]) for d in unique_dates],
+            dtype=np.float32,
+        )
+
+
+        # Extract training parameters from config
+        episode_length_days = config['environment']['episode_length_days']
+        if 'train_val_split_ratio' in config['environment']:
+            train_val_split_ratio = float(config['environment']['train_val_split_ratio'])
+        elif 'test_val_split_ratio' in config['environment']:
+            # Backward compatibility for legacy config key.
+            train_val_split_ratio = float(config['environment']['test_val_split_ratio'])
+        else:
+            raise KeyError("Missing environment ratio key. Use 'train_val_split_ratio'.")
+        block_buffer_multiplier = config['environment']['block_buffer_multiplier']
+        purge_length_days = int(config['environment'].get('purge_length_days', 60))
+
+        # Create instance first, then add splitting
+        instance = cls(
+            dates=np.array([pd.Timestamp(d).strftime('%Y-%m-%d') for d in unique_dates]),
+            asset_names=assets,
+            selected_feature_names=selected_features,
+            available_feature_names=available_feature_cols,
+            open_prices=open_prices,
+            high_prices=high_prices,
+            low_prices=low_prices,
+            close_prices=close_prices,
+            volumes=volumes,
+            features=features,
+            effr_raw_pct=effr_raw_pct,
+            risk_free_rate_pa=risk_free_rate_pa,
+            risk_free_rate_daily=risk_free_rate_daily,
+            risk_free_rate_zscore_60d=risk_free_rate_zscore_60d,
+            date_to_index={pd.Timestamp(d).strftime('%Y-%m-%d'): i for i, d in enumerate(unique_dates)},
+            asset_to_index=asset_to_index,
+            feature_to_index=feature_to_index,
+            num_days=num_days,
+            num_assets=num_assets,
+            num_features=num_features,
+            num_available_features=len(available_feature_cols),
+            train_blocks=[],
+            validation_blocks=[],
+            test_blocks=[],
+            block_sampling_weights={'train': np.array([]), 'validation': np.array([]), 'test': np.array([])},
+            episode_length_days=episode_length_days,
+            lookback_window=lookback_window,
+            train_val_split_ratio=train_val_split_ratio,
+            purge_length_days=purge_length_days,
+            maybe_provide_sequence=maybe_provide_sequence
+        )
+        
+        # Create time series blocks
+        instance._create_time_series_blocks(block_buffer_multiplier, train_val_split_ratio)
+        
+        return instance
+
+    @staticmethod
+    def _build_risk_free_features(unique_dates: pd.DatetimeIndex) -> pd.DataFrame:
+        """
+        Fetch and align EFFR (FRED: DFF) to provided dates.
+
+                Alignment policy:
+                - Pull daily EFFR from FRED over an expanded date range that starts
+                    at least 60 days before the first required market date.
+        - Reindex to calendar days and forward-fill without limit up to the last needed date.
+        - If leading values remain NaN (rare), backfill once from first available observation.
+                - Compute rolling 60-day z-score on the full expanded timeline.
+                - Reindex the final series to exact dataset dates.
+        """
+        try:
+            web = importlib.import_module("pandas_datareader.data")
+        except ImportError as exc:
+            raise ImportError(
+                "pandas_datareader is required for dynamic EFFR fetching. "
+                "Install it with: pip install pandas_datareader"
+            ) from exc
+
+        if len(unique_dates) == 0:
+            raise ValueError("Cannot build risk-free features: unique_dates is empty.")
+
+        date_idx = pd.DatetimeIndex(pd.to_datetime(unique_dates)).tz_localize(None).normalize()
+        start_needed = date_idx.min()
+        end_needed = date_idx.max()
+
+        # Pull at least 60 prior days so rolling z-score is fully warmed from day 1
+        # of the market cache. Extra buffer helps with holidays/weekends/data gaps.
+        query_start = start_needed - pd.Timedelta(days=120)
+        query_end = end_needed
+
+        effr_df = web.DataReader('DFF', 'fred', query_start, query_end)
+        if effr_df.empty:
+            raise ValueError("FRED returned empty EFFR series for requested date range.")
+
+        effr_series = effr_df['DFF'].astype(float)
+        effr_series.index = pd.DatetimeIndex(effr_series.index).tz_localize(None).normalize()
+
+        full_calendar = pd.date_range(query_start, end_needed, freq='D')
+        effr_full = effr_series.reindex(full_calendar).ffill()
+        if effr_full.isna().any():
+            effr_full = effr_full.bfill()
+
+        effr_aligned = effr_full.reindex(date_idx)
+        if effr_aligned.isna().any():
+            missing_dates = [d.strftime('%Y-%m-%d') for d in effr_aligned.index[effr_aligned.isna()]]
+            raise ValueError(f"Failed to align EFFR for all required dates. Missing: {missing_dates[:10]}")
+
+        # Build annualized and daily rates on the full expanded timeline first.
+        risk_free_rate_pa_full = effr_full / 100.0
+        # Fed funds is conventionally an overnight annualized rate on ACT/360. Since we only have
+        # 252 trading days in a full year we divide by 252 to get correct yearly readings
+        risk_free_rate_daily_full = risk_free_rate_pa_full / 252.0
+
+        # Compute rolling z-score on the expanded timeline so the first cache day
+        # can use a proper 60-day history.
+        z_eps = 1e-8
+        rolling_mean_full = risk_free_rate_pa_full.rolling(window=60, min_periods=60).mean()
+        rolling_std_full = risk_free_rate_pa_full.rolling(window=60, min_periods=60).std(ddof=0)
+        z60_full = (risk_free_rate_pa_full - rolling_mean_full) / (rolling_std_full + z_eps)
+        z60_full = z60_full.replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=-3.0, upper=3.0)
+
+        # Align final series to the exact dataset dates.
+        risk_free_rate_pa = risk_free_rate_pa_full.reindex(date_idx)
+        risk_free_rate_daily = risk_free_rate_daily_full.reindex(date_idx)
+        z60 = z60_full.reindex(date_idx)
+
+        return pd.DataFrame(
+            {
+                'effr_raw_pct': effr_aligned.values,
+                'risk_free_rate_pa': risk_free_rate_pa.values,
+                'risk_free_rate_daily': risk_free_rate_daily.values,
+                'risk_free_rate_zscore_60d': z60.values,
+            },
+            index=date_idx,
+        )
+
+    def _create_time_series_blocks(self, block_buffer_multiplier, train_val_split_ratio):
+        """
+        Create purged train/validation cycles plus one end-of-range OOS test block.
+
+        Layout:
+        [train_00][purge][val_00][train_01][purge][val_01]...[purge][test_00]
+
+        Rules:
+        - Purge is applied between train and validation inside every cycle.
+        - No purge is inserted between a validation block and the following training block.
+        - A purge is always inserted between the final validation block and the test block.
+        - Test block is held out from the end of the available date range (OOS).
+        """
+        print("\n" + "="*60)
+        print("CREATING TIME SERIES BLOCKS")
+        print("="*60)
+        
+        # Calculate minimum viable block sizes for train/validation slices.
+        if self.maybe_provide_sequence:
+            min_episode_requirement = self.lookback_window + self.episode_length_days
+        else: 
+            min_episode_requirement = self.episode_length_days
+        min_viable_train_block = int(min_episode_requirement * block_buffer_multiplier)
+
+        # Minimum viable block size for validation
+        min_viable_val_block = int(min_episode_requirement)
+        purge_days = int(max(0, self.purge_length_days))
+
+        if train_val_split_ratio <= 0.0 or train_val_split_ratio >= 1.0:
+            raise ValueError("train_val_split_ratio must be in (0, 1).")
+
+        # Compute minimum viable super-block size (train+validation, excluding purge)
+        # so the ratio is feasible while satisfying both minimum block constraints.
+        min_super_for_val = min_viable_val_block / train_val_split_ratio
+        min_super_for_train = min_viable_train_block / (1.0 - train_val_split_ratio)
+        min_super_block_days = int(np.ceil(max(min_super_for_val, min_super_for_train)))
+        min_cycle_days = int(min_super_block_days + purge_days)
+
+        # End-of-range OOS test size: default equals base validation size unless overridden.
+        default_test_days = int(min_viable_val_block)
+        test_days_cfg = default_test_days
+        test_days = int(max(min_viable_val_block, test_days_cfg))
+        holdout_tail_days = int(purge_days + test_days)
+
+
+        print(f"Episode requirements:")
+        print(f"  Lookback window: {self.lookback_window} days")
+        print(f"  Episode length: {self.episode_length_days} days")
+        print(f"  Min episode requirement: {min_episode_requirement} days")
+        print(f"  Buffer multiplier: {block_buffer_multiplier}x")
+        print(f"  Min viable train block: {min_viable_train_block} days")
+        print(f"  Min viable validation block: {min_viable_val_block} days")
+        print(f"  Min super-block for validation feasibility: {min_super_for_val:.0f} days")
+        print(f"  Min super-block for training feasibility: {min_super_for_train:.0f} days")
+        print(f"  Chosen minimum super-block size: {min_super_block_days} days")
+        print(f"  Purge length (config): {purge_days} days")
+        print(f"  Minimum train+purge+validation cycle size: {min_cycle_days} days")
+        print(f"  OOS test days at range end: {test_days}")
+        print(f"  Tail holdout (purge+test): {holdout_tail_days} days")
+        print(f"  Total available days: {self.num_days:,}")
+        print(f"  Target validation ratio (train_val_split_ratio): {self.train_val_split_ratio:.1%}")
+
+        available_for_cycles = int(self.num_days - holdout_tail_days)
+        if available_for_cycles <= 0:
+            raise ValueError(
+                "Insufficient data after reserving purge+test holdout. "
+                f"Need > {holdout_tail_days} days, have {self.num_days}."
+            )
+
+        possible_cycle_count = int(available_for_cycles // min_cycle_days)
+        if possible_cycle_count < 1:
+            raise ValueError(
+                "Insufficient data for even one train/purge/validation cycle. "
+                f"Required cycle size: {min_cycle_days}, available for cycles: {available_for_cycles}."
+            )
+
+        print(f"  Available days for train/val cycles: {available_for_cycles}")
+        print(f"  Possible full train/purge/val cycles: {possible_cycle_count}")
+
+        # Reset lists in case this method is called repeatedly.
+        self.train_blocks = []
+        self.validation_blocks = []
+        self.test_blocks = []
+
+        def _build_block(block_id: str, block_type: str, start_idx: int, end_idx: int) -> DataBlock:
+            num_days = int(max(0, end_idx - start_idx))
+            if self.maybe_provide_sequence:
+                min_start_step = int(start_idx + self.lookback_window)
+            else:
+                min_start_step = int(start_idx)
+            max_start_step = int(end_idx - self.episode_length_days)
+            max_consecutive_episodes = int(max(0, (end_idx - min_start_step) // self.episode_length_days))
+            end_for_label = max(start_idx, end_idx - 1)
+            return DataBlock(
+                block_id=block_id,
+                block_type=block_type,
+                start_date_idx=int(start_idx),
+                end_date_idx=int(end_idx),
+                start_date=self.dates[start_idx],
+                end_date=self.dates[end_for_label],
+                num_days=num_days,
+                max_episodes=max_consecutive_episodes,
+                min_start_step=min_start_step,
+                max_start_step=max_start_step,
+            )
+
+        # Keep all super-blocks as equal as possible.
+        # We reserve one purge per cycle and split the remaining non-purge days nearly evenly.
+        total_purge_days = int(possible_cycle_count * purge_days)
+        total_super_days = int(available_for_cycles - total_purge_days)
+        if total_super_days < possible_cycle_count * min_super_block_days:
+            raise ValueError(
+                "Insufficient non-purge days to satisfy minimum super-block size constraints. "
+                f"Need at least {possible_cycle_count * min_super_block_days}, got {total_super_days}."
+            )
+
+        super_base = int(total_super_days // possible_cycle_count)
+        super_remainder = int(total_super_days % possible_cycle_count)
+        super_sizes = [
+            int(super_base + (1 if i < super_remainder else 0))
+            for i in range(possible_cycle_count)
+        ]
+
+        # Allocate validation days per cycle so global validation share over
+        # non-test train/validation subset matches target as closely as possible.
+        target_total_val = int(round(train_val_split_ratio * total_super_days))
+        min_total_val = int(possible_cycle_count * min_viable_val_block)
+        max_total_val = int(sum(s - min_viable_train_block for s in super_sizes))
+        target_total_val = int(np.clip(target_total_val, min_total_val, max_total_val))
+
+        val_sizes = []
+        for s in super_sizes:
+            v = int(round(train_val_split_ratio * s))
+            v = int(np.clip(v, min_viable_val_block, s - min_viable_train_block))
+            val_sizes.append(v)
+
+        current_total_val = int(sum(val_sizes))
+        delta = int(target_total_val - current_total_val)
+
+        if delta > 0:
+            idx_order = np.argsort([-s for s in super_sizes]).tolist()
+            while delta > 0:
+                progressed = False
+                for idx in idx_order:
+                    max_v = super_sizes[idx] - min_viable_train_block
+                    if val_sizes[idx] < max_v:
+                        val_sizes[idx] += 1
+                        delta -= 1
+                        progressed = True
+                        if delta == 0:
+                            break
+                if not progressed:
+                    break
+        elif delta < 0:
+            idx_order = np.argsort(super_sizes).tolist()
+            while delta < 0:
+                progressed = False
+                for idx in idx_order:
+                    min_v = min_viable_val_block
+                    if val_sizes[idx] > min_v:
+                        val_sizes[idx] -= 1
+                        delta += 1
+                        progressed = True
+                        if delta == 0:
+                            break
+                if not progressed:
+                    break
+
+        train_sizes = [int(s - v) for s, v in zip(super_sizes, val_sizes)]
+
+        achieved_total_val = int(sum(val_sizes))
+        achieved_ratio = (achieved_total_val / total_super_days) if total_super_days > 0 else 0.0
+        print(f"  Total super-block days (train+validation, no purge): {total_super_days}")
+        print(f"  Achieved validation share over super-block subset: {achieved_ratio:.2%}")
+
+        cursor = 0
+        for cycle_idx in range(possible_cycle_count):
+            train_days = train_sizes[cycle_idx]
+            val_days = val_sizes[cycle_idx]
+            train_start_idx = int(cursor)
+            train_end_idx = int(train_start_idx + train_days)
+            purge_start_idx = int(train_end_idx)
+            purge_end_idx = int(purge_start_idx + purge_days)
+            val_start_idx = int(purge_end_idx)
+            val_end_idx = int(val_start_idx + val_days)
+
+            train_block = _build_block(
+                block_id=f"train_{cycle_idx:02d}",
+                block_type='train',
+                start_idx=train_start_idx,
+                end_idx=train_end_idx,
+            )
+            val_block = _build_block(
+                block_id=f"val_{cycle_idx:02d}",
+                block_type='validation',
+                start_idx=val_start_idx,
+                end_idx=val_end_idx,
+            )
+
+            self.train_blocks.append(train_block)
+            self.validation_blocks.append(val_block)
+
+            print(f"\nCycle {cycle_idx + 1}:")
+            print(f"  Training block: {train_block.block_id}")
+            print(f"    Date range: {train_block.start_date} to {train_block.end_date}")
+            print(f"    Days: {train_block.num_days:,}")
+            print(f"    Episodes: {train_block.max_episodes:,}")
+            print(f"    Episode start range: [{train_block.min_start_step}, {train_block.max_start_step}]")
+            print(f"    Super-block size (train+val): {train_days + val_days}")
+
+            print(f"  Purge window: train->{val_block.block_id}")
+            if purge_days > 0:
+                print(f"    Index range: [{purge_start_idx}, {purge_end_idx - 1}] ({purge_days} days)")
+                print(f"    Date range: {self.dates[purge_start_idx]} to {self.dates[purge_end_idx - 1]}")
+            else:
+                print("    Disabled (0 days)")
+
+            print(f"  Validation block: {val_block.block_id}")
+            print(f"    Date range: {val_block.start_date} to {val_block.end_date}")
+            print(f"    Days: {val_block.num_days:,}")
+            print(f"    Episodes: {val_block.max_episodes:,}")
+            print(f"    Episode start range: [{val_block.min_start_step}, {val_block.max_start_step}]")
+
+            cursor = val_end_idx
+
+        # End-of-range OOS holdout: purge then test block.
+        final_purge_start_idx = int(cursor)
+        final_purge_end_idx = int(final_purge_start_idx + purge_days)
+        test_start_idx = int(final_purge_end_idx)
+        test_end_idx = int(self.num_days)
+
+        if test_end_idx <= test_start_idx:
+            raise ValueError(
+                "Computed empty test block. Increase dataset length or reduce holdout settings."
+            )
+
+        test_block = _build_block(
+            block_id="test_00",
+            block_type='test',
+            start_idx=test_start_idx,
+            end_idx=test_end_idx,
+        )
+        self.test_blocks.append(test_block)
+
+        print("\nFinal OOS holdout:")
+        print("  Purge window: last_validation->test_00")
+        if purge_days > 0:
+            print(f"    Index range: [{final_purge_start_idx}, {final_purge_end_idx - 1}] ({purge_days} days)")
+            print(f"    Date range: {self.dates[final_purge_start_idx]} to {self.dates[final_purge_end_idx - 1]}")
+        else:
+            print("    Disabled (0 days)")
+        print(f"  Test block: {test_block.block_id}")
+        print(f"    Date range: {test_block.start_date} to {test_block.end_date}")
+        print(f"    Days: {test_block.num_days:,}")
+        print(f"    Episodes: {test_block.max_episodes:,}")
+        print(f"    Episode start range: [{test_block.min_start_step}, {test_block.max_start_step}]")
+        
+        # Calculate and store sampling weights
+        self._calculate_sampling_weights()
+        
+        # Print summary
+        total_train_episodes = sum(block.max_episodes for block in self.train_blocks)
+        total_val_episodes = sum(block.max_episodes for block in self.validation_blocks)
+        total_test_episodes = sum(block.max_episodes for block in self.test_blocks)
+        
+        print("\n" + "="*60)
+        print("TIME SERIES SPLITTING COMPLETE")
+        print("="*60)
+        print(f"Training blocks: {len(self.train_blocks)}")
+        print(f"Validation blocks: {len(self.validation_blocks)}")
+        print(f"Test blocks: {len(self.test_blocks)}")
+        print(f"Total training episodes: {total_train_episodes:,}")
+        print(f"Total validation episodes: {total_val_episodes:,}")
+        print(f"Total test episodes: {total_test_episodes:,}")
+        if (total_train_episodes + total_val_episodes) > 0:
+            print(f"Actual validation ratio: {total_val_episodes/(total_train_episodes + total_val_episodes):.1%}")
+        else:
+            print("Actual validation ratio: n/a (no train/validation episodes)")
+        print("="*60)
+
+    def _calculate_sampling_weights(self):
+        """Calculate sampling weights for blocks based on available days within each block."""
+        # Training weights
+        if self.train_blocks:
+            train_days = np.array([block.num_days for block in self.train_blocks], dtype=np.float32)
+            if train_days.sum() > 0:
+                train_weights = train_days / train_days.sum()
+            else:
+                train_weights = np.ones(len(self.train_blocks), dtype=np.float32) / len(self.train_blocks)
+        else:
+            train_weights = np.array([], dtype=np.float32)
+        
+        # Validation weights
+        if self.validation_blocks:
+            val_days = np.array([block.num_days for block in self.validation_blocks], dtype=np.float32)
+            if val_days.sum() > 0:
+                val_weights = val_days / val_days.sum()
+            else:
+                val_weights = np.ones(len(self.validation_blocks), dtype=np.float32) / len(self.validation_blocks)
+        else:
+            val_weights = np.array([], dtype=np.float32)
+
+        # Test weights
+        if self.test_blocks:
+            test_days = np.array([block.num_days for block in self.test_blocks], dtype=np.float32)
+            if test_days.sum() > 0:
+                test_weights = test_days / test_days.sum()
+            else:
+                test_weights = np.ones(len(self.test_blocks), dtype=np.float32) / len(self.test_blocks)
+        else:
+            test_weights = np.array([], dtype=np.float32)
+        
+        self.block_sampling_weights = {
+            'train': train_weights,
+            'validation': val_weights,
+            'test': test_weights,
+        }
+        
+        print(f"\nSampling weights calculated:")
+        print(f"  Training weights: {train_weights}")
+        print(f"  Validation weights: {val_weights}")
+        print(f"  Test weights: {test_weights}")
+    
+    @staticmethod
+    def _select_features_from_config(available_features: List[str], config: Dict[str, Any]) -> List[str]:
+        """
+        Select features based on configuration settings.
+        Supports the new config sections: ``saa_features``, ``paa_asset_token_features``,
+        and ``paa_portfolio_token_features``. The legacy ``features`` key is not accepted.
+        
+        Args:
+            available_features: List of all available feature names from CSV
+            config: Configuration dict with feature sections
+            
+        Returns:
+            List of selected feature names (no duplicates)
+        """
+        feature_keys = [
+            "saa_features",
+            "paa_asset_token_features",
+            "paa_portfolio_token_features",
+        ]
+
+        if "features" in config:
+            raise ValueError(
+                "Config key 'features' is deprecated. Use 'saa_features', "
+                "'paa_asset_token_features', or 'paa_portfolio_token_features' instead."
+            )
+
+        feature_sections: Dict[str, Dict[str, Any]] = {}
+        for key in feature_keys:
+            section = config.get(key, {}) or {}
+            if not isinstance(section, dict):
+                raise ValueError(f"Config section '{key}' must be a mapping of feature flags.")
+            feature_sections[key] = section
+
+        # Detect duplicate feature definitions across sections
+        # Note: Duplicates in the config feature keys are allowed for sorting/filtering operations later!
+        # We just need to ensure each unique feature is loaded only once
+        feature_origin: Dict[str, str] = {}
+        duplicates_found: Dict[str, list] = {}
+        
+        for section_name, section in feature_sections.items():
+            for feat_name in section:
+                if feat_name in feature_origin:
+                    # Track which sections define the same feature
+                    if feat_name not in duplicates_found:
+                        duplicates_found[feat_name] = [feature_origin[feat_name]]
+                    if section_name not in duplicates_found[feat_name]:
+                        duplicates_found[feat_name].append(section_name)
+                else:
+                    feature_origin[feat_name] = section_name
+        
+        # Inform user about duplicates but don't raise error
+        if duplicates_found:
+            print("\nWarning: The following features are defined in multiple config sections:")
+            for feat_name, sections in duplicates_found.items():
+                print(f"  '{feat_name}' found in: {', '.join(sections)}")
+                print("Each feature will be loaded only once to avoid redundant data loading.\n")
+
+        if all(len(section) == 0 for section in feature_sections.values()):
+            raise ValueError(
+                "No features specified in config sections. Please enable at least one feature in "
+                "'saa_features', 'paa_asset_token_features', or 'paa_portfolio_token_features'."    
+            )
+
+        # Flatten enabled flags while preserving the available_features order below
+        combined_flags: Dict[str, bool] = {}
+        for section in feature_sections.values():
+            for feat_name, enabled in section.items():
+                combined_flags[feat_name] = combined_flags.get(feat_name, False) or bool(enabled)
+
+        # Warn only when a feature is explicitly enabled in config but absent in data.
+        missing_requested = sorted(
+            feat_name
+            for feat_name, enabled in combined_flags.items()
+            if enabled and feat_name not in available_features
+        )
+        if missing_requested:
+            raise ValueError(
+                "The following enabled features are missing in the loaded market data: "
+                f"{missing_requested}"
+            )
+
+        selected_features: List[str] = [
+            feature_name
+            for feature_name in available_features
+            if bool(combined_flags.get(feature_name, False))
+        ]
+        
+        if not selected_features:
+            raise ValueError("No features selected. Please enable at least one feature in the config sections.")
+        
+        return selected_features
+    
+    # NEW: LSTM-optimized observation functions
+    def get_OHLCV_lookback(self, absolute_current_step: int, lookback_window: int) -> np.ndarray:
+        """
+        Get OHLCV data for lookback window optimized for LSTM input.
+        
+        Args:
+            current_step: Current step index (0-based from episode start)
+            lookback_window: Number of days to look back
+            
+        Returns:
+            np.ndarray with shape [lookback_window, num_assets, 5] (OHLCV)
+            If insufficient history, pads with zeros at the beginning
+        """
+        # Calculate actual date indices
+        end_step = absolute_current_step  # Current step (exclusive)
+        start_step = max(0, end_step - lookback_window)
+        
+        # Check bounds
+        if end_step >= self.num_days or end_step < 0:
+            return np.zeros((lookback_window, self.num_assets, 5), dtype=np.float32)
+        
+        # Get the actual window length available
+        actual_window = end_step - start_step
+        
+        # Create output array
+        ohlcv_window = np.zeros((lookback_window, self.num_assets, 5), dtype=np.float32)
+        
+        if actual_window > 0:
+            # Extract OHLCV data
+            ohlc_data = np.stack([
+                self.open_prices[start_step:end_step],
+                self.high_prices[start_step:end_step], 
+                self.low_prices[start_step:end_step],
+                self.close_prices[start_step:end_step],
+                self.volumes[start_step:end_step]
+            ], axis=-1)  # Shape: [actual_window, num_assets, 5]
+            
+            # Place in output array (pad at beginning if needed)
+            padding_needed = lookback_window - actual_window
+            ohlcv_window[padding_needed:] = ohlc_data
+        
+        return ohlcv_window
+    
+    def get_features_lookback(self, absolute_current_step: int, lookback_window: int) -> np.ndarray:
+        """
+        Get feature data for lookback window optimized for LSTM input.
+        
+        Args:
+            current_step: Current step index (0-based from episode start)
+            lookback_window: Number of days to look back
+            
+        Returns:
+            np.ndarray with shape [lookback_window, num_assets, num_features]
+            If insufficient history, pads with zeros at the beginning
+        """
+        # Calculate actual date indices  
+        end_step = absolute_current_step  # Current step (exclusive)
+        start_step = max(0, end_step - lookback_window)
+        
+        # Check bounds
+        if end_step >= self.num_days or end_step < 0:
+            return np.zeros((lookback_window, self.num_assets, self.num_features), dtype=np.float32)
+        
+        # Get the actual window length available
+        actual_window = end_step - start_step
+        
+        # Create output array
+        features_window = np.zeros((lookback_window, self.num_assets, self.num_features), dtype=np.float32)
+        
+        if actual_window > 0:
+            # Extract feature data
+            feature_data = self.features[start_step:end_step]  # Shape: [actual_window, num_assets, num_features]
+            
+            # Place in output array (pad at beginning if needed)
+            padding_needed = lookback_window - actual_window
+            features_window[padding_needed:] = feature_data
+        
+        return features_window
+    
+    # EXISTING: Keep the step-based functions
+    def get_OHLCV_at_step(self, step_idx: int) -> Dict[str, np.ndarray]:
+        """
+        Get all asset OHLCV for a specific step efficiently.
+        
+        Returns:
+            Dict with arrays: open, high, low, close, volume for all assets
+        """
+        if step_idx < 0 or step_idx >= self.num_days:
+            raise ValueError(f"Step index {step_idx} out of range [0, {self.num_days})")
+        
+        return {
+            'open': self.open_prices[step_idx],
+            'high': self.high_prices[step_idx], 
+            'low': self.low_prices[step_idx],
+            'close': self.close_prices[step_idx],
+            'volume': self.volumes[step_idx],
+            'date': self.dates[step_idx]
+        }
+    
+    def get_features_at_step(self, step_idx: int) -> np.ndarray:
+        """Get all features for all assets at a specific step."""
+        if step_idx < 0 or step_idx >= self.num_days:
+            return np.zeros((self.num_assets, self.num_features), dtype=np.float32)
+        
+        return self.features[step_idx]
+    
+    # NEW: Utility functions
+    def get_selected_feature_names(self) -> List[str]:
+        """Get list of selected feature names."""
+        return self.selected_feature_names.copy()
+    
+    def get_available_feature_names(self) -> List[str]:
+        """Get list of all available feature names."""
+        return self.available_feature_names.copy()
+    
+    def get_feature_selection_summary(self) -> Dict[str, Any]:
+        """Get summary of feature selection."""
+        return {
+            'total_available': self.num_available_features,
+            'selected': self.num_features,
+            'selection_ratio': self.num_features / self.num_available_features,
+            'selected_features': self.selected_feature_names,
+            'excluded_features': [f for f in self.available_feature_names if f not in self.selected_feature_names]
+        }
+    
+    @staticmethod
+    def _estimate_memory_mb(num_days: int, num_assets: int, num_features: int) -> float:
+        """Estimate memory usage in MB for selected features only."""
+        arrays_memory = (
+            num_days * num_assets * 5 +  # OHLCV arrays
+            num_days * num_assets * num_features  # Selected features array only
+        ) * 4  # 4 bytes per float32
+        
+        return arrays_memory / (1024 * 1024)
+
+    def validate_data_quality(self) -> Dict[str, Any]:
+        """Validate cached data quality and return statistics."""
+        close_nan_pct = np.isnan(self.close_prices).mean() * 100
+        features_nan_pct = np.isnan(self.features).mean() * 100
+        volume_zero_pct = (self.volumes == 0).mean() * 100
+        
+        # Check for missing data by asset
+        asset_completeness = {}
+        for i, asset in enumerate(self.asset_names):
+            asset_close_data = self.close_prices[:, i]
+            completeness = (~np.isnan(asset_close_data)).mean() * 100
+            asset_completeness[asset] = completeness
+        
+        return {
+            'close_prices_nan_pct': close_nan_pct,
+            'features_nan_pct': features_nan_pct,
+            'volume_zero_pct': volume_zero_pct,
+            'date_range': (str(self.dates[0]), str(self.dates[-1])),
+            'total_memory_mb': self._estimate_memory_mb(self.num_days, self.num_assets, self.num_features),
+            'asset_completeness': asset_completeness,
+            'min_completeness': min(asset_completeness.values()) if asset_completeness else 0.0,
+            'assets_with_gaps': [asset for asset, comp in asset_completeness.items() if comp < 95.0],
+            'feature_selection': self.get_feature_selection_summary()
+        }
+
+    def get_risk_free_rate_daily_at_step(self, step_idx: int) -> float:
+        """Get date-aligned daily risk-free carry for a given absolute step."""
+        if step_idx < 0:
+            step_idx = 0
+        elif step_idx >= self.num_days:
+            step_idx = self.num_days - 1
+        return float(self.risk_free_rate_daily[step_idx])
+
+    def get_risk_free_rate_pa_at_step(self, step_idx: int) -> float:
+        """Get date-aligned annualized decimal risk-free rate (e.g. 0.0525 for an EFFR of 5.25%)."""
+        if step_idx < 0:
+            step_idx = 0
+        elif step_idx >= self.num_days:
+            step_idx = self.num_days - 1
+        return float(self.risk_free_rate_pa[step_idx])
+
+    def get_log_risk_free_rate_daily_at_step(self, step_idx: int) -> float:
+        """Get daily log risk-free rate from EFFR for a given absolute step."""
+        if step_idx < 0:
+            step_idx = 0
+        elif step_idx >= self.num_days:
+            step_idx = self.num_days - 1
+        effr_pa = float(self.effr_raw_pct[step_idx]) / 100.0
+        # Convert annualized EFFR to a daily log rate for return-space subtraction.
+        return float(np.log1p(max(effr_pa / 252.0, -0.999999)))
+
+    def get_asset_excess_log_return_over_rf_at_step(self, step_idx: int, asset_idx: int) -> float:
+        """Get asset log return minus daily log risk-free rate for one asset at a given step."""
+        if asset_idx < 0 or asset_idx >= self.num_assets:
+            raise IndexError(f"Asset index {asset_idx} out of bounds [0, {self.num_assets - 1}]")
+        if step_idx <= 0:
+            return 0.0
+        if step_idx >= self.num_days:
+            step_idx = self.num_days - 1
+
+        prev_idx = step_idx - 1
+        px_now = float(self.close_prices[step_idx, asset_idx])
+        px_prev = float(self.close_prices[prev_idx, asset_idx])
+        if px_now <= 0.0 or px_prev <= 0.0:
+            return 0.0
+
+        asset_log_return = float(np.log(px_now) - np.log(px_prev))
+        rf_daily_log = self.get_log_risk_free_rate_daily_at_step(step_idx)
+        return float(asset_log_return - rf_daily_log)
+
+    def get_all_assets_excess_log_return_over_rf_at_step(self, step_idx: int) -> np.ndarray:
+        """Vectorized asset log returns minus daily log risk-free rate for all assets at a given step."""
+        if step_idx <= 0:
+            return np.zeros(self.num_assets, dtype=np.float32)
+        if step_idx >= self.num_days:
+            step_idx = self.num_days - 1
+
+        prev_idx = step_idx - 1
+        px_now = self.close_prices[step_idx]
+        px_prev = self.close_prices[prev_idx]
+        valid = (px_now > 0.0) & (px_prev > 0.0)
+        asset_log_returns = np.zeros(self.num_assets, dtype=np.float32)
+        asset_log_returns[valid] = (np.log(px_now[valid]) - np.log(px_prev[valid])).astype(np.float32)
+
+        rf_daily_log = np.float32(self.get_log_risk_free_rate_daily_at_step(step_idx))
+        excess = asset_log_returns - rf_daily_log
+        return np.nan_to_num(excess, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+    def get_risk_free_rate_zscore_at_step(self, step_idx: int) -> float:
+        """Get date-aligned 60-day z-score of the annualized risk-free rate for a given absolute step."""
+        if step_idx < 0:
+            step_idx = 0
+        elif step_idx >= self.num_days:
+            step_idx = self.num_days - 1
+        return float(self.risk_free_rate_zscore_60d[step_idx])
+    
+    def sample_episode_start(self, mode: str = 'train', random_seed: Optional[int] = None) -> Tuple[str, int]:
+        """
+        Sample a random episode start from appropriate blocks.
+        
+        Args:
+            mode: 'train', 'validation', or 'test'
+            random_seed: Optional random seed for reproducibility
+            
+        Returns:
+            Tuple of (block_id, absolute_start_step)
+        """
+        rng = np.random.default_rng(random_seed) if random_seed is not None else np.random.default_rng()
+        
+        if mode == 'train':
+            blocks = self.train_blocks
+        elif mode == 'validation':
+            blocks = self.validation_blocks
+        elif mode == 'test':
+            blocks = self.test_blocks
+        else:
+            raise ValueError(f"Invalid mode '{mode}'. Expected one of: train, validation, test")
+
+        weights = self.block_sampling_weights.get(mode, np.array([], dtype=np.float32))
+        
+        if len(blocks) == 0:
+            raise ValueError(f"No {mode} blocks available")
+        
+        if len(weights) == 0 or weights.sum() == 0:
+            raise ValueError(f"Invalid sampling weights for {mode} blocks")
+        
+        # Sample block based on weights
+        block_idx = rng.choice(len(blocks), p=weights)
+        selected_block = blocks[block_idx]
+        
+        # Sample start step within selected block
+        if selected_block.max_start_step <= selected_block.min_start_step:
+            start_step = rng.integers(selected_block.min_start_step, selected_block.min_start_step + 1)
+        else:
+            start_step = rng.integers(
+                selected_block.min_start_step, 
+                selected_block.max_start_step + 1
+            )
+        
+        return selected_block.block_id, start_step
+    
+
+@dataclass
+class TrainingMetrics:
+    """Collect metrics across training episodes for monitoring"""
+
+    # Pre-allocated circular buffers
+    buffer_size: int
+    
+    episode_returns: np.ndarray         # [buffer_size] - total episode returns
+    episode_rewards: np.ndarray         # [buffer_size] - total RL rewards  
+    episode_sharpe: np.ndarray          # [buffer_size] - episode Sharpe ratios
+    episode_max_dd: np.ndarray          # [buffer_size] - max drawdowns
+    episode_turnover: np.ndarray        # [buffer_size] - portfolio turnover rates
+    episode_costs: np.ndarray           # [buffer_size] - total transaction costs
+    final_portfolio_values: np.ndarray  # [buffer_size] - final portfolio values
+
+
+@dataclass 
+class ExecutionResult:
+    """Lightweight trade execution result tracking. Serves as a kind of blotter"""
+    current_step: int
+    trades_executed: np.ndarray         # [num_assets] - number of shares traded per asset
+    executed_prices: np.ndarray         # [num_assets] - prices at which trades were executed
+    transaction_cost: float             # Total transaction cost incurred in execution step
+    success: bool                       # Whether execution was successful
+    traded_dollar_value: float  # Total dollar value traded in this step
+    traded_shares_total: float
+    traded_notional_per_asset: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))  # [num_assets] - dollar value traded per asset
+
+
+class TradingEnv(gym.Env):
+    """
+    Main Gym environment class for (multi-)asset trading optimized for DRL.
+    
+    Key Features:
+    - Supports multiple execution modes (simple, tranche, portfolio)
+    - Realistic trading constraints and costs
+    - Efficient state representation for neural networks
+    - Proper reward shaping for stable PPO training
+    """
+
+    metadata = {'render.modes': ['human']}
+    
+    def __init__(self, config: Dict[str, Any], market_data_cache: MarketDataCache,
+    mode: str = 'train'):
+        """
+        Initialize trading environment with configuration and pre-built market data cache.
+        
+        Args:
+            config: Configuration dictionary with environment parameters
+            market_data_cache: Pre-built MarketDataCache instance with time series blocks
+            mode: 'train', 'validation', or 'test' - determines which blocks to sample from
+        """
+        super(TradingEnv, self).__init__()
+        
+        # Configuration parameters
+        self.episode_length_days = config["environment"]["episode_length_days"]
+        self.max_reward_risk_window = int(min(self.episode_length_days // 2, 63))
+        self.lookback_window = config["environment"]["lookback_window"]
+        self.initial_portfolio_value = config["environment"]["initial_portfolio_value"]
+        self.early_stopping_threshold = config["environment"]["early_stopping_threshold"]
+        #self.cash_drag_rate_pa = config["environment"]["cash_drag_rate_pa"]
+        
+        self.seed = config["environment"]["seed"]
+        # Execution parameters
+        self.execution_weight_change_threshold = config["environment"]["execution_weight_change_threshold"]
+        self.execution_min_trade_value_threshold = config["environment"]["execution_min_trade_value_threshold"]
+        self.execution_min_days_between_trades = config["environment"]["execution_min_days_between_trades"]              # e.g., 0.0005
+        self.maybe_provide_sequence = config['environment']['maybe_provide_sequence']  # Whether to provide sequence data in observations
+        self.log_sortino_net_reward_mix = config["environment"]["log_sortino_net_reward_mix"]
+        self.lambda_drawdown = config["environment"]["lambda_drawdown"]
+        # Portfolio concentration control coefficient used in allocator reward.
+        # Applied to normalized executed weights as:
+        # -lambda_spread * sum_i(w_i * log(w_i + 1e-8)).
+        self.lambda_spread = float(config["environment"].get("lambda_spread", 0.0))
+        self.lambda_transaction_cost = float(config["environment"].get("lambda_transaction_cost", 0.0))
+        self.action_forgiveness_width_sigma = config["environment"].get("action_forgiveness_width_sigma", None)  # Width of forgiveness zone in terms of action space std dev
+        self.action_hold_reward_weight_omega = config["environment"].get("action_hold_reward_weight_omega", None)  # Weight for holding action reward
+        self.lambda_execution_gap = config["environment"].get("lambda_execution_gap", None)  # Penalty coefficient for execution gap (difference between target and executed weights)
+        self.saa_realized_exit_bonus_coeff = float(config["environment"].get("saa_realized_exit_bonus_coeff", 8.0))
+        # SAA reward scaling knobs (kept in config for easy objective tuning)
+        self.saa_excess_log_return_scale = float(config["environment"].get("saa_excess_log_return_scale", 30.0))
+        self.saa_log_diff_sortino_scale = float(config["environment"].get("saa_log_diff_sortino_scale", 10.0))
+        self.saa_linear_sortino_net_reward_scale = float(config["environment"].get("saa_linear_sortino_net_reward_scale", 10.0))
+        self.saa_drawdown_level_penalty_coeff = float(config["environment"].get("saa_drawdown_level_penalty_coeff", 0.015))
+        self.saa_reward_tanh_divisor = float(config["environment"].get("saa_reward_tanh_divisor", 5.0))
+        self.saa_reward_tanh_scale = float(config["environment"].get("saa_reward_tanh_scale", 5.0))
+        self.saa_sortino_warmup_steps = int(config["environment"].get("saa_sortino_warmup_steps", 10))
+        self.saa_min_trade_value_floor = float(config["environment"].get("saa_min_trade_value_floor", 50.0))
+
+        # PAA (portfolio allocator) reward knobs - same methodology as the SAA reward
+        # (calculate_saa_step_reward), refitted to the multi-asset portfolio-weights context.
+        # See calculate_allocator_step_reward for how each knob is used.
+        self.paa_excess_log_return_scale = float(config["environment"].get("paa_excess_log_return_scale", 10.0))
+        self.paa_linear_sortino_net_reward_scale = float(config["environment"].get("paa_linear_sortino_net_reward_scale", 2.5))
+        self.paa_sortino_warmup_steps = int(config["environment"].get("paa_sortino_warmup_steps", 8))
+        self.paa_drawdown_level_penalty_coeff = float(config["environment"].get("paa_drawdown_level_penalty_coeff", 0.0))
+        self.paa_realized_exit_bonus_coeff = float(config["environment"].get("paa_realized_exit_bonus_coeff", 0.0))
+        self.paa_reward_tanh_divisor = float(config["environment"].get("paa_reward_tanh_divisor", 2.0))
+        self.paa_reward_tanh_scale = float(config["environment"].get("paa_reward_tanh_scale", 1.0))
+        self.paa_under_exec_penalty_mult = float(config["environment"].get("paa_under_exec_penalty_mult", 0.8))
+        self.paa_over_exec_penalty_mult = float(config["environment"].get("paa_over_exec_penalty_mult", 1.0))
+
+        self.previous_max_drawdown = None
+        self.saa_previous_max_drawdown = None
+        self.episode_peak_value = None
+        self.trans_act_pen = None  # Initialize transaction action penalty variable
+        self._step_cost_breakdown = np.zeros(4, dtype=np.float64)  # commission, spread, impact, fixed
+        self.paa_average_entry_price = None  # [num_assets] per-asset avg entry price, NaN = no open position
+        self.paa_realized_positive_pnl_cum = 0.0
+        self.paa_realized_exit_bonus_cum = 0.0
+        self.paa_last_realized_positive_pnl = 0.0
+        self.paa_last_realized_exit_bonus = 0.0
+        self._last_paa_weight_delta = None     # set by _apply_soft_execution each step (raw desired delta, incl. cash)
+        self._last_paa_executed_delta = None   # set by _apply_soft_execution each step (realized delta, incl. cash)
+
+        # Store references
+        self.market_data_cache = market_data_cache
+        self.config = config
+        self.mode = mode  # 'train' | 'validation' | 'test'
+        if self.mode not in {'train', 'validation', 'test'}:
+            raise ValueError(f"Invalid mode '{self.mode}'. Expected one of: train, validation, test")
+        self.threshold_val = self.initial_portfolio_value * self.early_stopping_threshold
+
+        # Execution-mode config (backwards compatible defaults)
+        self.execution_mode = config["environment"]["execution_mode"] # "single_asset_target_pos" | "simple" | "tranche" | "portfolio_weights"
+
+        # Used by reset() in ALL modes (cash-allocation floor for random portfolio-weight starts too),
+        # not just SINGLE_ASSET_TARGET_POS. Must never be conditionally set or PORTFOLIO_WEIGHTS mode
+        # crashes with AttributeError on the "random allocation" reset branch.
+        self.min_initial_cash_allocation = float(config["environment"].get("min_initial_cash_allocation", 0.1))
+
+        # Toggle for the 60-day EFFR z-score observation feature (SINGLE_ASSET_TARGET_POS mode).
+        self.include_risk_free_zscore_feature = bool(config["environment"].get("z_score_60_effr", True))
+        # Raw EFFR level is opt-in so older checkpoints retain their observation shape.
+        self.effr_level_active = bool(config["environment"].get("effr_level_active", False))
+
+        self.quantity_type = config["environment"].get("quantity_type", "shares")
+        self.price_source = config["environment"].get("price_source", "next_open")  # "next_open" | "current_close"
+        self.allow_short = bool(config["environment"].get("allow_short", False))
+        self.max_position_shares_per_symbol = config["environment"].get("max_position_shares_per_symbol", None)
+        if self.quantity_type != "shares":
+            raise ValueError("Only 'shares' quantity_type is supported in simple/tranche modes.")
+        if self.execution_mode not in {EXECUTION_SINGLE_ASSET_TARGET_POS, EXECUTION_SIMPLE, EXECUTION_TRANCHE, EXECUTION_PORTFOLIO_WEIGHTS}:
+            raise ValueError(f"Invalid execution_mode: {self.execution_mode}")
+        
+        self.saa_initial_subportfolio_value = None  # For SAA benchmark
+        
+        self.selected_asset_index = None  # For SINGLE_ASSET_TARGET_POS mode
+        
+        self.perc_of_cash_only_starts = config["environment"].get("percentage_of_cash_only_starts", 0.2)
+        self.action_l2_penalty_coeff = config['training'].get('action_l2_penalty_coeff', 0.01)
+        self.action_limiting_factor_start = config['training'].get('action_limiting_factor_start', 0.2)
+        self.saa_differential_sharpe_ratio_weight = config["environment"].get("saa_differential_sharpe_ratio_weight", 0.2)
+
+        # Differential Sortino config params
+        self.sortino_eta = config["environment"].get("sortino_eta", 0.0125) # Adaption rate
+
+        # Sortino reward components
+        self.previous_sortino = None
+        self.running_mean_ema = None
+        self.running_downside_variance_ema = None
+
+        # Sortino SAA reward metrics
+        self.saa_previous_sortino = None
+        self.saa_running_mean_ema = None
+        self.saa_running_downside_variance_ema = None
+        self.previous_saa_sharpe_ratio = None
+        self.saa_average_entry_price = None
+        self.saa_realized_positive_pnl_cum = 0.0
+        self.saa_realized_exit_bonus_cum = 0.0
+        self.saa_last_realized_positive_pnl = 0.0
+        self.saa_last_realized_exit_bonus = 0.0
+        
+        # Initialize state variables
+        self.current_step = None
+        self.current_episode = None
+        self.current_absolute_step = None
+        self.current_episode_length = int(self.episode_length_days)  # may be overridden per reset()
+        self.last_execution_step = -1
+  
+        # Create portfolio state instance. Correct values will be filled in reset and step!
+        self.portfolio_state = PortfolioState(
+            cash=0.0,
+            positions=np.array([0.0] * self.market_data_cache.num_assets),
+            prices=np.array([0.0] * self.market_data_cache.num_assets), 
+            step=0,                      # Initial step
+            terminated=False             # Not terminated
+        )
+
+        self.comparison_portfolio_state = PortfolioState(
+            cash=0.0,
+            positions=np.array([0.0] * self.market_data_cache.num_assets),
+            prices=np.array([0.0] * self.market_data_cache.num_assets), 
+            step=0,                      # Initial step
+            terminated=False             # Not terminated
+        )
+
+        # Create benchmark portfolio state instance
+        self.benchmark_portfolio_state = PortfolioState(
+            cash=0.0,
+            positions=np.array([0.0] * self.market_data_cache.num_assets),
+            prices=np.array([0.0] * self.market_data_cache.num_assets),
+            step=0,                      # Initial step
+            terminated=False             # Not terminated
+        )
+
+        # Create selected asset buy-and-hold portfolio state (SAA mode only)
+        # Used to track a pure buy-and-hold strategy of the selected asset for comparison
+        self.selected_asset_bh_portfolio_state = PortfolioState(
+            cash=0.0,
+            positions=np.array([0.0] * self.market_data_cache.num_assets),
+            prices=np.array([0.0] * self.market_data_cache.num_assets),
+            step=0,
+            terminated=False
+        )
+        self.selected_asset_bh_init_transaction_cost = 0.0  # Track initialization cost for selected asset BH
+
+        # In allocator mode the selected-asset BH tracker doubles as the SPY buy-and-hold reference.
+        self.spy_asset_index = None
+        if self.execution_mode == EXECUTION_PORTFOLIO_WEIGHTS:
+            if "SPY" not in self.market_data_cache.asset_to_index:
+                raise ValueError(
+                    "PORTFOLIO_WEIGHTS mode requires 'SPY' in the asset universe for the "
+                    "SPY buy-and-hold validation reference."
+                )
+            self.spy_asset_index = int(self.market_data_cache.asset_to_index["SPY"])
+
+        # Create EpisodeBuffer instance. Only pass required arguments; __post_init__ will handle array initialization.
+        if self.maybe_provide_sequence:
+            required_buffer_size_days = self.lookback_window + self.episode_length_days
+        else:
+            required_buffer_size_days = self.episode_length_days
+        self.episode_buffer = EpisodeBuffer(
+            episode_buffer_length_days=required_buffer_size_days,
+            num_assets=self.market_data_cache.num_assets, lookback_window=self.lookback_window,
+            maybe_provide_sequence=self.maybe_provide_sequence
+        )
+
+        # Define action and observation spaces
+        self._setup_spaces()
+
+
+    def _setup_spaces(self):
+        """Define action and observation spaces."""
+        num_assets = self.market_data_cache.num_assets
+        num_features = self.market_data_cache.num_features
+        num_portfolio_features = self.episode_buffer.num_portfolio_features
+
+
+        # ------ Action space design ------
+
+        if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
+            # ------ Action space: Target position for single selected asset ------
+            self.action_space = spaces.Box(
+                low=-1.0, high=1.0, shape=(1,), dtype=np.float32
+            )
+        elif self.execution_mode == EXECUTION_PORTFOLIO_WEIGHTS:
+            # ------ Action space: Continuous weights for each asset + cash (sum to 1) ------
+            self.action_space = spaces.Box(
+                low=-2.0, high=2.0, shape=(num_assets,), dtype=np.float32
+            )
+        else:
+            # Simple/Tranche modes: action is a list of instructions; Gym does not have a list space.
+            # Keep a generic Box to satisfy Gym, but we validate structure in step().
+            self.action_space = spaces.Box(low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32)
+
+
+        # ------ Observation space design ------
+
+        if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
+            asset_obs_size = num_features # Single step asset features for selected asset
+            # Base 5: log cash ratio, log asset ratio, agent return, last_action, daily_asset_alpha_risk_free.
+            portfolio_obs_size = (
+                5
+                + (1 if self.include_risk_free_zscore_feature else 0)
+                + (1 if self.effr_level_active else 0)
+            )
+
+        else:
+            if self.maybe_provide_sequence:
+                # 1. Asset features: [lookback_window, num_assets, num_features]
+                asset_obs_size = self.lookback_window * num_assets * num_features
+                
+                # 2. Portfolio features: [lookback_window, num_portfolio_features]
+                #    Portfolio-level metrics:
+                #    weights + alpha + sharpe + drawdown + volatility + turnover + allocator_rewards
+                portfolio_obs_size = self.lookback_window * num_portfolio_features
+            else:
+                # 1. Asset features: [num_assets, num_features]
+                asset_obs_size = num_assets * num_features # Single step asset features
+                # 2. Portfolio features: [num_portfolio_features]
+                portfolio_obs_size = num_portfolio_features  # Single step portfolio features
+            
+        # Single flattened observation space for maximum performance
+        # EXECUTION_SINGLE_ASSET_TARGET_POS appends a one-hot asset-ID block (num_assets dims)
+        # so the policy can learn asset-specific behaviour via nn.Embedding inside the extractor.
+        if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
+            total_obs_size = asset_obs_size + portfolio_obs_size + num_assets
+        else:
+            total_obs_size = asset_obs_size + portfolio_obs_size
+        self.observation_space = spaces.Box(
+            low=-np.inf, 
+            high=np.inf, 
+            shape=(total_obs_size,), 
+            dtype=np.float32
+        )
+        
+        print(f"\nObservation space setup complete: {self.observation_space}")
+
+        # Store dimensions for observation construction and splitting
+        self.asset_obs_size = asset_obs_size
+        self.portfolio_obs_size = portfolio_obs_size
+        self.num_asset_features = num_features
+        self.num_portfolio_features = num_portfolio_features
+
+    def _reconstruct_observation(self, flat_observation):
+        """
+        Reconstruct asset and portfolio features from flattened observation.
+        
+        Args:
+            flat_observation: Flattened numpy array of shape (total_obs_size,)
+        
+        Returns:
+            tuple: (asset_features, portfolio_features)
+        """
+        # Split the flattened observation
+        asset_features_flat = flat_observation[:self.asset_obs_size]
+        portfolio_features_flat = flat_observation[self.asset_obs_size:]
+        
+        # Reshape asset features to original dimensions
+        # Shape: [lookback_window, num_assets, num_features + 3]
+        asset_features = asset_features_flat.reshape(
+            self.lookback_window, 
+            self.market_data_cache.num_assets, 
+            self.num_asset_features
+        )
+        
+        # Reshape portfolio features
+        # Shape: [lookback_window, num_portfolio_features]
+        portfolio_features = portfolio_features_flat.reshape(
+            self.lookback_window,
+            self.num_portfolio_features
+        )
+        
+        return asset_features, portfolio_features
+
+    def _calculate_portfolio_metrics(self):
+        """Calculate portfolio-level metrics for observation space."""
+        # Placeholder for actual metrics calculation
+        print("\nPortfolio metric calc not yet implemented! This is a placeholder")
+        portfolio_metrics = [
+            'total_return', 'return_per_asset','sharpe_ratio', 'max_drawdown', 'volatility', 'turnover'
+        ]
+        return portfolio_metrics
+
+    def reset(self, seed: Optional[int] = None, option: Optional[Dict] = None, asset: Optional[str] = None):
+        """
+        Reset environment to start a new episode.
+        
+        Args:
+            seed: Optional random seed for reproducibility
+            options: Optional reset options
+
+        Returns: 
+            tuple: (initial_observation, info_dict)
+
+        Process:
+        0. Reset episode step counter
+        1. Sample a new random episode with random start from market data cache
+        2. Initialize portfolio state (cash, holdings, etc.)
+        3. Init metrics tracking
+        4. Return initial observation
+        """
+        # Call parent reset
+        super().reset(seed=seed)
+        
+        # Step 0: Reset episode step counter and last executed trade step. Also reset diff soretino reward params
+        self.current_step = 0
+        self.last_execution_step = -1
+        self.current_episode = (self.current_episode + 1) if self.current_episode is not None else 0
+        
+        self.previous_sortino = 0.0
+        self.running_mean_ema = 1e-6
+        self.running_downside_variance_ema = 2.5e-5
+        self.previous_saa_sharpe_ratio = 0.0
+
+        # Sortino SAA reward metrics
+        self.saa_previous_sortino = 0.0
+        self.saa_running_mean_ema = 1e-6
+        self.saa_running_downside_variance_ema = 2.5e-5
+
+        # Per-asset shadow sub-portfolio Sortino EMAs (PORTFOLIO_WEIGHTS mode observation feature).
+        # Same init values as the scalar SAA/PAA EMAs above so the first steps can't spike.
+        num_assets_for_reset = self.market_data_cache.num_assets
+        self.shadow_running_mean_ema = np.full(num_assets_for_reset, 1e-6, dtype=np.float32)
+        self.shadow_running_downside_variance_ema = np.full(num_assets_for_reset, 2.5e-5, dtype=np.float32)
+
+        # Init & reset episode accumulators for sortino diagnostics
+        self._sortino_mean_hist, self._sortino_down_hist, self._sortino_raw_hist = [], [], []
+
+        
+        if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
+            
+            # If asset specified in reset options, validate and set
+            if asset is not None:
+                if asset not in self.market_data_cache.asset_names:
+                    raise ValueError(f"Specified asset '{asset}' not in available assets.")
+                
+                # Get selected assets index
+                self.selected_asset_index = self.market_data_cache.asset_to_index[asset] 
+            else:
+                raise ValueError("In SINGLE_ASSET_TARGET_POS mode, 'asset' parameter must be specified in reset().")
+
+        # Step 1: Select episode start.
+        # Deterministic path (used by SAA test runner): caller can provide a concrete
+        # absolute start index in `option["episode_start_step"]`.
+        forced_start = None if option is None else option.get("episode_start_step", None)
+        forced_block_id = None if option is None else option.get("block_id", None)
+        force_cash_only_start = bool(option.get("force_cash_only_start", False)) if option is not None else False
+
+        if forced_start is not None:
+            self.current_episode_start_step = int(forced_start)
+            if self.current_episode_start_step < 0 or self.current_episode_start_step >= self.market_data_cache.num_days:
+                raise ValueError(f"episode_start_step out of bounds: {self.current_episode_start_step}")
+
+            if forced_block_id is not None:
+                self.current_block_id = str(forced_block_id)
+            else:
+                if self.mode == 'train':
+                    blocks = self.market_data_cache.train_blocks
+                elif self.mode == 'validation':
+                    blocks = self.market_data_cache.validation_blocks
+                else:
+                    blocks = self.market_data_cache.test_blocks
+                matched = [
+                    b for b in blocks
+                    if b.min_start_step <= self.current_episode_start_step <= b.max_start_step
+                ]
+                self.current_block_id = matched[0].block_id if matched else f"forced_{self.mode}"
+        else:
+            self.current_block_id, self.current_episode_start_step = self.market_data_cache.sample_episode_start(
+                mode=self.mode, random_seed=seed
+            )
+
+        # Calculate absolute step in full dataset. Very important for correct market data retrieval!
+        self.current_absolute_step = int(self.current_episode_start_step + self.current_step)
+
+        # Deterministic validation sweeps run one episode per full block, which is longer than
+        # the configured episode_length_days, so the buffer may have to grow.
+        length_override = None if option is None else option.get("episode_length_override", None)
+        if length_override is not None:
+            self.current_episode_length = int(length_override)
+            if self.current_episode_length < 2:
+                raise ValueError(f"episode_length_override must be >= 2, got {self.current_episode_length}")
+            max_available = int(self.market_data_cache.num_days - self.current_episode_start_step)
+            if self.current_episode_length > max_available:
+                raise ValueError(
+                    f"episode_length_override={self.current_episode_length} exceeds available days "
+                    f"({max_available}) from start step {self.current_episode_start_step}"
+                )
+        else:
+            self.current_episode_length = int(self.episode_length_days)
+
+        required_buffer_size_days = (
+            self.lookback_window + self.current_episode_length
+            if self.maybe_provide_sequence else self.current_episode_length
+        )
+        self.episode_buffer.ensure_capacity(required_buffer_size_days)
+
+        # Reset episode buffer
+        self.episode_buffer.reset_episode_buffer() # fills buffer with 0s
+
+        # Only trigger this when a sequence is needed. Not needed in RecurrentPPO
+        if self.maybe_provide_sequence:
+            # Warmup market data cache to ensure all data is ready
+            self.episode_buffer.warmup_market_data(self.market_data_cache, self.current_absolute_step)
+        
+        # Step 2: Initialize portfolio state using PortfolioState dataclass
+        # Get initial prices for portfolio valuation
+        initial_prices = self._get_current_prices(self.current_absolute_step)
+        
+        num_assets = self.market_data_cache.num_assets
+        initial_positions = np.zeros(num_assets, dtype=np.float32)
+        initial_cash = self.initial_portfolio_value  # Default to all cash
+        total_init_tc = 0.0  # Track initialization costs
+
+        self.previous_max_drawdown = float(0.0)
+        self.saa_previous_max_drawdown = float(0.0)
+        self.trans_act_pen = float(0.0)
+        self.saa_average_entry_price = None
+        self.saa_realized_positive_pnl_cum = 0.0
+        self.saa_realized_exit_bonus_cum = 0.0
+        self.saa_last_realized_positive_pnl = 0.0
+        self.saa_last_realized_exit_bonus = 0.0
+        self.paa_average_entry_price = np.full(num_assets, np.nan, dtype=np.float32)
+        self.paa_realized_positive_pnl_cum = 0.0
+        self.paa_realized_exit_bonus_cum = 0.0
+        self.paa_last_realized_positive_pnl = 0.0
+        self.paa_last_realized_exit_bonus = 0.0
+        self._last_paa_weight_delta = np.zeros(num_assets + 1, dtype=np.float32)
+        self._last_paa_executed_delta = np.zeros(num_assets + 1, dtype=np.float32)
+
+        # Episode accumulators for diagnostics
+        self._ep_turnover_notional = 0.0
+        self._ep_cost_commission = 0.0
+        self._ep_cost_spread = 0.0
+        self._ep_cost_impact = 0.0
+        self._ep_cost_fixed = 0.0
+        self._ep_buy_notional = 0.0
+        self._ep_sell_notional = 0.0
+        self._ep_trade_sizes = []  # absolute traded notional per leg
+        self._ep_action_outputs = []  # raw single-asset action outputs
+        self._ep_exposure_sum = 0.0
+        self._ep_exposure_steps = 0
+
+        # Shadow (frictionless) portfolio mirrors live trades without costs. 
+        # Has nothing to do with the shadow portfolio technique used by the saa for isolation purpose!
+        self.shadow_portfolio_state = PortfolioState(
+            cash=self.initial_portfolio_value,
+            positions=np.zeros(num_assets, dtype=np.float32),
+            prices=initial_prices.copy(),
+            step=self.current_step,
+            terminated=False,
+        )
+
+        # Single-asset target position mode: cash-only or random allocation between cash and assets
+        if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
+            # Single-asset-only setup: initialize in cash or selected-asset position.
+            # No non-selected asset may be held at episode start in this mode.
+            if force_cash_only_start or np.random.random() < self.perc_of_cash_only_starts:
+                # Cash-only start (no transaction costs)
+                initial_cash = self.initial_portfolio_value
+                initial_positions[:] = 0.0 # all assets zero
+                total_init_tc = 0.0
+                # Store initial subportfolio values for SAA mode (cash only, no selected asset position)
+                self.saa_initial_cash = initial_cash
+                self.saa_selected_asset_value = 0.0
+                self.saa_initial_subportfolio_value = self.saa_initial_cash + self.saa_selected_asset_value
+                self.saa_average_entry_price = None
+            else:
+                # Random start between selected asset and cash only.
+                selected_asset_price = float(initial_prices[self.selected_asset_index])
+                if selected_asset_price <= 0:
+                    raise ValueError(f"Initial price for selected asset index {self.selected_asset_index} is zero or negative.")
+
+                selected_asset_weight = float(np.random.random())
+                selected_asset_notional = self.initial_portfolio_value * selected_asset_weight
+
+                # Build selected-asset-only target positions vector [num_assets]
+                target_positions = np.zeros(num_assets, dtype=np.float32)
+                target_positions[self.selected_asset_index] = float(selected_asset_notional / selected_asset_price)
+                
+                # Apply transaction costs with iterative downscaling to prevent negative cash
+                initial_cash, initial_positions, total_init_tc = self._initialize_portfolio_with_costs(
+                    target_positions=target_positions,
+                    initial_prices=initial_prices,
+                    initial_value=self.initial_portfolio_value,
+                    allow_cash_residual=False,
+                    max_iterations=10
+                )
+                
+                # Safety check: if cash is still negative, scale down positions proportionally
+                if initial_cash < 0:
+                    shortfall = abs(initial_cash)
+                    # Calculate scale factor to reduce positions by the cash shortfall amount
+                    # shortfall_ratio = shortfall / initial_portfolio_value
+                    # Scale positions down proportionally
+                    scale_factor = max(0.0, 1.0 - (shortfall / self.initial_portfolio_value))
+                    initial_positions = initial_positions * scale_factor
+                    
+                    # Recalculate costs with scaled positions
+                    total_init_tc = self._calculate_transaction_costs(
+                        shares_traded=initial_positions,
+                        prices=initial_prices,
+                        abs_step=self.current_absolute_step,
+                        asset_mask=None
+                    )
+                    
+                    # Recalculate cash
+                    position_notional_total = np.sum(initial_positions * initial_prices)
+                    initial_cash = self.initial_portfolio_value - position_notional_total - total_init_tc
+                    
+                    print(f"[Portfolio Init Info] Scaled positions down by {(1.0 - scale_factor) * 100:.2f}% "
+                          f"to avoid negative cash. Final init cash: ${initial_cash:.4f}")
+                    
+                # Store initial subportfolio values for SAA mode
+                self.saa_initial_cash = initial_cash
+                self.saa_selected_asset_value = initial_positions[self.selected_asset_index] * initial_prices[self.selected_asset_index]
+                self.saa_initial_subportfolio_value = self.saa_initial_cash + self.saa_selected_asset_value
+                self.saa_average_entry_price = float(selected_asset_price) if initial_positions[self.selected_asset_index] > 0 else None
+
+        # Portfolio mode: random weights across all assets + cash, ensuring minimum cash allocation
+        else:
+            # Start with cash only and no positions to simulate real trading start
+            if force_cash_only_start or np.random.random() < self.perc_of_cash_only_starts:
+                # Cash-only start (no transaction costs)
+                initial_cash = self.initial_portfolio_value
+                initial_positions[:] = 0.0 # all assets zero
+                total_init_tc = 0.0
+                initial_prices = self._get_current_prices(self.current_absolute_step)
+
+            # Start with random allocation across all assets and cash, ensuring minimum cash allocation
+            else:
+                # Calculate initial cash allocation ensuring minimum threshold
+                # Generate random portfolio weights including cash
+                random_weights = np.random.random(num_assets + 1)  # +1 for cash
+                random_weights = random_weights / random_weights.sum()  # Normalize to sum to 1
+                
+                # Ensure minimum cash allocation
+                cash_weight = random_weights[0]
+                if cash_weight < self.min_initial_cash_allocation:
+                    # Set cash to minimum and rescale other weights
+                    cash_weight = self.min_initial_cash_allocation
+                    asset_weights = random_weights[1:]
+                    asset_weights_sum = asset_weights.sum()
+                    
+                    if asset_weights_sum > 0:
+                        # Rescale asset weights to fit remaining allocation
+                        remaining_allocation = 1.0 - cash_weight
+                        asset_weights = asset_weights * (remaining_allocation / asset_weights_sum)
+                    else:
+                        # If all asset weights were zero, distribute remaining equally
+                        remaining_allocation = 1.0 - cash_weight
+                        asset_weights = np.full(num_assets, remaining_allocation / num_assets)
+                    
+                    # Update the weights array
+                    random_weights = np.concatenate(([cash_weight], asset_weights))
+                
+                # Calculate target positions from weights
+                asset_weights = random_weights[1:]
+                target_positions = np.zeros(num_assets, dtype=np.float32)
+                
+                for i in range(num_assets):
+                    assets_notional = self.initial_portfolio_value * asset_weights[i]
+                    if assets_notional > 0 and initial_prices[i] > 0:
+                        target_positions[i] = assets_notional / initial_prices[i]
+                
+                # Apply transaction costs (reserves intended cash weight from portfolio value)
+                intended_cash = self.initial_portfolio_value * random_weights[0]
+                available_for_assets = self.initial_portfolio_value - intended_cash
+                
+                initial_cash, initial_positions, total_init_tc = self._initialize_portfolio_with_costs(
+                    target_positions=target_positions,
+                    initial_prices=initial_prices,
+                    initial_value=available_for_assets,
+                    allow_cash_residual=True,
+                    max_iterations=10
+                )
+                # Add back the intended cash reserve
+                initial_cash += intended_cash
+
+        # from here same logic for all modes ----------------------------------
+
+        # Update portfolio state instance
+        self.portfolio_state.portfolio_reset(
+            cash=initial_cash,
+            positions=initial_positions,
+            prices=initial_prices,
+            step=self.current_step,
+            terminated=False
+        )
+
+        # Frictionless mirror starts from the same holdings, without the init costs.
+        self.shadow_portfolio_state.portfolio_reset(
+            cash=float(self.initial_portfolio_value - np.sum(initial_positions * initial_prices, dtype=np.float64)),
+            positions=initial_positions,
+            prices=initial_prices,
+            step=self.current_step,
+            terminated=False
+        )
+
+        # update comparison portfolio (buy-and-hold reference) with same initial state as main portfolio
+        # This allows measuring alpha: portfolio_return - comparison_return
+        # Note: comparison portfolio receives same positions & cash (after transaction costs paid)
+        # It then only receives price updates and cash drag, no trades
+        init_cash_comparison = initial_cash
+        init_positions_comparison = initial_positions.copy()
+
+        self.comparison_portfolio_state.portfolio_reset(
+            cash=init_cash_comparison,
+            positions=init_positions_comparison,
+            prices=initial_prices,
+            step=self.current_step,
+            terminated=False
+        )
+
+        # Update Benchmark Portfolio (custom allocation, no cash - fully invested)
+        benchmark_target_weights = {
+            "SPY": 0.45,
+            "Gold": 0.20,
+            "Crude": 0.05,
+            "EWJ": 0.10,
+            "EWG": 0.10,
+            "EWQ": 0.05,
+            "EWT": 0.05
+        }
+
+        asset_names = self.market_data_cache.asset_names
+        symbol_to_idx = self.market_data_cache.asset_to_index
+
+        # Build weight vector (length = num_assets), zeros default
+        bench_weights = np.zeros(len(asset_names), dtype=np.float32)
+        present_weight_sum = 0.0
+        for sym, w in benchmark_target_weights.items():
+            if sym in symbol_to_idx:
+                idx = symbol_to_idx[sym]
+                bench_weights[idx] = w
+                present_weight_sum += w
+            else:
+                print(f"[Benchmark] Warning: symbol '{sym}' not in asset list; skipping.")
+
+        # Renormalize if any symbol missing
+        if present_weight_sum <= 0:
+            raise ValueError("Benchmark allocation failed: no target symbols present.")
+        if abs(present_weight_sum - 1.0) > 1e-6:
+            bench_weights /= present_weight_sum  # scale remaining to sum 1
+
+        # Convert weights to target positions (gross, before costs)
+        benchmark_target_positions = np.zeros(num_assets, dtype=np.float32)
+        for i in range(num_assets):
+            if bench_weights[i] > 0 and initial_prices[i] > 0:
+                allocation = self.initial_portfolio_value * bench_weights[i]
+                benchmark_target_positions[i] = allocation / initial_prices[i]
+
+        # Apply transaction costs with full investment constraint (allow small cash residual)
+        benchmark_cash, benchmark_positions, benchmark_tc = self._initialize_portfolio_with_costs(
+            target_positions=benchmark_target_positions,
+            initial_prices=initial_prices,
+            initial_value=self.initial_portfolio_value,
+            allow_cash_residual=True,  # Key difference: allows small residual
+            max_iterations=10
+        )
+
+        self.benchmark_portfolio_state.portfolio_reset(
+            cash=benchmark_cash,  # Will be small (< $1) or zero
+            positions=benchmark_positions,
+            prices=initial_prices,
+            step=self.current_step,
+            terminated=False
+        )
+
+        # Initialize selected asset buy-and-hold portfolio (SAA mode only)
+        # This portfolio: 1) pays transaction costs to buy selected asset, 2) holds until episode end
+        if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
+            # Allocate 100% available cash (after benchmark costs) to selected asset
+            bh_available_value = self.initial_portfolio_value  # Start with full portfolio value
+            
+            # Build target: 100% into selected asset only
+            bh_target_positions = np.zeros(num_assets, dtype=np.float32)
+            bh_target_positions[self.selected_asset_index] = bh_available_value / initial_prices[self.selected_asset_index]
+            
+            # Apply transaction costs with auto-resizing
+            bh_cash, bh_positions, bh_init_tc = self._initialize_portfolio_with_costs(
+                target_positions=bh_target_positions,
+                initial_prices=initial_prices,
+                initial_value=bh_available_value,
+                allow_cash_residual=True,  # Allow small cash residual
+                max_iterations=10
+            )
+            
+            self.selected_asset_bh_portfolio_state.portfolio_reset(
+                cash=bh_cash,
+                positions=bh_positions,
+                prices=initial_prices,
+                step=self.current_step,
+                terminated=False
+            )
+            self.selected_asset_bh_init_transaction_cost = bh_init_tc
+        elif self.execution_mode == EXECUTION_PORTFOLIO_WEIGHTS:
+            # Allocator mode: reuse this tracker as a pure SPY buy-and-hold reference.
+            bh_target_positions = np.zeros(num_assets, dtype=np.float32)
+            bh_target_positions[self.spy_asset_index] = self.initial_portfolio_value / initial_prices[self.spy_asset_index]
+
+            bh_cash, bh_positions, bh_init_tc = self._initialize_portfolio_with_costs(
+                target_positions=bh_target_positions,
+                initial_prices=initial_prices,
+                initial_value=self.initial_portfolio_value,
+                allow_cash_residual=True,
+                max_iterations=10
+            )
+
+            self.selected_asset_bh_portfolio_state.portfolio_reset(
+                cash=bh_cash,
+                positions=bh_positions,
+                prices=initial_prices,
+                step=self.current_step,
+                terminated=False
+            )
+            self.selected_asset_bh_init_transaction_cost = bh_init_tc
+        else:
+            # Non-SAA mode: initialize to empty
+            self.selected_asset_bh_portfolio_state.portfolio_reset(
+                cash=self.initial_portfolio_value,
+                positions=np.zeros(num_assets, dtype=np.float32),
+                prices=initial_prices,
+                step=self.current_step,
+                terminated=False
+            )
+            self.selected_asset_bh_init_transaction_cost = 0.0
+
+        # Validate initial portfolio value matches configuration net of the transaction costs
+        # actually paid at init (those are an expected deduction, not an error).
+        init_tc_tolerance = 25.0  # allows for float rounding across the cost breakdown terms
+        expected_initial_value = self.initial_portfolio_value - total_init_tc
+        actual_initial_value = self.portfolio_state.get_total_value()
+        if abs(actual_initial_value - expected_initial_value) > init_tc_tolerance:
+            print(f"\nPortfolio initialization error: {actual_initial_value} != {expected_initial_value} "
+                  f"(target {self.initial_portfolio_value}, init_tc {total_init_tc})")
+
+        # Validate comparison portfolio value (same cash/positions as portfolio_state after init TC)
+        comparison_initial_value = self.comparison_portfolio_state.get_total_value()
+        if abs(comparison_initial_value - expected_initial_value) > init_tc_tolerance:
+            print(f"\nComparison portfolio initialization error: {comparison_initial_value} != {expected_initial_value} "
+                  f"(target {self.initial_portfolio_value}, init_tc {total_init_tc})")
+
+        # Validate benchmark portfolio value matches configuration net of its own init TC
+        expected_benchmark_value = self.initial_portfolio_value - benchmark_tc
+        benchmark_initial_value = self.benchmark_portfolio_state.get_total_value()
+        if abs(benchmark_initial_value - expected_benchmark_value) > init_tc_tolerance:
+            print(f"Benchmark portfolio initialization error: {benchmark_initial_value} != {expected_benchmark_value} "
+                  f"(target {self.initial_portfolio_value}, init_tc {benchmark_tc})")
+
+        # Seed a pre-step entry in the EpisodeBuffer so the first observation contains real weights
+        initial_weights = self.portfolio_state.get_weights().astype(np.float32)
+        zero_action = np.zeros(self.market_data_cache.num_assets + 1, dtype=np.float32)
+        sum_sq = float(np.sum(initial_weights[1:] ** 2))
+        if sum_sq < 1e-8:
+            effective_asset_concentration_norm = 0.0
+        else:
+            effective_asset_concentration_norm = float(1.0 / sum_sq) /  float(len(initial_weights[1:]))
+
+        self.episode_buffer.record_step(
+            external_step=0, 
+            portfolio_value=actual_initial_value,
+            weights=initial_weights,
+            portfolio_positions=self.portfolio_state.positions.copy(),
+            daily_return=0.0,
+            saa_return=0.0,
+            reward_to_record=0.0,
+            action=zero_action,
+            transaction_cost=0.0,
+            prices=initial_prices,
+            sharpe_ratio=0.0,
+            drawdown=0.0,
+            volatility=0.0,
+            turnover=0.0,
+            alpha=0.0,
+            benchmark_portfolio_value=self.benchmark_portfolio_state.get_total_value(),
+            comparison_portfolio_value=self.comparison_portfolio_state.get_total_value(),
+            effective_asset_concentration_norm=effective_asset_concentration_norm,
+            risk_free_rate_zscore_60d=float(self.market_data_cache.get_risk_free_rate_zscore_at_step(self.current_absolute_step)),
+            risk_free_rate_daily=0.0,
+            risk_free_rate_daily_raw=float(self.market_data_cache.get_risk_free_rate_daily_at_step(self.current_absolute_step)),
+            selected_asset_bh_portfolio_value=self.selected_asset_bh_portfolio_state.get_total_value(),
+            selected_asset_bh_transaction_cost=self.selected_asset_bh_init_transaction_cost
+        )
+        
+        # Seed per-asset SAA sub-portfolios for PORTFOLIO_WEIGHTS mode.
+        # Cash-only start: each sub-portfolio holds initial_portfolio_value in cash, 0 shares.
+        if self.execution_mode == EXECUTION_PORTFOLIO_WEIGHTS:
+            num_assets = self.market_data_cache.num_assets
+            self.episode_buffer.set_saa_sub_state_mtm(
+                external_step=0,
+                cash        = np.full(num_assets, self.initial_portfolio_value, dtype=np.float32),
+                shares      = np.zeros(num_assets, dtype=np.float32),
+                last_action = np.zeros(num_assets, dtype=np.float32),
+                daily_return= np.zeros(num_assets, dtype=np.float32),
+            )
+            # Snapshot previous sub-portfolio values for next-step return computation
+            self._saa_sub_prev_value = np.full(num_assets, self.initial_portfolio_value, dtype=np.float32)
+
+        # Initialize previous portfolio value for return calculation
+        self._previous_portfolio_value = actual_initial_value
+
+        # SAA drawdown level baseline (single-asset mode reward).
+        self.episode_peak_value = float(max(self.portfolio_state.get_total_value(), 1e-12))
+        
+        # Step 4: Get initial observation and info
+        if self.maybe_provide_sequence:
+            # Provide full lookback sequence for initial observation
+            initial_observation = self.get_observation_sequence()
+        else:
+            # Provide single step observation
+            initial_observation = self.get_observation_single_step()
+        info = self._get_info()
+        
+        # Add reset-specific info
+        info.update({
+            'reset_type': 'episode_start',
+            'block_id': self.current_block_id,
+            'absolute_start_step': self.current_episode_start_step,
+            'initial_cash': initial_cash,
+            'initial_portfolio_value': actual_initial_value,
+            'initial_date': self.market_data_cache.dates[self.current_episode_start_step]
+        })
+        
+        return initial_observation, info
+
+    def _get_current_prices(self, current_absolute_step: int) -> np.ndarray:
+        """
+        Get current asset prices for portfolio valuation.
+        
+        Returns:
+            np.ndarray: Current closing prices for all assets [num_assets]
+        """
+        
+        # Bounds checking
+        if current_absolute_step >= self.market_data_cache.num_days:
+            # Return last available prices if we're at the end
+            return self.market_data_cache.close_prices[-1].copy()
+        
+        if current_absolute_step < 0:
+            # Return first available prices if somehow negative
+            return self.market_data_cache.close_prices[0].copy()
+        
+        return self.market_data_cache.close_prices[current_absolute_step].copy()
+
+    def apply_saa_sub_actions(self, actions_per_asset: np.ndarray) -> None:
+        """
+        Apply one SAA target_position_change per asset to its hypothetical sub-portfolio.
+        Updates cash/shares/last_action at the current buffer slot in place.
+        Called by SAASignalWrapper AFTER reading obs and running predict.
+
+        Args:
+            actions_per_asset: [N] float, each value in [-1, 1] (already clipped upstream).
+        """
+        if self.execution_mode != EXECUTION_PORTFOLIO_WEIGHTS:
+            return
+        ebuf = self.episode_buffer
+        cash, shares, _, _ = ebuf.get_saa_sub_state(self.current_step)  # current MTM state
+        cash   = cash.copy()
+        shares = shares.copy()
+
+        prices = self.portfolio_state.prices  # current (new) prices
+        num_assets = self.market_data_cache.num_assets
+        weight_thr = self.execution_weight_change_threshold
+        value_thr  = self.execution_min_trade_value_threshold
+
+        for a in range(num_assets):
+            px = float(prices[a])
+            if px <= 0.0 or not np.isfinite(px):
+                continue
+            tpc = float(actions_per_asset[a])
+            sub_value = float(cash[a] + shares[a] * px)
+            if sub_value <= 0.0:
+                continue
+            desired_notional = tpc * sub_value
+            if abs(desired_notional) < value_thr:
+                continue
+            current_w = (shares[a] * px) / sub_value
+            new_w = np.clip(current_w + tpc, 0.0, 1.0) if not self.allow_short else current_w + tpc
+            delta_w = new_w - current_w
+            if abs(delta_w) < weight_thr:
+                continue
+            trade_notional = delta_w * sub_value
+            delta_shares = trade_notional / px
+
+            # One-hot TC call; asset_mask keeps the call cheap and avoids corrupting cost on other assets
+            shares_vec = np.zeros(num_assets, dtype=np.float32)
+            shares_vec[a] = delta_shares
+            mask = np.zeros(num_assets, dtype=bool); mask[a] = True
+            tc = self._calculate_transaction_costs(
+                shares_traded=shares_vec, prices=prices,
+                abs_step=self.current_absolute_step, asset_mask=mask,
+            )
+
+            shares[a] += delta_shares
+            cash[a]   -= (delta_shares * px + tc)
+
+        ebuf.set_saa_sub_state_after_action(
+            external_step=self.current_step,
+            cash=cash.astype(np.float32),
+            shares=shares.astype(np.float32),
+            last_action=actions_per_asset.astype(np.float32),
+        )
+        # Refresh the cached "previous sub-portfolio value" so next step's MTM uses post-trade state
+        self._saa_sub_prev_value = (cash + shares * prices).astype(np.float32)
+
+    def get_saa_signal_inputs(self) -> Dict[str, np.ndarray]:
+        """
+        Per-asset state the allocator's SAASignalWrapper needs to rebuild SAA training
+        observations. Returned as a bundle so it survives one SubprocVecEnv round trip.
+        """
+        cash, shares, last_action, daily_return = self.episode_buffer.get_saa_sub_state(self.current_step)
+        return {
+            "cash": np.asarray(cash, dtype=np.float32).copy(),
+            "shares": np.asarray(shares, dtype=np.float32).copy(),
+            "last_action": np.asarray(last_action, dtype=np.float32).copy(),
+            "daily_return": np.asarray(daily_return, dtype=np.float32).copy(),
+            "effr_level": np.float32(
+                self.market_data_cache.get_risk_free_rate_pa_at_step(self.current_absolute_step)
+            ) / np.float32(0.1),
+            "prices": np.asarray(self.portfolio_state.prices, dtype=np.float32).copy(),
+            "rf_zscore": np.float32(
+                self.market_data_cache.get_risk_free_rate_zscore_at_step(self.current_absolute_step)
+            ),
+            "excess_log_return_over_rf": np.asarray(
+                self.market_data_cache.get_all_assets_excess_log_return_over_rf_at_step(self.current_absolute_step),
+                dtype=np.float32,
+            ).copy(),
+        }
+
+    def _get_info(self):
+        """Get info dictionary for current step."""
+        # Clamp absolute index to dataset bounds to avoid OOB on final step
+        abs_idx = self.current_episode_start_step + self.current_step
+        abs_idx = max(0, min(abs_idx, self.market_data_cache.num_days - 1))
+
+        info = {
+            'step': self.current_step,
+            'block_id': self.current_block_id,
+            'absolute_step': abs_idx,
+            'date': self.market_data_cache.dates[abs_idx],
+            'cash': self.portfolio_state.cash,
+            'positions': self.portfolio_state.positions.copy(),
+            'portfolio_value': self.portfolio_state.get_total_value(),
+            'prices': self.portfolio_state.prices.copy()
+        }
+        return info
+
+    def step(self, action: np.array, asset: Optional[str] = None) -> Tuple[np.ndarray, float, bool, bool, Dict]:
+        """
+        Execute one trading step in the environment.
+
+        MODES:
+            Single_asset_target_pos mode:
+                Action is a target_position_change (selected asset only). Meaning it is the requested
+                change of the action as a fraction of the total intial portfolio value.
+                E.g. a 0.2 action output results in a requested notional change of
+                0.2*initial_portfolio_value. This is translated into shares (positions).
+                Only the given asset is tradable; other assets are held but not traded. This allows 
+                for focused learning on single-asset dynamics and clearer attribution of rewards to actions.
+            
+            Portfolio mode:
+                Function represents a single day in the trading simulation where:
+                1. The agent provides portfolio allocation actions
+                2. Portfolio is rebalanced according to actions
+                3. Time advances by one day (price changes occur)
+                4. Rewards are calculated based on performance
+                5. Termination conditions are checked
+
+                Args:
+                    action: Portfolio allocation weights [num_assets + 1] including cash
+                        Must sum to 1.0, representing target portfolio weights
+
+            Simple/Tranche mode:
+                Actions must be list[TradeInstruction|dict]; execute per-instruction.
+                Attention with the hardcoded dynamics of these modes!
+
+        Returns:
+            tuple: (observation, reward, terminated, truncated, info)
+                - observation: Next state representation for agent
+                - reward: Scalar reward for this step
+                - terminated: Boolean indicating if episode ended due to conditions
+                - truncated: Boolean indicating if episode ended due to time limit
+                - info: Dictionary with additional step information
+
+        NOTE: In futur version the execution decisions will be made by additional agent.
+              Currently they will be performed automatically, if trading thresholds are reached.
+
+        Process in portfolio mode:
+        - Validate action (non-negative, sums to 1). Do not normalize, as this should be done by agent!
+        - Gather current portfolio state
+        - Placeholder for future EXECUTOR logic: execute trading mechanics. 
+          Convention: use same days closing price for buying!
+        - ADVANCE TIME -----------------------------------------------------
+        - Calculate reward based on portfolio value change
+        - Check termination conditions (early stopping, max steps)
+        - Record step data
+        - prepare next observation and info
+        - Return all step outputs (observation, reward, terminated, truncated, info)
+        """
+
+        # Gather current portfolio state----------------------------
+        # Store current state before any changes
+        portfolio_value_before = self.portfolio_state.get_total_value()
+        benchmark_portfolio_value_before = self.benchmark_portfolio_state.get_total_value()
+        comparison_portfolio_value_before = self.comparison_portfolio_state.get_total_value()
+        # SPY buy-and-hold reference (pays its own init transaction costs, then never trades again).
+        # This is the PAA reward's actual excess-return counterfactual, not comparison_portfolio_state.
+        spy_bh_value_before = self.selected_asset_bh_portfolio_state.get_total_value()
+        live_portfolio_cash_before = self.portfolio_state.cash
+        self._step_cost_breakdown = np.zeros(4, dtype=np.float64)
+
+        trade_results: List[Dict[str, Any]] = []
+
+        # Default entropy initialization; override in specific modes when computed
+        diagnostic_entropy = 0.0
+        raw_logits_mean = 0.0
+        raw_logits_std = 0.0
+        raw_logits_max = 0.0
+        raw_logits_l2 = 0.0
+        softmax_temp = 0.0
+        
+        # --------------------- Branch based on execution mode -------------
+
+        # ----- Single-asset target position mode -----
+        if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
+            if asset is None:
+                raise ValueError("In EXECUTION_SINGLE_ASSET_TARGET_POS mode, 'asset' parameter must be specified in step().")
+            if asset not in self.market_data_cache.asset_names:
+                raise ValueError(f"Specified asset '{asset}' not in available assets.")
+            selected_asset_index = self.market_data_cache.asset_to_index[asset]
+            selected_asset_notional_before = self.portfolio_state.positions[selected_asset_index] * self.portfolio_state.prices[selected_asset_index]
+
+            # Validate action input & target position change ------------------------------------
+            if not isinstance(action, (list, tuple, np.ndarray)):
+                raise ValueError("Action must be a list, tuple, or numpy array.")
+            if len(action) != 1:
+                raise ValueError("Action length must be 1 for EXECUTION_SINGLE_ASSET_TARGET_POS mode.")
+            
+            # Get desired target position change
+            target_position_change = float(action[0])  # scalar target position change for selected asset in [-1.0, 1.0]
+            # Validate target position change
+            if np.isnan(target_position_change) or np.isinf(target_position_change):
+                raise ValueError("Action contains NaN or Inf values.")
+            
+            # Execute trade based on provided target position change
+            execution_result = self.execute_single_asset_target_position(
+                asset_index=selected_asset_index,
+                target_position_change=target_position_change,
+                portfolio_state=self.portfolio_state
+            )
+
+        # ----- Portfolio mode: action is target weights vector -----
+        elif self.execution_mode == EXECUTION_PORTFOLIO_WEIGHTS:
+            # Get and Validate action input ------------------------------------
+            raw_action = np.asarray(action, dtype=np.float32)
+            if np.any(np.isnan(action)):
+                raise ValueError("Raw action input contains NaN values")
+            if raw_action.ndim != 1:
+                raise ValueError(f"Action must be 1D, got shape {raw_action.shape}")
+            if len(raw_action) != self.market_data_cache.num_assets:
+                raise ValueError(f"Action length must be {self.market_data_cache.num_assets}, got {len(raw_action)}")
+            # Explicit fixed anchor: cash logit is always 0
+            cash_logit = 0.0
+
+            # If policy output is non-finite, HOLD current weights (safer than forced all-cash jump)
+            if not np.all(np.isfinite(raw_action)):
+                weights = self.portfolio_state.get_weights().astype(np.float32)
+                print("Warning: Non-finite action output detected; defaulting to HOLD (current weights).")
+            else:
+                # Build full logits [cash, assets...]
+                full_logits = np.empty(raw_action.size + 1, dtype=np.float64)
+                full_logits[0] = cash_logit
+                full_logits[1:] = raw_action
+
+                # Stable softmax shift (equivalent to max(0, max(asset_logits)))
+                full_logits -= np.max(full_logits)
+
+                exp_logits = np.exp(full_logits)
+                den = np.sum(exp_logits)
+
+                # Defensive fallback if denominator is pathological
+                if (not np.isfinite(den)) or (den <= 0.0):
+                    weights = self.portfolio_state.get_weights().astype(np.float32)
+                else:
+                    weights = (exp_logits / den).astype(np.float32)
+
+            # Final numerical hygiene only
+            sum_w = float(np.sum(weights, dtype=np.float64))
+            if (not np.isfinite(sum_w)) or (sum_w <= 0.0):
+                weights = self.portfolio_state.get_weights().astype(np.float32)
+            else:
+                weights /= sum_w
+                
+            # legacy, dont know exactly, didnt bother
+            weight_change_target = weights
+
+            # Diagnostics
+            raw_logits_mean = float(np.mean(raw_action))
+            raw_logits_std  = float(np.std(raw_action))
+            raw_logits_max  = float(np.max(raw_action))
+            raw_logits_l2   = float(np.linalg.norm(raw_action))
+            softmax_var     = float(np.var(raw_action))
+            softmax_temp    = float(np.sqrt(softmax_var) + 1e-8)  # indicative temperature
+
+            # Allocation entropy from normalized executed weights
+            diagnostic_entropy = float(-np.sum(weights * np.log(np.clip(weights, 1e-8, 1.0))))                
+
+            # Execution ----------------------
+            execution_result = self.execute_portfolio_change(
+                target_weights=weights,
+                portfolio_state=self.portfolio_state
+            )
+
+        # ------- Simple/Tranche instruction path -------
+        else:
+            # Action must be a list of TradeInstruction or dicts
+            if not isinstance(action, (list, tuple)):
+                raise ValueError("In simple/tranche modes, action must be a list of TradeInstruction or dicts.")
+            # Normalize dicts to TradeInstruction
+            instructions: List[TradeInstruction] = []
+            for item in action:
+                if isinstance(item, TradeInstruction):
+                    instructions.append(item)
+                elif isinstance(item, dict):
+                    instructions.append(TradeInstruction(
+                        symbol=item.get("symbol"),
+                        action=item.get("action"),
+                        quantity=item.get("quantity", None),   # do not cast; allow None
+                        notional=item.get("notional", None),   # include notional
+                        order_type=item.get("order_type", "MARKET"),
+                        limit_price=item.get("limit_price", None),
+                    ))
+                else:
+                    # Skip malformed entry
+                    print(f"Warning: Skipping malformed action entry: {item}")
+                    continue
+
+            # Execute instructions and collect trade results
+            execution_result, trade_results = self.execute_instructions(instructions)
+            # Simple entropy proxy: fraction of assets touched
+            touched = np.zeros(self.market_data_cache.num_assets, dtype=np.float32)
+            for tr in trade_results:
+                if tr["success"]:
+                    idx = self.market_data_cache.asset_to_index.get(tr["symbol"], None)
+                    if idx is not None:
+                        touched[idx] = 1.0
+            total_touch = np.sum(touched)
+            diagnostic_entropy = float(-np.sum((touched / max(total_touch, 1.0)) * np.log(np.clip(touched / max(total_touch, 1.0), 1e-8, 1.0)))) if total_touch > 0 else 0.0
+            # For buffer, we don’t have weights vector from action; we will store current weights post-execution below.
+            weight_change_target = None  # not used in reward in this path
+
+
+        # ---------------- FROM HERE ALL MODES SHARE THE SAME PROCESSING ------------
+        # ---- Episode metric accumulation ----
+        traded_notional = float(execution_result.traded_dollar_value)
+        if traded_notional > 0:
+            self._ep_turnover_notional += traded_notional
+            self._ep_trade_sizes.append(traded_notional)
+        # Split buy/sell notional from execution_result.trades_executed
+        buys = execution_result.traded_notional_per_asset[execution_result.trades_executed > 0].sum()
+        sells = execution_result.traded_notional_per_asset[execution_result.trades_executed < 0].sum()
+        self._ep_buy_notional += float(buys)
+        self._ep_sell_notional += float(abs(sells))
+        # Components of the costs actually charged this step (booked by the execution paths)
+        c_comm, c_spread, c_imp, c_fix = (float(c) for c in self._step_cost_breakdown)
+        self._ep_cost_commission += c_comm
+        self._ep_cost_spread += c_spread
+        self._ep_cost_impact += c_imp
+        self._ep_cost_fixed += c_fix
+        # Exposure tracking
+        invested_fraction = 1.0 - self.portfolio_state.get_weights()[0]
+        self._ep_exposure_sum += invested_fraction
+        self._ep_exposure_steps += 1
+        # Record raw action output (single-asset mode)
+        if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
+            self._ep_action_outputs.append(float(target_position_change))
+        # Shadow (frictionless) portfolio: apply same position changes without costs
+        if execution_result.success:
+            shadow_pos = self.shadow_portfolio_state.positions.copy()
+            shadow_pos += execution_result.trades_executed
+            self.shadow_portfolio_state.positions = shadow_pos
+            # Signed flow: buys pay, sells receive; no costs
+            self.shadow_portfolio_state.cash -= float(np.sum(
+                execution_result.trades_executed * execution_result.executed_prices, dtype=np.float64))
+
+        # ADVANCE TIME -----------------------------------------------------
+        self.current_step += 1
+        self.current_absolute_step = int(self.current_episode_start_step + self.current_step)
+
+        # Calculate reward -----------------------------------------------
+        # Get new market prices for the new day (THIS IS THE DAY CHANGE!)
+        new_prices = self._get_current_prices(self.current_absolute_step)
+        
+        # Update portfolio state with new prices (mark-to-market)
+        # Portfolio positions remain the same, but prices change
+        self._saa_sub_prev_prices = self.portfolio_state.prices.copy() 
+        self.portfolio_state.prices[:] = new_prices # in-place update
+        self.portfolio_state.step = self.current_step
+
+        # Update shadow portfolio prices (frictionless)
+        self.shadow_portfolio_state.prices[:] = new_prices
+        self.shadow_portfolio_state.step = self.current_step
+
+        # Update comparison portfolio state (buy-and-hold reference)
+        self.comparison_portfolio_state.prices[:] = new_prices # in-place update
+        self.comparison_portfolio_state.step = self.current_step
+
+        # Update selected asset buy-and-hold portfolio state (SAA mode only)
+        self.selected_asset_bh_portfolio_state.prices[:] = new_prices
+        self.selected_asset_bh_portfolio_state.step = self.current_step
+
+        # Update benchmark portfolio state
+        self.benchmark_portfolio_state.prices[:] = new_prices # in-place update
+        self.benchmark_portfolio_state.step = self.current_step
+
+        # Apply dynamic risk-free cash carry from the date-aligned EFFR series.
+        daily_cash_return = self.market_data_cache.get_risk_free_rate_daily_at_step(self.current_absolute_step)
+        cash_multiplier = 1.0 + daily_cash_return
+        self.portfolio_state.cash *= cash_multiplier
+        self.comparison_portfolio_state.cash *= cash_multiplier
+        self.benchmark_portfolio_state.cash *= cash_multiplier
+        self.shadow_portfolio_state.cash *= cash_multiplier
+        self.selected_asset_bh_portfolio_state.cash *= cash_multiplier
+        
+        # --- SAA sub-portfolio MTM update (PORTFOLIO_WEIGHTS mode only) ---
+        # Mirrors live-portfolio treatment: apply cash drag, then price-revalue. Records per-asset
+        # saa_sub_daily_return using the same $-delta formula the SAA saw during training:
+        #     delta_notional + (cash_before - cash_after_drag)   (see env.py L2290-2292 for single-asset path)
+        if self.execution_mode == EXECUTION_PORTFOLIO_WEIGHTS:
+            ebuf = self.episode_buffer
+            # Previous-slot state (from end of previous step, i.e. post-SAA-action)
+            prev_cash, prev_shares, prev_last_action, _ = ebuf.get_saa_sub_state(self.current_step - 1)  # note: current_step already advanced
+
+            # Cash before drag (snapshotted at start of this step, stored on env at reset/after last action)
+            cash_before_drag = prev_cash.copy()
+
+            # Apply the same dynamic risk-free cash carry used by the live portfolio.
+            cash_after_drag = prev_cash * (1.0 + daily_cash_return)
+
+            # Revalue at new prices
+            notional_after   = prev_shares * new_prices                                      # [N]
+            sub_value_after  = cash_after_drag + notional_after                              # [N]
+            # delta_cash = cash_before - cash_after; delta_notional = after - before_at_NEW_prices
+            # But env's formula compares: after(new_price) vs before(old_price) for notional, and before vs after_drag for cash.
+            delta_cash        = cash_before_drag - cash_after_drag                           # [N] (only drag, no trade yet)
+            delta_notional    = notional_after - (prev_shares * self._saa_sub_prev_prices)  # [N] (price change effect on old shares, ignores trades)
+            saa_sub_ret       = delta_notional + delta_cash                                  # [N]
+
+            ebuf.set_saa_sub_state_mtm(
+                external_step = self.current_step,
+                cash          = cash_after_drag.astype(np.float32),
+                shares        = prev_shares.astype(np.float32),
+                last_action   = prev_last_action.astype(np.float32),
+                daily_return  = saa_sub_ret.astype(np.float32),
+            )
+            # Cache for the NEXT step's "before_notional" read (avoids indexing into buffer again)
+            self._saa_sub_prev_value = (cash_after_drag + notional_after).astype(np.float32)
+
+            # --- Per-asset shadow-portfolio Sortino + drawdown (feeds PAA asset tokens) ---
+            # Same EMA/floor/clip setup as the SAA reward's own Sortino (calculate_saa_step_reward),
+            # just vectorized across assets and applied to each shadow sub-portfolio's own return.
+            prev_sub_value = cash_before_drag + prev_shares * self._saa_sub_prev_prices  # [N] value before this step
+            shadow_step_return = saa_sub_ret / np.maximum(prev_sub_value, 1e-8)          # [N] pct return, not $-delta
+
+            shadow_delta = shadow_step_return - self.shadow_running_mean_ema
+            self.shadow_running_mean_ema = self.shadow_running_mean_ema + self.sortino_eta * shadow_delta
+            shadow_downside_sq = np.minimum(shadow_step_return, 0.0) ** 2
+            self.shadow_running_downside_variance_ema = self.shadow_running_downside_variance_ema + self.sortino_eta * (
+                shadow_downside_sq - self.shadow_running_downside_variance_ema
+            )
+            shadow_downside_std = np.maximum(
+                np.sqrt(np.maximum(self.shadow_running_downside_variance_ema, 0.0)), 0.005
+            )
+            shadow_sortino = np.clip(self.shadow_running_mean_ema / shadow_downside_std, -3.0, 3.0)
+
+            if self.current_step <= 2:
+                shadow_risk_window = 2
+            else:
+                shadow_risk_window = min(self.current_step, self.max_reward_risk_window)
+            shadow_drawdown = ebuf.shadow_calculate_max_drawdown(
+                external_step=self.current_step, window=shadow_risk_window, current_step_prices=new_prices
+            )
+
+            ebuf.record_shadow_diagnostics(
+                external_step=self.current_step,
+                sortino=shadow_sortino.astype(np.float32),
+                drawdown=shadow_drawdown.astype(np.float32),
+            )
+
+        # Calculate new portfolio value after price changes
+        portfolio_value_after = self.portfolio_state.get_total_value()
+        benchmark_portfolio_value_after = self.benchmark_portfolio_state.get_total_value()
+        comparison_portfolio_value_after = self.comparison_portfolio_state.get_total_value()
+        spy_bh_value_after = self.selected_asset_bh_portfolio_state.get_total_value()
+
+        # SAA return: change in cash + target asset return 
+        "NOTE: only meaningful in single-asset mode"
+        selected_asset_notional_after = 0.0
+        delta_selected_asset_notional = 0.0
+        delta_cash = 0.0
+        saa_return = 0.0
+
+        if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
+            selected_asset_notional_after = (
+                self.portfolio_state.positions[selected_asset_index]
+                * self.portfolio_state.prices[selected_asset_index]
+            )
+            delta_selected_asset_notional = selected_asset_notional_after - selected_asset_notional_before
+            delta_cash = live_portfolio_cash_before - self.portfolio_state.cash
+            saa_return = delta_selected_asset_notional + delta_cash
+
+
+        # Allocate rewards based on mode. Init all with None to check proper implementation
+        allocator_reward:Optional[float] = None
+        saa_reward:Optional[float] = None
+
+        reward_parts: Dict[str, float] = {}
+        saa_reward_parts: Dict[str, float] = {}
+
+        if self.execution_mode in {EXECUTION_PORTFOLIO_WEIGHTS, EXECUTION_SIMPLE, EXECUTION_TRANCHE}:
+            # Calculate Allocator Reward
+            allocator_reward, reward_parts = self.calculate_allocator_step_reward(
+                execution_result=execution_result,
+                portfolio_before=portfolio_value_before,
+                portfolio_after=portfolio_value_after,
+                spy_bh_before=spy_bh_value_before,
+                spy_bh_after=spy_bh_value_after,
+                benchmark_before=benchmark_portfolio_value_before,
+                benchmark_after=benchmark_portfolio_value_after,
+                action=(weight_change_target if self.execution_mode == EXECUTION_PORTFOLIO_WEIGHTS else None)
+            )
+        elif self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
+            # In single-asset target position mode, isolate saa_return 
+            saa_reward, saa_reward_parts = self.calculate_saa_step_reward(
+                execution_result=execution_result,
+                selected_asset_index=selected_asset_index,
+                delta_selected_asset_notional=delta_selected_asset_notional,
+                delta_cash=delta_cash,
+                saa_return=saa_return,
+                selected_asset_notional_before=selected_asset_notional_before,
+                selected_asset_notional_after=selected_asset_notional_after,
+                saa_cash_before=live_portfolio_cash_before,
+                saa_cash_after=self.portfolio_state.cash,
+                action=target_position_change
+            )
+        else:
+            raise ValueError(f"Unknown execution mode {self.execution_mode} in reward allocation.")
+
+        # Construct action vector for episode buffer:
+            # Single Asset target position mode: store [net_cash_delta, per-asset traded $] computed from execution_result.
+            # Portfolio mode: store weights action (as before).
+            # Simple/Tranche: store [net_cash_delta, per-asset traded $] computed from execution_result.
+
+        if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
+            net_asset_dollars = execution_result.traded_notional_per_asset.copy()
+            net_asset_dollars[np.isnan(net_asset_dollars)] = 0.0
+            net_cash_delta = -float(np.sum(net_asset_dollars))  # costs handled separately in transaction_cost
+            action_vec = np.zeros(self.market_data_cache.num_assets + 1, dtype=np.float32)
+            action_vec[selected_asset_index + 1] = np.float32(target_position_change)  
+
+        elif self.execution_mode == EXECUTION_PORTFOLIO_WEIGHTS:
+            action_vec = weight_change_target.astype(np.float32).copy()
+
+        else:
+            net_asset_dollars = execution_result.traded_notional_per_asset.copy()
+            net_asset_dollars[np.isnan(net_asset_dollars)] = 0.0
+            net_cash_delta = -float(np.sum(net_asset_dollars))  # costs handled separately in transaction_cost
+            action_vec = np.concatenate([[net_cash_delta], net_asset_dollars]).astype(np.float32)
+
+        # Record step data ---------------------------------------
+        current_weights_after_execution = self.portfolio_state.get_weights()
+        daily_return = (portfolio_value_after / portfolio_value_before - 1.0 if portfolio_value_before > 0 else 0.0)
+        rf_daily_log = float(self.market_data_cache.get_log_risk_free_rate_daily_at_step(self.current_absolute_step))
+        portfolio_excess_log_return_over_rf = float(np.log1p(max(daily_return, -0.999999)) - rf_daily_log)
+        
+        sum_sq = float(np.sum(current_weights_after_execution[1:] ** 2))
+        if sum_sq < 1e-8:
+            effective_asset_concentration_norm = 0.0
+        else:
+            effective_asset_concentration_norm = float(1.0 / sum_sq) /  float(len(current_weights_after_execution[1:]))
+
+        # Get all available portfolio values of episode
+        window = min(20, self.current_step)  # use up to 20 most recent returns
+        returns_window = self.episode_buffer.get_returns_window(window)
+        step_volatility = float(np.std(returns_window)) if len(returns_window) > 1 else 0.0
+
+        # FIX: Set external step to current step (already incremented)
+        external_step = self.current_step  # zero-based index for buffer, is called first time at reset!
+
+        # Decide on reward to report
+        if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
+            reward_to_record = float(saa_reward) 
+        elif self.execution_mode in {EXECUTION_PORTFOLIO_WEIGHTS, EXECUTION_SIMPLE, EXECUTION_TRANCHE}:
+            reward_to_record = float(allocator_reward)
+        else:
+            raise ValueError(f"Unknown execution mode {self.execution_mode} in reward recording.")
+        
+        # Record step in episode buffer
+        self.episode_buffer.record_step(
+            external_step=external_step,
+            portfolio_value=float(portfolio_value_after),
+            portfolio_positions=self.portfolio_state.positions.copy(),
+            weights=current_weights_after_execution.copy(),
+            daily_return=float(daily_return),
+            saa_return=float(saa_return),
+            #reward=float(allocator_reward),
+            reward_to_record=float(reward_to_record),
+            #saa_reward=float(saa_reward),
+            action=action_vec.copy(),
+            transaction_cost=float(execution_result.transaction_cost),
+            prices=new_prices.copy(),
+            sharpe_ratio=reward_parts.get("sharpe_ratio", 0.0),
+            drawdown=reward_parts.get("max_drawdown_delta", 0.0),
+            volatility=step_volatility,
+            turnover=reward_parts.get("turnover", 0.0),
+            alpha=reward_parts.get("raw_alpha", 0.0),
+            traded_dollar_volume=float(execution_result.traded_dollar_value),
+            traded_shares_total=float(execution_result.traded_shares_total),
+            action_entropy=float(diagnostic_entropy),
+            reward_parts={k: float(v) for k, v in reward_parts.items()},
+            saa_reward_parts={k: float(v) for k, v in saa_reward_parts.items()},
+            benchmark_portfolio_value=float(benchmark_portfolio_value_after),
+            comparison_portfolio_value=float(comparison_portfolio_value_after),
+            effective_asset_concentration_norm=float(effective_asset_concentration_norm),
+            previous_sortino=reward_parts.get("previous_sortino", None),
+            current_sortino=reward_parts.get("current_sortino", None),
+            running_mean_ema=reward_parts.get("running_mean_ema", None),
+            downside_var_sqrt=reward_parts.get("downside_var_sqrt", None),
+            previous_max_drawdown=reward_parts.get("previous_max_drawdown", None),
+            risk_free_rate_zscore_60d=float(self.market_data_cache.get_risk_free_rate_zscore_at_step(self.current_absolute_step)),
+            risk_free_rate_daily=portfolio_excess_log_return_over_rf,
+            risk_free_rate_daily_raw=float(daily_cash_return),
+            selected_asset_bh_portfolio_value=float(self.selected_asset_bh_portfolio_state.get_total_value()),
+            selected_asset_bh_transaction_cost=0.0  # No transaction costs after initialization (buy-and-hold)
+        )
+
+        # Check termination conditions -----------------------------------
+        low_value_cond = portfolio_value_after <= self.threshold_val
+        zero_value_cond = portfolio_value_after < 0.0
+        negative_cash_cond = self.portfolio_state.cash < -10.0  # allow small negative cash for numerical stability
+
+        terminated = bool(low_value_cond or zero_value_cond or negative_cash_cond)
+
+        if terminated:
+            reasons = []
+            if low_value_cond:
+                reasons.append(f"portfolio value {portfolio_value_after:.2f} <= early stopping threshold {self.threshold_val:.2f}")
+            elif zero_value_cond:
+                reasons.append(f"portfolio value {portfolio_value_after:.2f} <= 0")
+            elif negative_cash_cond:
+                reasons.append(f"cash balance {self.portfolio_state.cash:.2f} < -10 USD")
+            else:
+                reasons.append("unknown reason")
+
+            # Print all triggered reasons together
+            print(f"Episode {self.current_episode} terminated early due to: " + "; ".join(reasons))
+        
+        truncated = self.current_step >= self.current_episode_length - 1  # step limit reached in days
+        self.portfolio_state.terminated = terminated or truncated
+        
+        # Prepare info
+        info = self._get_info()
+        if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
+            info.update({
+                "saa_average_entry_price": float(self.saa_average_entry_price) if self.saa_average_entry_price is not None else None,
+                "saa_realized_positive_pnl_cum": float(self.saa_realized_positive_pnl_cum),
+                "saa_realized_exit_bonus_cum": float(self.saa_realized_exit_bonus_cum),
+                "saa_last_realized_positive_pnl": float(self.saa_last_realized_positive_pnl),
+                "saa_last_realized_exit_bonus": float(self.saa_last_realized_exit_bonus),
+            })
+        if self.execution_mode in {EXECUTION_SIMPLE, EXECUTION_TRANCHE}:
+            info['trade_results'] = trade_results
+        elif self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
+            info["trade_results"] = [execution_result]
+
+
+        # ------------------ Prepare next observation if not terminated ------------------------
+        if terminated or truncated:
+            next_observation = np.zeros(self.observation_space.shape, dtype=np.float32)
+            # Internal index range for actual episode steps (exclude warmup)
+            if self.maybe_provide_sequence:
+                internal_start = self.lookback_window
+                internal_end = self.lookback_window + external_step  # inclusive
+            else:
+                internal_start = 0
+                internal_end = external_step  # inclusive
+
+            # Cumulative allocator reward over real steps
+            if internal_end >= internal_start:
+                cumulative_reward = float(
+                    np.sum(self.episode_buffer.rewards[internal_start:internal_end + 1])
+                )
+            else:
+                cumulative_reward = 0.0
+
+            # Episode max drawdown (already stored per step)
+            if internal_end >= internal_start:
+                episode_max_dd = float(
+                    np.max(self.episode_buffer.drawdown[internal_start:internal_end + 1])
+                )
+            else:
+                episode_max_dd = 0.0
+
+            final_portfolio_value = portfolio_value_after
+            final_benchmark_value = benchmark_portfolio_value_after
+            final_comparison_value = comparison_portfolio_value_after
+            port_ret = (final_portfolio_value / self.initial_portfolio_value) - 1.0
+            comparison_ret = (final_comparison_value / self.initial_portfolio_value) - 1.0
+            bench_ret = (final_benchmark_value / self.initial_portfolio_value) - 1.0
+            alpha_ret = port_ret - bench_ret
+
+            ep_turnover = self._ep_turnover_notional / max(1e-8, self.initial_portfolio_value)
+            avg_exposure = (self._ep_exposure_sum / max(1, self._ep_exposure_steps)) if self._ep_exposure_steps else 0.0
+            start_exposure = 1.0 - float(self.episode_buffer.portfolio_weights[internal_start][0])
+            end_exposure = 1.0 - self.portfolio_state.get_weights()[0]
+            shadow_value = self.shadow_portfolio_state.get_total_value()
+            live_value = self.portfolio_state.get_total_value()
+            comparison_value = self.comparison_portfolio_state.get_total_value()
+
+            # Safe slices
+            if internal_end >= internal_start:
+                returns_slice = self.episode_buffer.returns[internal_start:internal_end + 1]
+                costs_slice = self.episode_buffer.transaction_costs[internal_start:internal_end + 1]
+                weights_slice = self.episode_buffer.portfolio_weights[internal_start:internal_end + 1]  # [T, A+1]
+                traded_notional_slice = self.episode_buffer.traded_dollar_volume[internal_start:internal_end + 1]
+                traded_shares_slice = self.episode_buffer.traded_shares_total[internal_start:internal_end + 1]
+
+                # Sharpe/Volatility (annualized)
+                if returns_slice.size >= 2:
+                    mean_r = float(np.mean(returns_slice))
+                    std_r = float(np.std(returns_slice, ddof=1))
+                    episode_volatility = float(std_r * np.sqrt(252)) if std_r > 0 else 0.0
+                    episode_sharpe = float((mean_r / std_r) * np.sqrt(252)) if std_r > 0 else 0.0
+                else:
+                    episode_sharpe = 0.0
+                    episode_volatility = 0.0
+
+                # Total costs and trade-day count
+                total_transaction_costs = float(np.sum(costs_slice))
+                num_trade_days = int(np.sum(costs_slice > 0))
+
+                # Turnover from weights (exclude cash; per-step |Δw| sum)
+                if weights_slice.shape[0] >= 2:
+                    w_ex_cash = weights_slice[:, 1:]                # [T, A]
+                    step_turnovers = np.sum(np.abs(w_ex_cash[1:] - w_ex_cash[:-1]), axis=1)  # [T-1]
+                    avg_turnover = float(np.mean(step_turnovers)) if step_turnovers.size > 0 else 0.0
+                    total_turnover = float(np.sum(step_turnovers)) if step_turnovers.size > 0 else 0.0
+                    weights_mean = float(np.mean(w_ex_cash))
+                    weights_max = float(np.max(w_ex_cash))
+                    weights_min = float(np.min(w_ex_cash))
+                    weights_median = float(np.median(w_ex_cash))
+                else:
+                    avg_turnover = 0.0
+                    total_turnover = 0.0
+                    weights_mean = 0.0
+                    weights_max = 0.0
+                    weights_min = 0.0
+                    weights_median = 0.0
+                # episode traded_volume
+                episode_traded_notional = float(np.sum(traded_notional_slice))
+                episode_traded_shares = float(np.sum(traded_shares_slice))
+
+            else:
+                episode_sharpe = 0.0
+                episode_volatility = 0.0
+                total_transaction_costs = 0.0
+                num_trade_days = 0
+                avg_turnover = 0.0
+                total_turnover = 0.0
+                weights_mean = weights_max = weights_min = weights_median = 0.0
+                episode_traded_notional = 0.0
+                episode_traded_shares = 0.0
+
+            # ===== Action & Allocation Diagnostics (Episode Level) =====
+            # Slice real steps only
+            if internal_end >= internal_start:
+                weights_slice_full = self.episode_buffer.portfolio_weights[internal_start:internal_end + 1]  # [T, A+1]
+                actions_entropy_slice = self.episode_buffer.action_entropy[internal_start:internal_end + 1]
+                traded_notional_slice = self.episode_buffer.traded_dollar_volume[internal_start:internal_end + 1]  # [T, A]
+                # Exclude cash for per-asset stats
+                w_assets = weights_slice_full[:, 1:]  # [T, A]
+                # Mean / std weights
+                mean_w_per_asset = np.mean(w_assets, axis=0)
+                std_w_per_asset  = np.std(w_assets, axis=0)
+                time_gt_10 = np.mean(w_assets > 0.10, axis=0)
+                # Turnover contributions
+                if w_assets.shape[0] >= 2:
+                    step_deltas = np.abs(w_assets[1:] - w_assets[:-1])  # [T-1, A]
+                    total_abs_change = np.sum(step_deltas)
+                    if total_abs_change > 0:
+                        turnover_contrib = np.sum(step_deltas, axis=0) / total_abs_change
+                    else:
+                        turnover_contrib = np.zeros(w_assets.shape[1], dtype=np.float32)
+                else:
+                    turnover_contrib = np.zeros(w_assets.shape[1], dtype=np.float32)
+                # Traded notional share
+                total_traded_notional = np.sum(traded_notional_slice)
+                if total_traded_notional > 0:
+                    notional_share = np.sum(traded_notional_slice, axis=0) / total_traded_notional
+                else:
+                    notional_share = np.zeros(w_assets.shape[1], dtype=np.float32)
+
+                avg_entropy = float(np.mean(actions_entropy_slice))
+                avg_traded_notional_step = float(np.mean(np.sum(traded_notional_slice, axis=1))) if traded_notional_slice.size else 0.0
+                total_costs = float(np.sum(self.episode_buffer.transaction_costs[internal_start:internal_end + 1]))
+                cost_per_dollar = float(total_costs / total_traded_notional) if total_traded_notional > 0 else 0.0
+
+                # Pack per-asset metrics (symbol aligned)
+                per_asset_metrics = {}
+                asset_names_local = self.market_data_cache.asset_names
+                for i, sym in enumerate(asset_names_local):
+                    per_asset_metrics[f"weights/avg_{sym}"] = float(mean_w_per_asset[i])
+                    per_asset_metrics[f"weights/std_{sym}"] = float(std_w_per_asset[i])
+                    per_asset_metrics[f"weights/time_gt_10pct_{sym}"] = float(time_gt_10[i])
+                    per_asset_metrics[f"turnover/contrib_{sym}"] = float(turnover_contrib[i])
+                    per_asset_metrics[f"trades/notional_share_{sym}"] = float(notional_share[i])
+
+                # Reward component sums
+                comp_slice = slice(internal_start, internal_end + 1)
+                comp_alpha_sum = float(np.sum(self.episode_buffer.reward_alpha[comp_slice]))
+                comp_risk_sum = float(np.sum(self.episode_buffer.reward_risk[comp_slice]))
+                comp_port_ret_sum = float(np.sum(self.episode_buffer.reward_portfolio_return[comp_slice]))
+                comp_cost_sum = float(np.sum(self.episode_buffer.reward_cost[comp_slice]))
+                comp_turn_sum = float(np.sum(self.episode_buffer.reward_turnover[comp_slice]))
+                comp_conc_sum = float(np.sum(self.episode_buffer.reward_concentration[comp_slice]))
+                comp_surv_sum = float(np.sum(self.episode_buffer.reward_survival[comp_slice]))
+
+            else:
+                avg_entropy = 0.0
+                avg_traded_notional_step = 0.0
+                cost_per_dollar = 0.0
+                per_asset_metrics = {}
+                benchmark_sharpe = 0.0
+                sharpe_diff = 0.0
+                comp_alpha_sum = comp_risk_sum = comp_port_ret_sum = comp_cost_sum = comp_turn_sum = comp_conc_sum = comp_surv_sum = 0.0
+
+            # Single-asset mode: compute final SAA return metrics
+            if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
+                final_saa_cash = self.portfolio_state.cash
+                final_saa_asset_value = (self.portfolio_state.positions[selected_asset_index] * self.portfolio_state.prices[selected_asset_index])
+                final_saa_subportfolio_value = final_saa_cash + final_saa_asset_value
+                saa_return_final = (final_saa_subportfolio_value - self.saa_initial_subportfolio_value)
+                saa_return_final_pct = saa_return_final / self.saa_initial_subportfolio_value
+                
+                # Add to info
+                info.update({
+                    "saa_final_cash": final_saa_cash,
+                    "saa_final_asset_value": final_saa_asset_value,
+                    "saa_final_subportfolio_value": final_saa_subportfolio_value,
+                    "saa_return_final": saa_return_final,
+                    "saa_return_final_pct": saa_return_final_pct,
+                    "saa_realized_positive_pnl_cum": float(self.saa_realized_positive_pnl_cum),
+                    "saa_realized_exit_bonus_cum": float(self.saa_realized_exit_bonus_cum),
+                })
+
+            # Buy-and-hold comparison metrics (selected-asset B&H in SAA mode).
+            # Also emitted in other modes for logging consistency.
+            final_selected_asset_bh_value = float(self.selected_asset_bh_portfolio_state.get_total_value())
+            pv_minus_selected_asset_bh_abs = float(final_portfolio_value - final_selected_asset_bh_value)
+            bh_base = max(abs(final_selected_asset_bh_value), 1e-12)
+            pv_minus_selected_asset_bh_pct_base = float(pv_minus_selected_asset_bh_abs / bh_base)
+
+            # Allocator validation metrics: terminal PnL and excess over a pure SPY buy-and-hold.
+            terminal_pnl_abs = float(final_portfolio_value - self.initial_portfolio_value)
+            if self.execution_mode == EXECUTION_PORTFOLIO_WEIGHTS:
+                spy_bh_final_value = final_selected_asset_bh_value
+                spy_bh_return = float(spy_bh_final_value / self.initial_portfolio_value - 1.0)
+                excess_return_over_spy_abs = float(final_portfolio_value - spy_bh_final_value)
+                excess_return_over_spy_pct = float(port_ret - spy_bh_return)
+                info.update({
+                    "spy_bh_final_value": spy_bh_final_value,
+                    "spy_bh_return": spy_bh_return,
+                    "excess_return_over_spy_abs": excess_return_over_spy_abs,
+                    "excess_return_over_spy_pct": excess_return_over_spy_pct,
+                })
+
+
+            # Populate info dictionary with episode metrics
+            info.update({
+                "episode_final": True,
+                "episode_id": self.current_episode,
+                "episode_length": external_step + 1,
+                "portfolio_final_value": final_portfolio_value,
+                "benchmark_final_value": final_benchmark_value,
+                "comparison_final_value": final_comparison_value,
+                "portfolio_return": port_ret,
+                "terminal_pnl_abs": terminal_pnl_abs,
+                "benchmark_return": bench_ret,
+                "comparison_return": comparison_ret,
+                "alpha_return": alpha_ret,
+                "cumulative_reward": cumulative_reward,
+                "selected_asset_bh_final_value": final_selected_asset_bh_value,
+                "pv_minus_selected_asset_bh_abs": pv_minus_selected_asset_bh_abs,
+                "pv_minus_selected_asset_bh_pct_base": pv_minus_selected_asset_bh_pct_base,
+                "episode_max_drawdown": episode_max_dd,
+                "episode_sharpe": episode_sharpe,
+                "episode_volatility": episode_volatility,
+                # Gross vs net
+                "shadow_final_value": float(shadow_value),
+                "shadow_return": float(shadow_value / self.initial_portfolio_value - 1.0),
+                # Costs
+                "total_transaction_costs": total_transaction_costs,
+                "episode_cost_commission": float(self._ep_cost_commission),
+                "episode_cost_spread": float(self._ep_cost_spread),
+                "episode_cost_impact": float(self._ep_cost_impact),
+                "episode_cost_fixed": float(self._ep_cost_fixed),
+                "num_trade_days": num_trade_days,
+                "avg_turnover": avg_turnover,
+                "total_turnover": total_turnover,
+                "episode_traded_notional": episode_traded_notional,
+                "episode_traded_shares": episode_traded_shares,
+                # Exposure
+                "exposure_start": float(start_exposure),
+                "exposure_avg": float(avg_exposure),
+                "exposure_end": float(end_exposure),
+                "weights_mean": weights_mean,
+                "weights_max": weights_max,
+                "weights_min": weights_min,
+                "weights_median": weights_median,
+                "actions/entropy_avg": avg_entropy,
+                "actions/raw_logits_mean": raw_logits_mean,
+                "actions/raw_logits_std": raw_logits_std,
+                "actions/raw_logits_max": raw_logits_max,
+                "actions/raw_l2_norm": raw_logits_l2,
+                "actions/softmax_temp": softmax_temp,
+                "trades/avg_notional": avg_traded_notional_step,
+                "trades/cost_per_$": cost_per_dollar,
+                **per_asset_metrics,
+                "reward_components/alpha_sum": comp_alpha_sum,
+                "reward_components/risk_sum": comp_risk_sum,
+                "reward_components/portfolio_return_sum": comp_port_ret_sum,
+                "reward_components/cost_sum": comp_cost_sum,
+                "reward_components/turnover_sum": comp_turn_sum,
+                "reward_components/concentration_sum": comp_conc_sum,
+                "reward_components/survival_sum": comp_surv_sum,
+                # Buy/Sell totals
+                "total_buy_notional": float(self._ep_buy_notional),
+                "total_sell_notional": float(self._ep_sell_notional),
+                # Trade sizes
+                "trade_size_mean": float(np.mean(self._ep_trade_sizes)) if self._ep_trade_sizes else 0.0,
+                "trade_size_median": float(np.median(self._ep_trade_sizes)) if self._ep_trade_sizes else 0.0,
+                # Action magnitude stats (single-asset mode)
+                "action_mean": float(np.mean(self._ep_action_outputs)) if self._ep_action_outputs else 0.0,
+                "action_median": float(np.median(self._ep_action_outputs)) if self._ep_action_outputs else 0.0,
+                "action_p05": float(np.percentile(self._ep_action_outputs, 5)) if self._ep_action_outputs else 0.0,
+                "action_p25": float(np.percentile(self._ep_action_outputs, 25)) if self._ep_action_outputs else 0.0,
+                "action_p75": float(np.percentile(self._ep_action_outputs, 75)) if self._ep_action_outputs else 0.0,
+                "action_p95": float(np.percentile(self._ep_action_outputs, 95)) if self._ep_action_outputs else 0.0,
+                # Sortino internals (episode aggregates)
+                "sortino_mean_ema": float(np.mean(self._sortino_mean_hist)) if (hasattr(self, "_sortino_mean_hist") and len(self._sortino_mean_hist) > 0) else 0.0,
+                "sortino_downside_ema": float(np.mean(self._sortino_down_hist)) if (hasattr(self, "_sortino_down_hist") and len(self._sortino_down_hist) > 0) else 0.0,
+                "sortino_reward_raw_mean": float(np.mean(self._sortino_raw_hist)) if (hasattr(self, "_sortino_raw_hist") and len(self._sortino_raw_hist) > 0) else 0.0,
+                "sortino_reward_raw_p25": float(np.percentile(self._sortino_raw_hist, 25)) if (hasattr(self, "_sortino_raw_hist") and len(self._sortino_raw_hist) > 0) else 0.0,
+                "sortino_reward_raw_p75": float(np.percentile(self._sortino_raw_hist, 75)) if (hasattr(self, "_sortino_raw_hist") and len(self._sortino_raw_hist) > 0) else 0.0,
+ 
+            })
+
+        else:
+            if self.maybe_provide_sequence:
+                next_observation = self.get_observation_sequence()
+            else:
+                next_observation = self.get_observation_single_step()
+            # Validation layer
+            if not np.all(np.isfinite(next_observation)):
+                print(f"NaNs: {np.isnan(next_observation).sum()}, Infs: {np.isinf(next_observation).sum()}")
+                raise ValueError("Next observation contains non-finite values (NaN or Inf)")
+
+        # # Debug prints for tracing step execution, COMMENT OUT WHEN PRODUCTION PHASE
+        # print(f"Step {self.current_step}: Reward: {allocator_reward:.2f}, "
+        # f"Transaction cost: {execution_result.transaction_cost:.2f}, Trades executed: {execution_result.success}\n"
+        # f"Executed trades: {execution_result.trades_executed}\n"
+        # f"Actual weights after execution: {self.portfolio_state.get_weights()}\n"
+        # f"Prices: {self.portfolio_state.prices}\n"
+        # f"Positions: {self.portfolio_state.positions}\n"
+        # f"Cash: {self.portfolio_state.cash:.2f}, "
+        # f"Total Portfolio Value: {self.portfolio_state.get_total_value():.2f}\n")
+
+        # Use correct reward to report based on the mode!
+        if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
+            reward_to_return = saa_reward
+        else:
+            reward_to_return = allocator_reward
+        if reward_to_return is None:
+            raise ValueError("[Step fct]Reward to return is None, check reward calculation logic for execution mode.")
+        # Return all step outputs (observation, reward, terminated, truncated, info)
+        return next_observation, reward_to_return, terminated, truncated, info
+    
+
+    def calculate_allocator_step_reward(
+            self, execution_result: ExecutionResult, portfolio_before,
+            portfolio_after, spy_bh_before, spy_bh_after, benchmark_before, benchmark_after, action: np.ndarray
+            ) -> Tuple[float, Dict[str, float]]:
+        """
+        Calculate the allocator (PAA) reward for this step.
+
+        Ported from calculate_saa_step_reward: same component methodology (excess log-return
+        over a passive benchmark, differential Sortino, incremental + level-based drawdown
+        penalties, execution-gap penalty, realized-profit exit bonus, tanh squash), refitted
+        from the single-asset scalar-action context to the multi-asset portfolio-weights
+        context. See docstring of calculate_saa_step_reward and the class-level explanation
+        in the accompanying documentation for why each component helps training.
+
+        Args:
+            execution_result: Result of the trade execution step
+            portfolio_before/after: Live portfolio value before/after this step's price move
+            spy_bh_before/after: 100%-invested SPY buy-and-hold portfolio value (pays its own
+                init transaction costs, then never trades again); this is the PAA's excess-return
+                counterfactual, NOT comparison_portfolio_state (which stays a separate, purely
+                diagnostic "do-nothing clone of the live portfolio's own start" tracked elsewhere).
+            benchmark_before/after: Fixed custom-weights benchmark portfolio value
+            action: Target portfolio weights [num_assets + 1] including cash (PORTFOLIO_WEIGHTS only)
+        Returns:
+            Scalar reward value for this step
+            Reward_parts: Dict of individual reward components for diagnostics/observation feed
+        """
+
+        # Calculate basic returns
+        if portfolio_before > 0 and portfolio_after > 0:
+            portfolio_return = (portfolio_after / portfolio_before)
+        else:
+            portfolio_return = 0.0
+        if benchmark_before > 0 and benchmark_after > 0:
+            benchmark_return = (benchmark_after / benchmark_before)
+        else:
+            benchmark_return = 0.0
+
+        # ---------- Differential Sortino ratio components (identical EMA math to SAA) ----------
+        portfolio_return_absolut = portfolio_return - 1.0
+        delta = portfolio_return_absolut - self.running_mean_ema
+        self.running_mean_ema += self.sortino_eta * delta
+
+        downside_sq = (min(portfolio_return_absolut, 0.0))**2
+        self.running_downside_variance_ema += self.sortino_eta * (downside_sq - self.running_downside_variance_ema)
+        downside_var_floor = 0.005
+        downside_var = max(self.running_downside_variance_ema, downside_var_floor)
+        current_sortino = self.running_mean_ema / np.sqrt(downside_var)
+
+        # Delay the differential-Sortino reward contribution until the EMAs have warmed up,
+        # to avoid an initialization spike from previous_sortino=0.0 (mirrors SAA warmup gate).
+        sortino_warmup = max(2, int(self.paa_sortino_warmup_steps))
+        if self.current_step < sortino_warmup:
+            delta_sortino_linear = 0.0
+            self.previous_sortino = current_sortino
+        else:
+            delta_sortino_linear = current_sortino - self.previous_sortino
+            self.previous_sortino = current_sortino
+        scaled_delta_sortino_linear = float(self.paa_linear_sortino_net_reward_scale * delta_sortino_linear)
+
+        # Dynamic risk window: starts small, grows with the episode up to max_reward_risk_window.
+        if self.current_step <= 2:
+            risk_metric_window = 2
+        else:
+            risk_metric_window = min(self.current_step, self.max_reward_risk_window)
+
+        max_drawdown = self.episode_buffer.calculate_max_drawdown(
+            window=risk_metric_window
+        )
+
+        # Incremental drawdown penalty: linear delta (matches calculate_saa_step_reward exactly).
+        # No log() involved, so no -inf/nan risk when drawdown is legitimately 0.0 at a new peak.
+        max_drawdown_delta = max(0.0, max_drawdown - self.previous_max_drawdown)
+        self.previous_max_drawdown = max_drawdown
+        max_drawdown_penalty = float(self.lambda_drawdown * max_drawdown_delta)
+
+        # Persistent drawdown-level penalty: keeps penalizing while underwater (mirrors SAA).
+        if self.episode_peak_value is None:
+            self.episode_peak_value = float(max(portfolio_after, 1e-12))
+        peak_before = float(max(self.episode_peak_value, 1e-12))
+        current_drawdown_level = max(0.0, 1.0 - (float(portfolio_after) / peak_before))
+        drawdown_level_penalty = float(self.paa_drawdown_level_penalty_coeff * current_drawdown_level)
+        self.episode_peak_value = float(max(peak_before, float(portfolio_after)))
+
+        # Core objective: outperform a 100%-invested, transaction-cost-paying SPY buy-and-hold
+        # (the PAA's "passive benchmark", analogous to the SAA's same-asset buy-and-hold).
+        eps = 1e-12
+        port_log_ret = np.log(max(float(portfolio_after), eps)) - np.log(max(float(portfolio_before), eps))
+        spy_bh_log_ret = np.log(max(float(spy_bh_after), eps)) - np.log(max(float(spy_bh_before), eps))
+        excess_log_ret = port_log_ret - spy_bh_log_ret
+        excess_return_scaled = float(self.paa_excess_log_return_scale * excess_log_ret)
+
+        # Execution-gap penalty and realized-profit exit bonus: portfolio-weights mode only,
+        # since _apply_soft_execution/per-asset entry-price tracking are only populated there.
+        excess_gap_total = 0.0
+        net_signed_gap = 0.0
+        execution_gap_penalty = 0.0
+        realized_positive_pnl_total = 0.0
+        realized_exit_bonus = 0.0
+
+        if self.execution_mode == EXECUTION_PORTFOLIO_WEIGHTS:
+            # Execution gap: how much of the raw desired weight change was left unexecuted this
+            # step due to the deadband/soft-step execution mechanics (asset legs only; cash
+            # mirrors the sum of asset deltas so including it would double-count).
+            gap = self._last_paa_weight_delta[1:] - self._last_paa_executed_delta[1:]
+            deadband = float(self.config['environment'].get('execution_deadband', 0.002))
+            excess_gap_total = float(np.sum(np.maximum(np.abs(gap) - deadband, 0.0)))
+            net_signed_gap = float(np.sum(gap))  # >0: net under-executed intended exposure increase
+            lambda_exec_gap = float(self.lambda_execution_gap) if self.lambda_execution_gap is not None else 0.0
+            penalty_mult = self.paa_under_exec_penalty_mult if net_signed_gap > 0 else self.paa_over_exec_penalty_mult
+            execution_gap_penalty = float(lambda_exec_gap * penalty_mult * excess_gap_total)
+
+            # Realized-profit exit bonus: per-asset average-entry-price tracking, only pays out
+            # on a sell/reduction when the sell price is above that asset's average buy price.
+            num_assets = self.market_data_cache.num_assets
+            for a in range(num_assets):
+                trade_shares = float(execution_result.trades_executed[a])
+                execution_price = float(execution_result.executed_prices[a])
+                post_trade_shares = float(self.portfolio_state.positions[a])
+                pre_trade_shares = max(0.0, post_trade_shares - trade_shares)
+                avg_entry = self.paa_average_entry_price[a]
+
+                if trade_shares > 0.0 and execution_price > 0.0:
+                    if not np.isfinite(avg_entry) or pre_trade_shares <= 0.0:
+                        self.paa_average_entry_price[a] = execution_price
+                    else:
+                        self.paa_average_entry_price[a] = (
+                            (avg_entry * pre_trade_shares + execution_price * trade_shares)
+                            / max(pre_trade_shares + trade_shares, eps)
+                        )
+                elif trade_shares < 0.0 and np.isfinite(avg_entry) and pre_trade_shares > 0.0 and execution_price > 0.0:
+                    sold_shares = min(-trade_shares, pre_trade_shares)
+                    realized_positive_pnl_total += max(0.0, (execution_price - avg_entry) * sold_shares)
+                    if post_trade_shares <= 1e-8:
+                        self.paa_average_entry_price[a] = np.nan
+
+            realized_exit_bonus = float(
+                self.paa_realized_exit_bonus_coeff * (realized_positive_pnl_total / max(self.initial_portfolio_value, eps))
+            )
+
+        self.paa_last_realized_positive_pnl = float(realized_positive_pnl_total)
+        self.paa_last_realized_exit_bonus = float(realized_exit_bonus)
+        self.paa_realized_positive_pnl_cum += float(realized_positive_pnl_total)
+        self.paa_realized_exit_bonus_cum += float(realized_exit_bonus)
+
+        # Combine components (same structure as calculate_saa_step_reward) and squash.
+        reward_raw = (
+            excess_return_scaled
+            + scaled_delta_sortino_linear
+            - max_drawdown_penalty
+            - drawdown_level_penalty
+            # - execution_gap_penalty
+            + realized_exit_bonus
+        )
+        tanh_div = max(self.paa_reward_tanh_divisor, 1e-8)
+        reward = float(np.tanh(reward_raw / tanh_div) * self.paa_reward_tanh_scale)
+
+        # Track Sortino internals for episode-level stats
+        self._sortino_mean_hist.append(float(self.running_mean_ema))
+        self._sortino_down_hist.append(float(self.running_downside_variance_ema))
+        self._sortino_raw_hist.append(float(reward))
+
+        # ===== Diagnostics kept for observation feed / TensorBoard (not part of the reward above) =====
+        alpha = (portfolio_return - benchmark_return)  # daily alpha
+        portfolio_return = portfolio_return - 1.0  # daily portfolio return
+
+        sharpe_ratio = self.episode_buffer.calculate_sharpe_ratio(window=risk_metric_window)
+        recent_returns = self.episode_buffer.get_returns_window(window=risk_metric_window)
+        volatility = np.std(recent_returns) * np.sqrt(252) if len(recent_returns) > 1 else 0.0  # Annualized
+
+        current_weights = self.portfolio_state.get_weights()
+        if self.current_step > 0:
+            if self.maybe_provide_sequence:
+                prev_w = self.episode_buffer.portfolio_weights[self.episode_buffer.lookback_window + self.current_step - 1]
+            else:
+                prev_w = self.episode_buffer.portfolio_weights[self.current_step - 1]
+            # Classic turnover: sum of absolute changes in asset weights (excluding cash)
+            turnover = float(np.sum(np.abs(current_weights[1:] - prev_w[1:]))) / 2.0
+        else:
+            turnover = 0.0
+        turnover = float(np.clip(turnover, 0.0, 1.0))  # max possible turnover is 2.0, div by 2 gives max 1.0
+
+        parts = {
+            "raw_alpha": alpha,
+            "raw_portfolio_return": portfolio_return,
+            "raw_benchmark_return": benchmark_return,
+            "sharpe_ratio": sharpe_ratio,
+            "volatility": volatility,
+            "turnover": turnover,
+            "max_drawdown_delta": max_drawdown_delta,
+            "previous_sortino": self.previous_sortino,
+            "current_sortino": current_sortino,
+            "running_mean_ema": self.running_mean_ema,
+            "downside_var_sqrt": np.sqrt(downside_var),
+            "previous_max_drawdown": self.previous_max_drawdown,
+            "excess_log_ret": excess_log_ret,
+            "excess_return_scaled": excess_return_scaled,
+            "scaled_delta_sortino_linear": scaled_delta_sortino_linear,
+            "max_drawdown_penalty": max_drawdown_penalty,
+            "drawdown_level": current_drawdown_level,
+            "drawdown_level_penalty": drawdown_level_penalty,
+            "execution_gap_excess": excess_gap_total,
+            "execution_gap_net_signed": net_signed_gap,
+            "execution_gap_penalty": execution_gap_penalty,
+            "realized_positive_pnl": realized_positive_pnl_total,
+            "realized_exit_bonus": realized_exit_bonus,
+            "realized_exit_bonus_cum": self.paa_realized_exit_bonus_cum,
+        }
+
+        return float(reward), parts
+
+    def calculate_saa_step_reward(
+            self, execution_result, selected_asset_index, delta_selected_asset_notional,
+            delta_cash, saa_return, 
+            selected_asset_notional_before, selected_asset_notional_after,
+            saa_cash_before, saa_cash_after, action
+            ):
+        
+        # Calculate the SAA step reward
+        # ---------- Differential Sortino ratio components ----------
+        # Get simple returns
+        saa_portfolio_return_absolut = (selected_asset_notional_after + saa_cash_after) / (selected_asset_notional_before + saa_cash_before) - 1.0
+        # portfolio_return_log = np.log(portfolio_return) if portfolio_return > 0 else -np.inf
+        # 1. Update EMAs
+        saa_delta = saa_portfolio_return_absolut - self.saa_running_mean_ema
+        self.saa_running_mean_ema += self.sortino_eta * saa_delta
+
+        # Alternative: use squared downside returns
+        saa_downside_sq = (min(saa_portfolio_return_absolut, 0.0))**2
+        self.saa_running_downside_variance_ema += self.sortino_eta * (saa_downside_sq - self.saa_running_downside_variance_ema)
+        # downside_var_floor = 0.000025
+        #saa_downside_var = max(self.saa_running_downside_variance_ema, downside_var_floor)
+        #current_sortino = self.saa_running_mean_ema / np.sqrt(saa_downside_var)
+
+        # 3. Calculate downside standard deviation and apply floor directly at 50 bps (0.005)
+        downside_std_floor = 0.005
+        raw_downside_std = np.sqrt(max(0.0, self.saa_running_downside_variance_ema))
+        saa_downside_std = max(raw_downside_std, downside_std_floor)
+
+        # 4. Compute current Sortino
+        current_sortino = self.saa_running_mean_ema / saa_downside_std
+
+        eps = 1e-12
+
+        # Clean Classic Differential Sortino
+        sortino_warmup = max(2, int(self.saa_sortino_warmup_steps))
+        if self.current_step < sortino_warmup:
+            delta_sortino_linear = 0.0
+            self.saa_previous_sortino = current_sortino
+        else:
+            delta_sortino_linear = current_sortino - self.saa_previous_sortino
+            self.saa_previous_sortino = current_sortino
+        scaled_delta_sortino_linear = float(self.saa_linear_sortino_net_reward_scale * delta_sortino_linear)
+
+        # # Delay log Sortino reward contribution until EMAs have warmed up to avoid
+        # # initialization spikes from previous_sortino=0.0.
+        # sortino_warmup_steps = max(0, int(self.saa_sortino_warmup_steps))
+        # if self.current_step < sortino_warmup_steps:
+        #     log_diff_sortino_reward = 0.0
+        #     self.saa_previous_sortino = current_sortino
+        # else:
+        #     prev_sortino = self.saa_previous_sortino
+        #     log_diff_sortino_reward = np.log(max(current_sortino, eps)) - np.log(max(prev_sortino, eps))
+        #     self.saa_previous_sortino = current_sortino
+
+        # Mix Sortino with other metrics to get risk-aware non-deterministic policy
+        """Calculate dynamic risk window. Use self.reward_risk_window and the current step to produce
+        behaviour which starts at 2 raises with the steps up to maximum risk_reward_window"""
+        if self.current_step <= 2:
+            risk_metric_window = 2
+        else:
+            risk_metric_window = min(self.current_step, self.max_reward_risk_window)
+
+        saa_max_drawdown = self.episode_buffer.saa_calculate_max_drawdown(
+            selected_asset_idx=selected_asset_index,
+            window=risk_metric_window
+        )
+
+        saa_max_drawdown_delta = max(0.0, saa_max_drawdown - self.saa_previous_max_drawdown)
+        self.saa_previous_max_drawdown = saa_max_drawdown
+        max_drawdown_penalty = float(self.lambda_drawdown * saa_max_drawdown_delta)
+
+        # # 4. Mix in raw return & windowed drawdown penalty
+        # reward = (self.sortino_net_reward_mix * saa_sortino_reward + 
+        #         (1 - self.sortino_net_reward_mix) * saa_portfolio_return_absolut) - max_drawdown_penalty
+
+        # # 5. Clip and amplify reward
+        # gain = float(3.5)
+        # saa_reward = float(np.tanh(gain * reward))
+
+        prev_value = float(selected_asset_notional_before + saa_cash_before)
+        next_value = float(selected_asset_notional_after + saa_cash_after)
+
+        # SAA realized log return (portfolio-level, includes cash drag and TC)
+        saa_log_return = np.log(max(next_value, eps)) - np.log(max(prev_value, eps))
+
+        # Realized-profit exit bonus: only pay on sell/reduction when the sell price is above
+        # the average buy price for the currently open position in this run.
+        realized_positive_pnl = 0.0
+        realized_exit_bonus = 0.0
+        avg_entry_price = self.saa_average_entry_price
+        trade_shares = float(execution_result.trades_executed[selected_asset_index])
+        execution_price = float(execution_result.executed_prices[selected_asset_index])
+        post_trade_shares = float(self.portfolio_state.positions[selected_asset_index])
+        pre_trade_shares = max(0.0, post_trade_shares - trade_shares)
+
+        if trade_shares > 0.0:
+            if avg_entry_price is None or pre_trade_shares <= 0.0:
+                self.saa_average_entry_price = execution_price
+            elif execution_price > 0.0:
+                self.saa_average_entry_price = (
+                    (avg_entry_price * pre_trade_shares) + (execution_price * trade_shares)
+                ) / max(pre_trade_shares + trade_shares, eps)
+        elif trade_shares < 0.0 and avg_entry_price is not None and pre_trade_shares > 0.0 and execution_price > 0.0:
+            sold_shares = min(-trade_shares, pre_trade_shares)
+            realized_positive_pnl = max(0.0, (execution_price - avg_entry_price) * sold_shares)
+            realized_exit_bonus = float(self.saa_realized_exit_bonus_coeff * (realized_positive_pnl / max(self.initial_portfolio_value, eps)))
+            if post_trade_shares <= 1e-8:
+                self.saa_average_entry_price = None
+
+        self.saa_last_realized_positive_pnl = float(realized_positive_pnl)
+        self.saa_last_realized_exit_bonus = float(realized_exit_bonus)
+        self.saa_realized_positive_pnl_cum += float(realized_positive_pnl)
+        self.saa_realized_exit_bonus_cum += float(realized_exit_bonus)
+
+        # Single-asset passive benchmark: same-asset fully-invested buy-and-hold.
+        # Rationale: the SAA chooses between "be in this asset" and "be in cash".
+        # Benchmark is "always in this asset" — measures alpha of timing vs. always-on.
+        # Prices are taken one-day apart (matches env's step cadence).
+        old_price = float(self._saa_sub_prev_prices[selected_asset_index])   # snapshot taken in step() just before MTM
+        new_price = float(self.portfolio_state.prices[selected_asset_index])
+        if old_price > 0 and new_price > 0:
+            passive_log_return = float(np.log(new_price) - np.log(old_price))
+        else:
+            passive_log_return = 0.0
+
+        # Scale the passive benchmark by the SAA's achievable notional so the reward
+        # is on the same scale as a fully-invested SAA would see.
+        # sub_portfolio_notional = prev_value; passive return applied to it = passive_log_return.
+        # (log-return is scale-free; no multiplication needed — just subtract.)
+        saa_excess_log_return = saa_log_return - passive_log_return
+
+        # Simple log return reward
+        saa_excess_return_scaled = self.saa_excess_log_return_scale * saa_excess_log_return
+
+        # scaled_log_diff_sortino = self.saa_log_diff_sortino_scale * log_diff_sortino_reward
+
+        # """Calculate dynamic risk window. Use self.reward_risk_window and the current step to produce
+        # behaviour which starts at 2 raises with the steps up to maximum risk_reward_window"""
+        # if self.current_step <= 2:
+        #     risk_metric_window = 2
+        # else:
+        #     risk_metric_window = min(self.current_step, self.max_reward_risk_window)
+
+        # sharpe_ratio = self.episode_buffer.calculate_sharpe_ratio(
+        #    window=risk_metric_window)
+        # differential_sharpe_ratio = sharpe_ratio - self.previous_saa_sharpe_ratio
+        # self.previous_saa_sharpe_ratio = sharpe_ratio
+
+        # saa_reward_raw = 1.0 * (saa_excess_return_scaled + scaled_log_diff_sortino - ((abs(action) * (1 / self.action_limiting_factor_start)) * self.action_l2_penalty_coeff) + (differential_sharpe_ratio * self.saa_differential_sharpe_ratio_weight) - max_drawdown_penalty)
+
+        # Action hold reward: small positive reward for taking action close to zero (holding)
+        # Calculate the continuous Gaussian reward
+        # Peak of 'hold_reward_weight' at action=0, decaying as action moves away
+        # action_holding_reward = self.action_hold_reward_weight_omega * np.exp(-(action**2) / (2 * (self.action_forgiveness_width_sigma**2)))
+
+        # action_holding_reward = self.action_hold_reward_weight_omega * (1 - abs(action)**2)
+
+        # Execution gap penalty: asymmetric with a dynamic deadband so we do not
+        # penalize gaps caused by non-executed tiny trades (<~$50 + buffer).
+        total_value_before = float(selected_asset_notional_before + saa_cash_before)
+        action_executed = float(delta_selected_asset_notional / max(total_value_before, eps))
+
+        min_trade_usd = float(self.config['environment'].get('execution_min_trade_value_threshold', 50.0))
+        min_trade_usd = max(min_trade_usd, float(self.saa_min_trade_value_floor))
+        small_trade_buffer_usd = float(self.config['environment'].get('saa_execution_gap_buffer_usd', 10.0))
+        action_limiter = float(self.action_limiting_factor_start) if self.action_limiting_factor_start is not None else 1.0
+        action_limiter = float(np.clip(action_limiter, 1e-6, 1.0))
+
+        no_penalty_gap = ((min_trade_usd + small_trade_buffer_usd) / max(total_value_before, eps)) / action_limiter
+        signed_gap = float(action - action_executed)
+        excess_gap = max(0.0, abs(signed_gap) - no_penalty_gap)
+
+        lambda_exec_gap = float(self.lambda_execution_gap) if self.lambda_execution_gap is not None else 0.0
+        under_exec_mult = float(self.config['environment'].get('saa_under_exec_penalty_mult', 0.75))
+        over_exec_mult = float(self.config['environment'].get('saa_over_exec_penalty_mult', 1.25))
+        penalty_mult = under_exec_mult if signed_gap > 0 else over_exec_mult
+        execution_gap_penalty = float(lambda_exec_gap * penalty_mult * excess_gap)
+
+        # Persistent drawdown-level signal: keeps penalizing while staying underwater.
+        if self.episode_peak_value is None:
+            self.episode_peak_value = float(max(total_value_before, eps))
+        peak_before = float(max(self.episode_peak_value, eps))
+        current_drawdown_level = max(0.0, 1.0 - (float(next_value) / peak_before))
+        drawdown_level_penalty = self.saa_drawdown_level_penalty_coeff * current_drawdown_level
+        self.episode_peak_value = float(max(peak_before, float(next_value)))
+
+        saa_reward_raw = (
+            saa_excess_return_scaled
+            - max_drawdown_penalty
+            - drawdown_level_penalty
+            - execution_gap_penalty
+            + realized_exit_bonus
+            # + scaled_log_diff_sortino
+            + scaled_delta_sortino_linear
+        )
+
+        tanh_div = max(self.saa_reward_tanh_divisor, 1e-8)
+        saa_reward = np.tanh(saa_reward_raw / tanh_div) * self.saa_reward_tanh_scale
+        
+        # NOTE: Several values here get used to fill portfolio wide metrics in the episode buffer.
+        saa_reward_parts = {
+            "alpha_component": 0.0,
+            "risk_component": 0.0,
+            "portfolio_return_component": 0.0,
+            "cost_component": 0.0,
+            "turnover_component": 0.0,
+            "concentration_component": 0.0,
+            "survival_component": 0.0,
+            "raw_alpha": 0.0,
+            "raw_portfolio_return": 0.0,
+            "raw_benchmark_return": 0.0,
+            "sharpe_ratio": 0.0,
+            "max_drawdown": saa_max_drawdown,
+            "drawdown_level": current_drawdown_level,
+            "drawdown_level_penalty": drawdown_level_penalty,
+            "execution_gap_penalty": execution_gap_penalty,
+            "realized_positive_pnl": realized_positive_pnl,
+            "realized_exit_bonus": realized_exit_bonus,
+            "realized_exit_bonus_cum": self.saa_realized_exit_bonus_cum,
+            "average_entry_price": float(self.saa_average_entry_price) if self.saa_average_entry_price is not None else 0.0,
+            "no_penalty_gap": no_penalty_gap
+            # "scaled_log_diff_sortino": scaled_log_diff_sortino,
+            #"log_diff_sortino_reward": log_diff_sortino_reward
+        }
+        
+        return saa_reward, saa_reward_parts
+            
+
+    def execute_single_asset_target_position(self, asset_index: int, target_position_change: float, portfolio_state: PortfolioState) -> ExecutionResult:
+        # Execution of single-asset target position change. Only trades in the provided asset!
+        num_assets = self.market_data_cache.num_assets
+        current_prices = portfolio_state.prices.copy()
+
+        # Current position in shares
+        current_position_shares = float(portfolio_state.positions[asset_index])
+
+        # Guard: valid price
+        px = float(current_prices[asset_index]) if asset_index < num_assets else ValueError("Asset index out of range")
+        if not np.isfinite(px) or np.isnan(px) or px <= 0.0:
+            print(f"price is {px}. Excecution not conducted because nan, inf or <= 0")
+            return ExecutionResult(
+                current_step=self.current_step,
+                trades_executed=np.zeros(num_assets, dtype=np.float32),
+                executed_prices=current_prices,
+                transaction_cost=0.0,
+                success=False,
+                traded_dollar_value=0.0,
+                traded_shares_total=0.0,
+                traded_notional_per_asset=np.zeros(num_assets, dtype=np.float32)
+            )
+
+        # Convert desired change to dollar notional based on current total portfolio value
+        desired_notional_change = target_position_change * portfolio_state.get_total_value()  # +buy dollars, -sell dollars
+
+        # Shares to trade from desired notional
+        shares_to_trade = float(desired_notional_change / px) if px > 0 else 0.0
+
+        # Deadband on tiny share trades
+        share_eps = float(self.config['environment'].get('execution_min_share_threshold', 1))
+        if abs(shares_to_trade) < share_eps:
+            return ExecutionResult(
+                current_step=self.current_step,
+                trades_executed=np.zeros(num_assets, dtype=np.float32),
+                executed_prices=current_prices,
+                transaction_cost=0.0,
+                success=False,
+                traded_dollar_value=0.0,
+                traded_shares_total=0.0,
+                traded_notional_per_asset=np.zeros(num_assets, dtype=np.float32)
+            )
+
+        # Min trade value and min days gates
+        min_trade_value_thresh = float(self.config['environment'].get('execution_min_trade_value_threshold', 0.0))
+        min_days_between = int(self.config['environment'].get('execution_min_days_between_trades', 0))
+        steps_since_last = (self.current_step - self.last_execution_step) if self.last_execution_step >= 0 else np.inf
+        if abs(desired_notional_change) < min_trade_value_thresh or steps_since_last < min_days_between:
+            return ExecutionResult(
+                current_step=self.current_step,
+                trades_executed=np.zeros(num_assets, dtype=np.float32),
+                executed_prices=current_prices,
+                transaction_cost=0.0,
+                success=False,
+                traded_dollar_value=0.0,
+                traded_shares_total=0.0,
+                traded_notional_per_asset=np.zeros(num_assets, dtype=np.float32)
+            )
+
+        # WHEN PASSED ALL CHECKS: here actual trading starts
+        # Prepare execution tracking variables
+        trades_executed = np.zeros(num_assets, dtype=np.float32)
+        traded_notional_per_asset = np.zeros(num_assets, dtype=np.float32)
+        total_transaction_costs = 0.0
+
+        # Init a shares vector for transaction cost calculation
+        shares_vec = np.zeros(num_assets, dtype=np.float32)
+
+        # Since only a single asset is traded there needs to be no selling before buying
+        if shares_to_trade > 0:
+            # BUY leg
+            # First estimate tc with requested shares
+            shares_vec[asset_index] = shares_to_trade
+            tc_est = self._calculate_transaction_costs(
+                shares_traded=shares_vec,
+                prices=current_prices,
+                abs_step=self.current_absolute_step,
+                asset_mask=None
+            )
+            notional_buy = shares_to_trade * px
+            cash_needed = float(notional_buy + tc_est)
+
+            if cash_needed > portfolio_state.cash:
+                # Scale down by available cash
+                available_cash = max(0.0, float(portfolio_state.cash))
+                # subtract a tc estimate; scale using initial tc_est to avoid iterative loops
+                denom = (px + (tc_est / max(shares_to_trade, 1e-8)))
+                # Use fractional shares (positions are float throughout env) to avoid
+                # systematic floor-to-zero when affordable size is in (0, 1).
+                scaled_shares = float(max(0.0, available_cash / max(denom, 1e-8)))
+                if scaled_shares <= 0.0 or scaled_shares < share_eps:
+                    # Cannot buy meaningful size after affordability scaling.
+                    
+                    return ExecutionResult(
+                        current_step=self.current_step,
+                        trades_executed=np.zeros(num_assets, dtype=np.float32),
+                        executed_prices=current_prices,
+                        transaction_cost=0.0,
+                        success=False,
+                        traded_dollar_value=0.0,
+                        traded_shares_total=0.0,
+                        traded_notional_per_asset=np.zeros(num_assets, dtype=np.float32)
+                    )
+                shares_to_trade = scaled_shares
+                shares_vec[asset_index] = shares_to_trade
+                # Recompute tc on scaled shares
+                tc_est = self._calculate_transaction_costs(
+                    shares_traded=shares_vec,
+                    prices=current_prices,
+                    abs_step=self.current_absolute_step,
+                    asset_mask=None
+                )
+                notional_buy = shares_to_trade * px
+                cash_needed = float(notional_buy + tc_est)
+
+            # Apply buy
+            self._book_cost_components(tc_est)
+            portfolio_state.positions[asset_index] += shares_to_trade
+            portfolio_state.cash -= cash_needed
+            trades_executed[asset_index] += shares_to_trade
+            traded_notional_per_asset[asset_index] += notional_buy
+            total_transaction_costs += tc_est
+
+        else:
+            # SELL leg
+            sell_shares = -shares_to_trade  # positive number
+            if not self.allow_short:
+                sell_shares = min(sell_shares, max(0.0, current_position_shares))
+
+            if sell_shares <= 0:
+                # No shares available to sell (or short not allowed)
+                return ExecutionResult(
+                    current_step=self.current_step,
+                    trades_executed=np.zeros(num_assets, dtype=np.float32),
+                    executed_prices=current_prices,
+                    transaction_cost=0.0,
+                    success=False,
+                    traded_dollar_value=0.0,
+                    traded_shares_total=0.0,
+                    traded_notional_per_asset=np.zeros(num_assets, dtype=np.float32)
+                )
+
+            shares_vec[asset_index] = -sell_shares
+            tc_sell = self._calculate_transaction_costs(
+                shares_traded=shares_vec,
+                prices=current_prices,
+                abs_step=self.current_absolute_step,
+                asset_mask=None
+            )
+            self._book_cost_components(tc_sell)
+            notional_sell = sell_shares * px
+
+            # Apply sell
+            portfolio_state.positions[asset_index] -= sell_shares
+            if not self.allow_short:
+                portfolio_state.positions[asset_index] = max(0.0, float(portfolio_state.positions[asset_index]))
+            portfolio_state.cash += float(notional_sell - tc_sell)
+            trades_executed[asset_index] -= sell_shares
+            traded_notional_per_asset[asset_index] += notional_sell
+            total_transaction_costs += tc_sell
+
+        total_traded_notional = float(np.sum(traded_notional_per_asset))
+        traded_shares_total = float(np.sum(np.abs(trades_executed)))
+
+        if total_traded_notional > 0.0:
+            self.last_execution_step = self.current_step
+
+        return ExecutionResult(
+            current_step=self.current_step,
+            trades_executed=trades_executed.astype(np.float32),
+            executed_prices=current_prices,
+            transaction_cost=float(total_transaction_costs),
+            success=bool(total_traded_notional > 0.0),
+            traded_dollar_value=total_traded_notional,
+            traded_shares_total=traded_shares_total,
+            traded_notional_per_asset=traded_notional_per_asset.astype(np.float32)
+        )
+
+
+    def execute_portfolio_change(self, target_weights: np.ndarray, portfolio_state: PortfolioState) -> ExecutionResult:
+        num_assets = self.market_data_cache.num_assets
+        current_prices = portfolio_state.prices.copy()
+
+        # Threshold gating disabled to check for instability reasons
+        # should_execute, adjusted_target_weights = self._check_execution_thresholds(target_weights, portfolio_state)
+        # if not should_execute:
+        #     return ExecutionResult(
+        #         current_step=self.current_step,
+        #         trades_executed=np.zeros(num_assets, dtype=np.float32),
+        #         executed_prices=current_prices,
+        #         transaction_cost=0.0,
+        #         success=False,
+        #         traded_dollar_value=0.0,
+        #         traded_shares_total=0.0,
+        #         traded_notional_per_asset=np.zeros(num_assets, dtype=np.float32)
+        #     )
+
+        current_weights = portfolio_state.get_weights()
+        total_value = portfolio_state.get_total_value()
+
+        # --- Intro of smooth exec ---
+        current_weights = portfolio_state.get_weights()
+        adjusted_target_weights = self._apply_soft_execution(
+            target_weights=target_weights,
+            current_weights=current_weights,
+            portfolio_state=portfolio_state
+        )
+
+
+        desired_allocations = adjusted_target_weights * total_value
+        current_allocations = current_weights * total_value
+        trade_amounts = desired_allocations - current_allocations  # includes cash at index 0
+
+        asset_trade_amounts = trade_amounts[1:]  # exclude cash
+        with np.errstate(divide='ignore', invalid='ignore'):
+            raw_shares_to_trade = np.where(current_prices > 0,
+                                           asset_trade_amounts / current_prices,
+                                           0.0).astype(np.float32)
+
+        share_eps = float(self.config['environment'].get('execution_min_share_threshold', 1e-5))
+        # Full-length shares vector (assets only), signed: +buy, -sell
+        shares_to_trade_full = raw_shares_to_trade.copy()
+
+        # Deadband removal
+        shares_to_trade_full[np.abs(shares_to_trade_full) < share_eps] = 0.0
+        if np.all(shares_to_trade_full == 0.0):
+            return ExecutionResult(
+                current_step=self.current_step,
+                trades_executed=np.zeros(num_assets, dtype=np.float32),
+                executed_prices=current_prices,
+                transaction_cost=0.0,
+                success=False,
+                traded_dollar_value=0.0,
+                traded_shares_total=0.0,
+                traded_notional_per_asset=np.zeros(num_assets, dtype=np.float32)
+            )
+
+        position_changes = np.zeros(num_assets, dtype=np.float32)
+        trades_executed = np.zeros(num_assets, dtype=np.float32)
+        traded_notional_per_asset = np.zeros(num_assets, dtype=np.float32)
+        total_transaction_costs = 0.0
+
+        # SELL leg
+        sell_mask = shares_to_trade_full < -share_eps
+        if np.any(sell_mask):
+            shares_to_sell = -shares_to_trade_full[sell_mask]
+            available_shares = portfolio_state.positions[sell_mask]
+            actual_shares_sold = np.minimum(shares_to_sell, available_shares)
+            # Adjust for position limits
+            shares_deficit = shares_to_sell - actual_shares_sold
+            if np.any(shares_deficit > 0):
+                # Clamp attempted oversell to available
+                pass
+            if np.any(actual_shares_sold > 0):
+                position_changes[sell_mask] -= actual_shares_sold
+                trades_executed[sell_mask] -= actual_shares_sold
+                sell_notional = actual_shares_sold * current_prices[sell_mask]
+                traded_notional_per_asset[sell_mask] += sell_notional
+                tc_sell = self._calculate_transaction_costs(
+                    shares_traded=self._expand_shares(actual_shares_sold, sell_mask, num_assets),
+                    prices=current_prices,
+                    abs_step=self.current_absolute_step,
+                    asset_mask=sell_mask
+                )
+                self._book_cost_components(tc_sell)
+                total_transaction_costs += tc_sell
+                portfolio_state.cash += float(np.sum(sell_notional) - tc_sell)
+
+        # BUY leg
+        buy_mask = shares_to_trade_full > share_eps
+        if np.any(buy_mask):
+            shares_to_buy = shares_to_trade_full[buy_mask]
+            buy_notional = shares_to_buy * current_prices[buy_mask]
+            tc_buy = self._calculate_transaction_costs(
+                shares_traded=self._expand_shares(shares_to_buy, buy_mask, num_assets),
+                prices=current_prices,
+                abs_step=self.current_absolute_step,
+                asset_mask=buy_mask
+            )
+            cost_of_buys = float(np.sum(buy_notional) + tc_buy)
+            if cost_of_buys > portfolio_state.cash:
+                scaling_factor = portfolio_state.cash / max(cost_of_buys, 1e-8)
+                shares_to_buy *= scaling_factor
+                buy_notional = shares_to_buy * current_prices[buy_mask]
+                tc_buy = self._calculate_transaction_costs(
+                    shares_traded=self._expand_shares(shares_to_buy, buy_mask, num_assets),
+                    prices=current_prices,
+                    abs_step=self.current_absolute_step,
+                    asset_mask=buy_mask
+                )
+                cost_of_buys = float(np.sum(buy_notional) + tc_buy)
+            if np.any(shares_to_buy > 0):
+                # Last computed tc_buy is the charged one (post-scaling if scaled)
+                self._book_cost_components(tc_buy)
+                position_changes[buy_mask] += shares_to_buy
+                trades_executed[buy_mask] += shares_to_buy
+                traded_notional_per_asset[buy_mask] += buy_notional
+                total_transaction_costs += tc_buy
+                portfolio_state.cash -= cost_of_buys
+
+        # Apply position changes
+        portfolio_state.positions += position_changes
+
+        total_traded_notional = float(np.sum(traded_notional_per_asset))
+        traded_shares_total = float(np.sum(np.abs(trades_executed)))
+
+        if total_traded_notional > 0:
+            self.last_execution_step = self.current_step
+
+        return ExecutionResult(
+            current_step=self.current_step,
+            trades_executed=trades_executed,
+            executed_prices=current_prices,
+            transaction_cost=float(total_transaction_costs),
+            success=bool(total_traded_notional > 0),
+            traded_dollar_value=total_traded_notional,
+            traded_shares_total=traded_shares_total,
+            traded_notional_per_asset=traded_notional_per_asset
+        )
+
+    def _apply_soft_execution(
+        self, 
+        target_weights: np.ndarray, 
+        current_weights: np.ndarray,
+        portfolio_state: PortfolioState
+    ) -> np.ndarray:
+        """
+        Apply smooth partial rebalance with deadband.
+        
+        Instead of hard all-or-nothing gate, apply a soft step toward target.
+        Maps continuous policy output → continuous weight changes.
+        
+        Args:
+            target_weights: Desired weights from policy softmax
+            current_weights: Current portfolio weights
+            portfolio_state: Current portfolio state (for metrics)
+        
+        Returns:
+            adjusted_target_weights: Executed weights (partial step toward target)
+        """
+        # Deadband: ignore changes smaller than this
+        deadband = float(self.config['environment'].get('execution_deadband', 0.002))
+        
+        # Step size: how much of the desired change to actually execute (0.0–1.0)
+        # 0.25–0.35 typical; smaller = more conservative, larger = more aggressive
+        step_size = float(self.config['environment'].get('execution_step_size', 0.30))
+        
+        # Compute desired change
+        weight_delta = target_weights - current_weights  # shape (num_assets,)
+        
+        # Apply deadband: set small changes to zero
+        deadband_mask = np.abs(weight_delta) < deadband
+        weight_delta_filtered = weight_delta.copy()
+        weight_delta_filtered[deadband_mask] = 0.0
+        
+        # Apply soft step: move partway toward target
+        executed_delta = step_size * weight_delta_filtered
+        
+        # Compute executed weights
+        executed_weights = current_weights + executed_delta
+        
+        # Normalize (enforce w_i >= 0, sum(w) = 1)
+        executed_weights = np.clip(executed_weights, 0.0, None)
+        total = np.sum(executed_weights)
+        if total > 1e-8:
+            executed_weights = executed_weights / total
+        else:
+            # Fallback: if all weights vanish, stay put
+            executed_weights = current_weights.copy()
+
+        # Snapshot for the execution-gap reward term (raw intended vs. actually realized delta,
+        # BEFORE the post-trade renormalization above so cash/asset deltas stay additive).
+        self._last_paa_weight_delta = weight_delta.astype(np.float32).copy()
+        self._last_paa_executed_delta = executed_delta.astype(np.float32).copy()
+
+        return executed_weights.astype(np.float32)
+
+    def execute_instructions(self, instructions: List[TradeInstruction]) -> Tuple[ExecutionResult, List[Dict[str, Any]]]:
+        """
+        Execute list of TradeInstruction in simple/tranche modes.
+        Returns ExecutionResult aggregate and per-trade TradeResult dicts.
+        """
+        num_assets = self.market_data_cache.num_assets
+        asset_to_index = self.market_data_cache.asset_to_index
+
+        trades_executed = np.zeros(num_assets, dtype=np.float32)  # shares signed
+        traded_notional_per_asset = np.zeros(num_assets, dtype=np.float32)
+        total_transaction_costs = 0.0
+        trade_results: List[Dict[str, Any]] = []
+
+        # Determine execution price source index
+        def resolve_execution_price_idx():
+            if self.price_source == "current_close":
+                idx = self.current_absolute_step
+            else:
+                # next_open: use next bar; we price at open but costs use notional at that price
+                idx = self.current_absolute_step + 1
+            return idx
+
+        for instr in instructions:
+            reason = _validate_instruction(instr, asset_to_index)
+            if reason:
+                trade_results.append({
+                    "success": False, "symbol": instr.symbol, "action": instr.action,
+                    "requested_qty": float(instr.quantity) if instr.quantity is not None else None, 
+                    "requested_notional": float(instr.notional) if instr.notional is not None else None,
+                    "executed_qty": 0.0,
+                    "execution_price": None, "notional": 0.0, "transaction_cost": 0.0,
+                    "reason": reason
+                })
+                continue
+
+            sym_idx = asset_to_index[instr.symbol]
+            price_idx = resolve_execution_price_idx()
+            # Price availability
+            if price_idx < 0 or price_idx >= self.market_data_cache.num_days:
+                trade_results.append({
+                    "success": False, "symbol": instr.symbol, "action": instr.action,
+                    "requested_qty": float(instr.quantity) if instr.quantity is not None else None,
+                    "requested_notional": float(instr.notional) if instr.notional is not None else None,
+                    "executed_qty": 0.0,
+                    "execution_price": None, "notional": 0.0, "transaction_cost": 0.0,
+                    "reason": "end_of_data"
+                })
+                continue
+
+            # Execution price: open at next bar or close at current bar
+            if self.price_source == "current_close":
+                execution_price = float(self.market_data_cache.close_prices[price_idx, sym_idx])
+            else:
+                execution_price = float(self.market_data_cache.open_prices[price_idx, sym_idx])
+            if not np.isfinite(execution_price) or execution_price <= 0:
+                trade_results.append({
+                    "success": False, "symbol": instr.symbol, "action": instr.action,
+                    "requested_qty": float(instr.quantity) if instr.quantity is not None else None,
+                    "requested_notional": float(instr.notional) if instr.notional is not None else None,
+                    "executed_qty": 0.0,
+                    "execution_price": None, "notional": 0.0, "transaction_cost": 0.0,
+                    "reason": "no_price"
+                })
+                continue
+
+            # LIMIT semantics
+            if instr.order_type == "LIMIT":
+                lp = float(instr.limit_price)
+                if instr.action == "BUY" and not (lp >= execution_price):
+                    trade_results.append({
+                        "success": False, "symbol": instr.symbol, "action": instr.action,
+                        "requested_qty": float(instr.quantity) if instr.quantity is not None else None,
+                        "requested_notional": float(instr.notional) if instr.notional is not None else None,
+                        "executed_qty": 0.0,
+                        "execution_price": execution_price, "notional": 0.0,
+                        "transaction_cost": 0.0, "reason": "limit_not_reached"
+                    })
+                    continue
+                if instr.action == "SELL" and not (lp <= execution_price):
+                    trade_results.append({
+                        "success": False, "symbol": instr.symbol, "action": instr.action,
+                        "requested_qty": float(instr.quantity) if instr.quantity is not None else None,
+                        "requested_notional": float(instr.notional) if instr.notional is not None else None,
+                        "executed_qty": 0.0,
+                        "execution_price": execution_price, "notional": 0.0,
+                        "transaction_cost": 0.0, "reason": "limit_not_reached"
+                    })
+                    continue
+
+            # Compute requested shares based on quantity or notional
+            req_qty = None
+            req_notional = None
+            if instr.quantity is not None:
+                req_qty = float(instr.quantity)
+            elif instr.notional is not None:
+                req_notional = float(instr.notional)
+                req_qty = float(req_notional / execution_price) if execution_price > 0 else 0.0
+
+            current_shares = float(self.portfolio_state.positions[sym_idx])
+            executed_qty = 0.0
+            mode = self.execution_mode
+            reason_final: Optional[str] = None
+
+            if mode == EXECUTION_SIMPLE:
+                if instr.action == "BUY":
+                    # Target absolute shares = quantity
+                    target_shares = req_qty
+                    # Cap by max_position_shares_per_symbol
+                    if self.max_position_shares_per_symbol is not None:
+                        target_shares = min(target_shares, float(self.max_position_shares_per_symbol))
+                    delta = target_shares - current_shares
+                    if delta > 0:  # need to buy
+                        executed_qty = delta
+                    else:          # need to sell down
+                        executed_qty = -min(-delta, current_shares)  # negative indicates sell shares
+                else:  # SELL closes entire position
+                    delta = -current_shares
+                    if not self.allow_short:
+                        delta = max(delta, -current_shares)  # cannot go below 0
+                    executed_qty = delta
+            elif mode == EXECUTION_TRANCHE:
+                if instr.action == "BUY":
+                    delta = req_qty
+                    # Cap by max_position_shares_per_symbol
+                    max_cap = self.max_position_shares_per_symbol
+                    if max_cap is not None and (current_shares + delta) > max_cap:
+                        delta = max(0.0, float(max_cap) - current_shares)
+                        reason_final = "position_capped"
+                    executed_qty = max(0.0, delta)  # buying shares
+                else:  # SELL
+                    delta = -req_qty
+                    if not self.allow_short:
+                        # Cap so final position >= 0
+                        delta = max(delta, -current_shares)
+                        if -req_qty < -current_shares:
+                            reason_final = "short_not_allowed"
+                    executed_qty = delta  # negative shares means sell
+            else:
+                # Should not reach here in portfolio mode
+                raise ValueError("Trade instruction mode in simple/tranch non existent.")
+
+            # Cash sufficiency for BUY legs
+            if executed_qty > 0:
+                notional = executed_qty * execution_price
+                # Estimate transaction cost for buy
+                total_transaction_cost = self._calculate_transaction_costs(
+                    shares_traded=np.eye(1, self.market_data_cache.num_assets, sym_idx, dtype=np.float32)[0] * executed_qty,
+                    prices=self.market_data_cache.close_prices[price_idx],  # costs scale with notional; price choice consistent
+                    abs_step=price_idx
+                )
+                cash_needed = notional + total_transaction_cost
+                if cash_needed > self.portfolio_state.cash:
+                    # Cap shares by cash
+                    cap_shares = max(0.0, (self.portfolio_state.cash - total_transaction_cost) / execution_price)
+                    cap_shares = float(np.floor(cap_shares)) if cap_shares > 0 else 0.0
+                    if cap_shares <= 0:
+                        executed_qty = 0.0
+                        notional = 0.0
+                        total_transaction_cost = 0.0
+                        reason_final = "insufficient_cash"
+                    else:
+                        executed_qty = cap_shares
+                        notional = executed_qty * execution_price
+                        total_transaction_cost = self._calculate_transaction_costs(
+                            shares_traded=np.eye(1, self.market_data_cache.num_assets, sym_idx, dtype=np.float32)[0] * executed_qty,
+                            prices=self.market_data_cache.close_prices[price_idx],
+                            abs_step=price_idx
+                        )
+                        reason_final = "cash_capped"
+
+                # Apply buy
+                if executed_qty > 0:
+                    self._book_cost_components(total_transaction_cost)
+                    self.portfolio_state.positions[sym_idx] += executed_qty
+                    self.portfolio_state.cash -= (notional + total_transaction_cost)
+                    trades_executed[sym_idx] += executed_qty
+                    traded_notional_per_asset[sym_idx] += notional
+                    total_transaction_costs += total_transaction_cost
+                    trade_results.append({
+                        "success": True, "symbol": instr.symbol, "action": instr.action,
+                        "requested_qty": float(instr.quantity) if instr.quantity is not None else None,
+                        "requested_notional": float(instr.notional) if instr.notional is not None else None,
+                        "executed_qty": executed_qty,
+                        "execution_price": execution_price, "notional": notional,
+                        "transaction_cost": total_transaction_cost, "reason": reason_final
+                    })
+                else:
+                    trade_results.append({
+                        "success": False, "symbol": instr.symbol, "action": instr.action,
+                        "requested_qty": float(instr.quantity) if instr.quantity is not None else None,
+                        "requested_notional": float(instr.notional) if instr.notional is not None else None,
+                        "executed_qty": 0.0,
+                        "execution_price": execution_price, "notional": 0.0,
+                        "transaction_cost": 0.0, "reason": reason_final or "insufficient_cash"
+                    })
+                    # print(f"TradeInstruction BUY for {instr.symbol} at price {execution_price} for "
+                    #       f"qty={instr.quantity} notional={instr.notional}: could not be executed. Reason: {reason_final or 'insufficient_cash'}")
+                    # print(f"    Current cash: {self.portfolio_state.cash}, needed: {cash_needed} (notional {notional} + tc {tc})")
+
+            elif executed_qty < 0:
+                sell_shares = -executed_qty
+                # Cap sells if not allow_short and not enough shares (already handled)
+                notional = sell_shares * execution_price
+                total_transaction_cost = self._calculate_transaction_costs(
+                    shares_traded=-np.eye(1, self.market_data_cache.num_assets, sym_idx, dtype=np.float32)[0] * sell_shares,
+                    prices=self.market_data_cache.close_prices[price_idx],
+                    abs_step=price_idx
+                )
+                self._book_cost_components(total_transaction_cost)
+                # Apply sell
+                self.portfolio_state.positions[sym_idx] -= sell_shares
+                if not self.allow_short:
+                    # enforce non-negative floor
+                    self.portfolio_state.positions[sym_idx] = max(0.0, self.portfolio_state.positions[sym_idx])
+                self.portfolio_state.cash += (notional - total_transaction_cost)
+                trades_executed[sym_idx] -= sell_shares
+                traded_notional_per_asset[sym_idx] += notional
+                total_transaction_costs += total_transaction_cost
+                trade_results.append({
+                    "success": True, "symbol": instr.symbol, "action": instr.action,
+                    "requested_qty": float(instr.quantity) if instr.quantity is not None else None,
+                    "requested_notional": float(instr.notional) if instr.notional is not None else None,
+                    "executed_qty": sell_shares,
+                    "execution_price": execution_price, "notional": notional,
+                    "transaction_cost": total_transaction_cost, "reason": reason_final
+                })
+            else:
+                # No-op
+                trade_results.append({
+                    "success": False, "symbol": instr.symbol, "action": instr.action,
+                    "requested_qty": float(instr.quantity) if instr.quantity is not None else None,
+                    "requested_notional": float(instr.notional) if instr.notional is not None else None,
+                    "executed_qty": 0.0,
+                    "execution_price": execution_price, "notional": 0.0,
+                    "transaction_cost": 0.0, "reason": reason_final or "no_execution"
+                })
+
+        traded_shares_total = float(np.sum(np.abs(trades_executed)))
+        total_traded_notional = float(np.sum(traded_notional_per_asset))
+
+        if total_traded_notional > 0:
+            self.last_execution_step = self.current_step
+
+        exec_result = ExecutionResult(
+            current_step=self.current_step,
+            trades_executed=trades_executed,
+            executed_prices=self.portfolio_state.prices.copy(),
+            transaction_cost=float(total_transaction_costs),
+            success=bool(total_traded_notional > 0),
+            traded_dollar_value=total_traded_notional,
+            traded_shares_total=traded_shares_total,
+            traded_notional_per_asset=traded_notional_per_asset
+        )
+        return exec_result, trade_results
+    
+    def _expand_shares(self, shares_subset: np.ndarray, mask: np.ndarray, num_assets: int) -> np.ndarray:
+        """Utility: embed subset shares into full-length array."""
+        full = np.zeros(num_assets, dtype=np.float32)
+        full[mask] = shares_subset
+        return full
+    
+    def _calculate_transaction_costs(self, shares_traded: np.ndarray, prices: np.ndarray,
+                                     abs_step: int, asset_mask: Optional[np.ndarray] = None) -> float:
+        """
+        Transaction costs model (commission + spread + ADV-based impact).
+        All terms scale with traded notional. Impact depends on fraction of ADV$.
+        - commission_bps: per-dollar commission (e.g., 0.00005 = 0.5 bps)
+        - half_spread_bps: expected half-spread cost (e.g., 0.0005 = 5 bps)
+        - impact_coeff: multiplier on sqrt(trade_notional / ADV$) (e.g., 0.1)
+
+        Args:
+        - shares_traded: np.ndarray of shares traded per asset (positive for buy, negative for sell)
+        - prices: np.ndarray of current prices per asset
+
+
+        Return:
+        - Total transaction costs as a float
+        """
+        cfg_env = self.config['environment']
+        commission_bps = float(cfg_env.get('commission_bps', 0.000005))
+        half_spread_bps = float(cfg_env.get('half_spread_bps', 0.00002))
+        impact_coeff = float(cfg_env.get('impact_coeff', 0.3))
+        adv_window = int(cfg_env.get('adv_window', 60))
+        fixed_fee = float(cfg_env.get('fixed_fee_per_order', 1.0))
+
+        # Full-length traded_notional
+        traded_notional_full = np.abs(shares_traded) * prices  # [A]
+
+        start = max(0, abs_step - adv_window)
+        end = abs_step
+        if end <= start:
+            prev_idx = max(0, end - 1)
+            adv_dollar_full = np.maximum(1.0,
+                                         self.market_data_cache.volumes[prev_idx] *
+                                         self.market_data_cache.close_prices[prev_idx])
+        else:
+            vol_slice = self.market_data_cache.volumes[start:end]      # [W, A]
+            px_slice = self.market_data_cache.close_prices[start:end]  # [W, A]
+            adv_dollar_full = np.maximum(1.0, np.mean(vol_slice * px_slice, axis=0))
+
+        if asset_mask is not None:
+            traded_notional = traded_notional_full[asset_mask]
+            adv_dollar = adv_dollar_full[asset_mask]
+        else:
+            traded_notional = traded_notional_full
+            adv_dollar = adv_dollar_full
+
+        if np.sum(traded_notional) == 0.0:
+            return 0.0
+
+        commission_cost = commission_bps * np.sum(traded_notional)
+        spread_cost = half_spread_bps * np.sum(traded_notional)
+        impact_term = traded_notional * np.sqrt(traded_notional / adv_dollar)
+        impact_cost = impact_coeff * np.sum(impact_term)
+        num_orders = int(np.sum(traded_notional > 0))
+        fixed_cost = fixed_fee * num_orders
+
+        total_cost = float(commission_cost + spread_cost + impact_cost + fixed_cost)
+        # Record components for episode metrics
+        self._last_cost_breakdown = (
+            float(commission_cost),
+            float(spread_cost),
+            float(impact_cost),
+            float(fixed_cost),
+        )
+        return total_cost
+
+    def _book_cost_components(self, cost: float) -> None:
+        """Add the components of the cost just computed (and charged) to this step's breakdown."""
+        if cost > 0.0:
+            self._step_cost_breakdown += np.asarray(self._last_cost_breakdown, dtype=np.float64)
+    
+    def _initialize_portfolio_with_costs(
+        self, 
+        target_positions: np.ndarray, 
+        initial_prices: np.ndarray,
+        initial_value: float,
+        allow_cash_residual: bool = True,
+        max_iterations: int = 6
+    ) -> Tuple[float, np.ndarray, float]:
+        """
+        Calculate initial portfolio positions accounting for transaction costs.
+        
+        For portfolios that must be fully invested (benchmark), iteratively reduces
+        position sizes to ensure costs can be paid while leaving minimal cash.
+        
+        Args:
+            target_positions: Desired positions in shares [num_assets]
+            initial_prices: Asset prices at initialization [num_assets]
+            initial_value: Total portfolio value to allocate
+            allow_cash_residual: If True, allows small cash remainder (for benchmark)
+            max_iterations: Max adjustment iterations (3 is sufficient for convergence)
+        
+        Returns:
+            Tuple of (final_cash, final_positions, transaction_costs)
+        """
+        num_assets = len(target_positions)
+        
+        # Calculate transaction costs for target positions
+        tc = self._calculate_transaction_costs(
+            shares_traded=target_positions,
+            prices=initial_prices,
+            abs_step=self.current_absolute_step,
+            asset_mask=None
+        )
+        
+        # Calculate gross cost (positions + transaction costs)
+        position_notional = np.sum(target_positions * initial_prices)
+        total_cost = position_notional + tc
+        
+        # Case 1: Standard portfolio (with intended cash allocation)
+        if not allow_cash_residual:
+            # Simple: reduce available cash by transaction costs
+            final_cash = initial_value - total_cost
+            return float(final_cash), target_positions.copy(), float(tc)
+        
+        # Case 2: Fully-invested portfolio (benchmark)
+        # Must iteratively adjust to ensure: positions + costs <= initial_value
+        # and leave minimal cash (< $1)
+        
+        if total_cost <= initial_value:
+            # Lucky case: already fits with small residual
+            final_cash = initial_value - total_cost
+            return float(final_cash), target_positions.copy(), float(tc)
+        
+        # Need to scale down positions iteratively
+        scale_factor = 1.0
+        final_positions = target_positions.copy()
+        
+        for iteration in range(max_iterations):
+            # Shrinking positions also shrinks tc, so this lands within budget with a residual of cents
+            scale_factor *= initial_value / total_cost
+            final_positions = target_positions * scale_factor
+            
+            # Recalculate costs with scaled positions
+            tc = self._calculate_transaction_costs(
+                shares_traded=final_positions,
+                prices=initial_prices,
+                abs_step=self.current_absolute_step,
+                asset_mask=None
+            )
+            
+            position_notional = np.sum(final_positions * initial_prices)
+            total_cost = position_notional + tc
+            
+            if total_cost <= initial_value:
+                final_cash = initial_value - total_cost
+                return float(final_cash), final_positions.astype(np.float32), float(tc)
+        
+        # Fallback: return best effort (should rarely reach here)
+        final_cash = max(0.0, initial_value - total_cost)
+        return float(final_cash), final_positions.astype(np.float32), float(tc)
+
+    def _check_execution_thresholds(self, target_weights: np.ndarray, portfolio_state: PortfolioState) -> Tuple[bool, np.ndarray]:
+        """
+        Determine if execution should occur based on multiple thresholds.
+        Returns (should_execute, adjusted_target_weights).
+        If should_execute False, returns current weights for idempotence.
+        Thresholds (configurable):
+          - execution_weight_change_threshold: sum |Δw|
+          - execution_min_per_asset_weight_change: max |Δw_i|
+          - execution_min_trade_value_threshold: total $ to reallocate
+          - execution_min_days_between_trades: min steps since last real execution
+        """
+        current_weights = portfolio_state.get_weights()
+        # Weight diffs
+        weight_diffs_assets = target_weights[1:] - current_weights[1:]  # exclude cash
+        abs_diffs_assets = np.abs(weight_diffs_assets)
+
+        # Config thresholds
+        agg_change_thresh = float(self.config['environment'].get('execution_weight_change_threshold', 0.02))
+        per_asset_change_thresh = float(self.config['environment'].get('execution_min_per_asset_weight_change', 0.01))
+        min_trade_value_thresh = float(self.config['environment'].get('execution_min_trade_value_threshold', 250.0))
+        min_days_between = int(self.config['environment'].get('execution_min_days_between_trades', 1))
+
+        # Aggregate metrics
+        sum_abs_change = float(np.sum(abs_diffs_assets))
+        max_abs_change = float(np.max(abs_diffs_assets)) if abs_diffs_assets.size else 0.0
+        total_value = float(portfolio_state.get_total_value())
+        # Approx dollar turnover (assets only)
+        combined_trade_value = float(np.sum(abs_diffs_assets * total_value))
+
+        # Days since last execution
+        steps_since_last = (self.current_step - self.last_execution_step) if self.last_execution_step >= 0 else np.inf
+
+        # Gate checks
+        if max_abs_change < per_asset_change_thresh:
+            return False, current_weights
+        if sum_abs_change < agg_change_thresh:
+            return False, current_weights
+        if combined_trade_value < min_trade_value_thresh:
+            return False, current_weights
+        if steps_since_last < min_days_between:
+            return False, current_weights
+
+        # Normalize tiny floating noise (optional deadband)
+        # If after rounding diffs vanish, skip execution
+        if np.all(abs_diffs_assets < 1e-5):
+            return False, current_weights
+
+        # Passed all gates
+        return True, target_weights
+
+
+    def get_observation_sequence(self):
+        """
+        Generate sequential observation for DRL agent with maximum computational efficiency.
+
+        Returns:
+            Flattened observation array optimized for SB3 LSTM processing
+            Shape: (total_observation_size,)
+            - feature part: [lookback_window, num_assets, num_asset_features]
+            - portfolio part: [lookback_window, num_portfolio_features]            
+        
+        Performance Optimizations:
+        - Reuse pre-allocated arrays where possible
+        - Vectorized numpy operations throughout
+        - Minimal memory allocations
+        - Efficient data access patterns
+        - In-place operations when safe
+        """
+
+        # Get features lookback: shape [lookback_window, num_assets, num_selected_features]
+        features_sequence = self.market_data_cache.get_features_lookback(self.current_absolute_step, self.lookback_window)
+
+        # Get portfolio lookback: shape [lookback_window, num_portfolio_features]
+        # Includes sequences for: weights, alpha, sharpe_ratio, drawdown, volatility, turnover,
+        #                         allocator_rewards
+        portfolio_sequence = self.episode_buffer.get_observation_lookback()
+        
+        # Flatten components, if necessary
+        features_sequence_flat = features_sequence.flatten()
+        portfolio_sequence_flat = portfolio_sequence.flatten()
+
+        # Check that the flattened observation matches the predefined observation space shape
+        assert features_sequence_flat.shape[0] + portfolio_sequence_flat.shape[0] == self.observation_space.shape[0], \
+            f"Observation shape mismatch: expected {self.observation_space.shape[0]}, got {features_sequence_flat.shape[0] + portfolio_sequence_flat.shape[0]}"
+        
+        # Concatenate all components
+        observation = np.concatenate([
+            features_sequence_flat,
+            portfolio_sequence_flat
+        ]).astype(np.float32)
+
+        return observation 
+    
+    def get_observation_single_step(self):
+        """
+        Generate single-step observation for agents like RecurrentPPO or PPO that do not require sequences.
+
+        Returns:
+            Flattened observation array optimized for SB3 processing
+            Shape: (total_observation_size,)
+            - feature part: [num_assets, num_asset_features]
+            - portfolio part: [num_portfolio_features]            
+        
+        Performance Optimizations:
+        - Reuse pre-allocated arrays where possible
+        - Vectorized numpy operations throughout
+        - Minimal memory allocations
+        - Efficient data access patterns
+        - In-place operations when safe
+        """
+
+        # Use the last recorded external step from EpisodeBuffer for portfolio features
+        # We recorded with external_step = self.current_step
+        external_step_for_obs = self.current_step
+        if self.maybe_provide_sequence:
+            internal_step = external_step_for_obs + self.lookback_window
+        else:
+            internal_step = external_step_for_obs
+        # Clamp to valid buffer range
+        internal_step = int(np.clip(internal_step, 0, self.episode_buffer.portfolio_values.shape[0] - 1))
+
+        
+        if self.execution_mode == EXECUTION_SINGLE_ASSET_TARGET_POS:
+            # Pull only choosen asset features
+            asset_index = self.selected_asset_index
+            if asset_index is None:
+                raise ValueError("Selected asset index is not set for SINGLE_ASSET_TARGET_POS mode.")
+            # Get features for current step: shape [num_selected_features]
+            features = self.market_data_cache.get_features_at_step(self.current_absolute_step)[asset_index]
+            # Get portfolio features for current step: shape [num_portfolio_features]
+            # Map to internal buffer index considering lookback warmup
+            internal_step = external_step_for_obs + (self.lookback_window if self.maybe_provide_sequence else 0)
+
+            # Extract weights: index 0 is cash, index (asset_index + 1) is the selected asset
+            weights_vec = self.episode_buffer.portfolio_weights[internal_step]
+            cash_weight = float(weights_vec[0])
+            asset_weight = float(weights_vec[asset_index + 1])
+
+            # Calc log metrics for cash and asset notional
+            cash_notional = cash_weight * self.episode_buffer.portfolio_values[internal_step]
+            asset_notional = asset_weight * self.episode_buffer.portfolio_values[internal_step]
+            initial_portfolio_value = self.initial_portfolio_value
+
+            cash_log_value = np.log(cash_notional / initial_portfolio_value) if cash_notional > 0 else 0.0
+            asset_log_value = np.log(asset_notional / initial_portfolio_value) if asset_notional > 0 else 0.0
+
+
+            # Daily return of the full portfolio for this step
+            daily_portfolio_return = float(self.episode_buffer.returns[internal_step])
+
+            # Daily return of just cash change plus selected asset notional change
+            daily_agent_return = float(self.episode_buffer.saa_returns[internal_step])
+
+            # Last agents action
+            last_action = float(self.episode_buffer.actions[internal_step, asset_index + 1])
+            
+            risk_free_rate_zscore_60d = float(
+                self.market_data_cache.get_risk_free_rate_zscore_at_step(self.current_absolute_step)
+            )
+            daily_asset_alpha_risk_free = float(
+                self.market_data_cache.get_asset_excess_log_return_over_rf_at_step(
+                    self.current_absolute_step,
+                    asset_index,
+                )
+            )
+            # Build minimal portfolio features for single-asset mode.
+            portfolio_feature_list = [
+                cash_log_value,
+                asset_log_value,
+                daily_agent_return,
+                last_action,
+            ]
+            if self.include_risk_free_zscore_feature:
+                portfolio_feature_list.append(risk_free_rate_zscore_60d)
+            portfolio_feature_list.append(daily_asset_alpha_risk_free)
+            if self.effr_level_active:
+                effr_level_scaled = float(
+                    self.market_data_cache.get_risk_free_rate_pa_at_step(self.current_absolute_step)
+                ) / 0.1
+                portfolio_feature_list.append(effr_level_scaled)
+
+            portfolio_features = np.array(portfolio_feature_list, dtype=np.float32)
+
+            # Verify that all values contain numeric values before concatenation and guard!
+            if not np.all(np.isfinite(features)):
+                features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+                print(f"Warning: Non-finite feature values encountered at step {self.current_absolute_step} for asset index {asset_index}. Replaced with zeros.")
+            if not np.all(np.isfinite(portfolio_features)):
+                portfolio_features = np.nan_to_num(portfolio_features, nan=0.0, posinf=0.0, neginf=0.0)
+                print(f"Warning: Non-finite portfolio feature values encountered at step {internal_step}. Replaced with zeros.")
+                
+            # One-hot asset-ID vector: shape [num_assets]. Argmax is invariant to VecNormalize
+            # affine transforms, so the embedding lookup inside InputMLPFeatures is always correct.
+            one_hot_asset_id = np.zeros(self.market_data_cache.num_assets, dtype=np.float32)
+            one_hot_asset_id[self.selected_asset_index] = 1.0
+
+            observation = np.concatenate([
+                features,
+                portfolio_features,
+                one_hot_asset_id,
+            ]).astype(np.float32)
+
+            return observation
+
+        else:    
+            # Get features for current step: shape [num_assets, num_selected_features]
+            features = self.market_data_cache.get_features_at_step(self.current_absolute_step)
+
+            # Get portfolio features for current step: shape [num_portfolio_features]
+            portfolio_features = self.episode_buffer.get_observation_at_step(external_step_for_obs)
+
+            # Verify that all values contain numeric values before concatenation and guard!
+            if not np.all(np.isfinite(features)):
+                features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+                print(f"Warning: Non-finite feature values encountered at step {self.current_absolute_step} for asset index {asset_index}. Replaced with zeros.")
+            if not np.all(np.isfinite(portfolio_features)):
+                portfolio_features = np.nan_to_num(portfolio_features, nan=0.0, posinf=0.0, neginf=0.0)
+                print(f"Warning: Non-finite portfolio feature values encountered at step {internal_step}. Replaced with zeros.")
+                
+
+            # Concatenate all components
+            observation = np.concatenate([
+                features.flatten(),
+                portfolio_features
+            ]).astype(np.float32)
+
+            return observation

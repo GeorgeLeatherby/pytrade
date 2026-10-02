@@ -1,10 +1,11 @@
 {
     "saa_config":{
-        "saa_run_id": "00076",
+        "saa_run_id": "00239",
         "saa_base_dir":"src/agents/RecurrPPO_target_position_agent/saved_models",
-        "saa_config_id": "00010",
-        "saa_run_date": "26_02_28",
-        "device": "cpu"
+        "saa_config_id": "01058",
+        "saa_run_date": "26_08_13",
+        "saa_checkpoint_name": "best_model_pv_minus_selected_asset_bh_abs_mean",
+        "device": "cuda"
     },
 
   "allocator_transformer": {
@@ -105,7 +106,7 @@
     "environment": {
         "assets": ["SPY", "EWG", "EWH", "EWJ", "EWQ", "EWS", "EWT", "EWU", "EWY", "Crude", "Gold"],
         "execution_mode": "portfolio_weights",
-        "initial_portfolio_value": 10000,
+        "initial_portfolio_value": 100000,
         "episode_length_days": 252,
         "lookback_window": 0,
         "early_stopping_threshold": 0.2,
@@ -115,13 +116,26 @@
         "block_buffer_multiplier": 1.0,
         "test_val_split_ratio": 0.20,
 
-        "sortino_eta": 0.015,
-        "lambda_drawdown": 0.001,
+        "sortino_eta": 0.035,
+        "lambda_drawdown": 0.15,
         "sortino_net_reward_mix": 0.3,
+        "log_sortino_net_reward_mix": 0.3,
         "lambda_spread": 0.0,
         "lambda_transaction_cost": 0.001,
+        "lambda_execution_gap": 0.04,
+
+        "paa_excess_log_return_scale": 10.0,
+        "paa_linear_sortino_net_reward_scale": 2.5,
+        "paa_sortino_warmup_steps": 8,
+        "paa_drawdown_level_penalty_coeff": 0.0,
+        "paa_realized_exit_bonus_coeff": 0.0,
+        "paa_reward_tanh_divisor": 2.0,
+        "paa_reward_tanh_scale": 1.0,
+        "paa_under_exec_penalty_mult": 0.8,
+        "paa_over_exec_penalty_mult": 1.0,
 
         "percentage_of_cash_only_starts": 0.10,
+        "min_initial_cash_allocation": 0.1,
 
         "execution_min_share_threshold": 0.1,
         "execution_min_trade_value_threshold": 50.0,
@@ -145,7 +159,7 @@
     },
 
     "critic_pretraining": {
-        "enabled": true,
+        "enabled": false,
         "warmup_steps": 20000,
         "train_episodes": 100,
         "validation_episodes": 10,
@@ -160,15 +174,15 @@
     },
 
     "portfolio_allocator_agent":{
-        "device": "cpu",
+        "device": "cuda",
         "verbose": 1,
-        "n_epochs": 3,
-        "n_steps": 4096,
-        "batch_size": 2048,
-        "gamma": 0.995,
+        "n_epochs": 4,
+        "n_steps": 1008,
+        "batch_size": 252,
+        "gamma": 0.988,
         "gae_lambda": 0.98,
         "vf_coef": 0.4,
-        "max_grad_norm": 0.4,
+        "max_grad_norm": 0.3,
         "target_kl": 0.01,
         "normalize_advantage": true,
         "log_std_init": -1.0,
@@ -201,14 +215,14 @@
 
     "training": {
         "seed": 42,
-        "total_timesteps": 10000000,
+        "n_envs": 8,
+        "vec_env_start_method": "spawn",
+        "total_timesteps": 8000000,
         "train_log_freq": 10,
-        "eval_freq": 50000,
-        "n_eval_episodes": 30,
-        "patience": 10,
+        "eval_freq": 12500,
+        "patience": 30,
         "min_delta_reward": 0.0,
         "min_delta_sharpe": 0.0,
-        "eval_deterministic": true,
         "progress_bar": true,
         "config_id": 10007,
         "tensorboard_log": "src/agents/PPO_portfolio_allocator_weights/tb_logs"

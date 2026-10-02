@@ -9,6 +9,7 @@ runs/
 *.csv
 *.xlsx
 *.xls
+*.png
 
 # rules.md
 # thoughts.md
@@ -21,9 +22,6 @@ runs/
 
 # Exclude the full report section for now.
 reports/
-
-# utils
-utils/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
