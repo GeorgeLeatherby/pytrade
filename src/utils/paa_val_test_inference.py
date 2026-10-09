@@ -81,11 +81,24 @@ from agents.PAA_cross_sectional_only.PAA_cross_sectional_only import ZeroSignalW
 # =====================================================================================
 HIERARCHICAL_PAA_CHECKPOINTS: List[str] = [
     r"src\agents\PPO_portfolio_allocator_weights\saved_models\00283_config_10019_26_10_02\best_model_excess_over_spy_abs.zip",
+    r"src\agents\PPO_portfolio_allocator_weights\saved_models\00284_config_10020_26_10_03\best_model_excess_over_spy_abs.zip",
+    r"src\agents\PPO_portfolio_allocator_weights\saved_models\00285_config_10021_26_10_03\best_model_excess_over_spy_abs.zip",
+    r"src\agents\PPO_portfolio_allocator_weights\saved_models\00286_config_10022_26_10_03\best_model_excess_over_spy_abs.zip",
+    r"src\agents\PPO_portfolio_allocator_weights\saved_models\00287_config_10023_26_10_04\best_model_excess_over_spy_abs.zip",
+    r"src\agents\PPO_portfolio_allocator_weights\saved_models\00288_config_10024_26_10_05\best_model_excess_over_spy_abs.zip",
+    r"src\agents\PPO_portfolio_allocator_weights\saved_models\00289_config_10025_26_10_05\best_model_excess_over_spy_abs.zip",
+    r"src\agents\PPO_portfolio_allocator_weights\saved_models\00290_config_10026_26_10_05\best_model_excess_over_spy_abs.zip",
 ]
 CONTROL_ABLATION_AR1_CHECKPOINTS: List[str] = [
+    r"src\agents\PAA_with_autoregressive_rnd_walk_SAA\saved_models\00291_config_20001_26_10_05\best_model_excess_over_spy_abs.zip",
+    r"src\agents\PAA_with_autoregressive_rnd_walk_SAA\saved_models\00292_config_20002_26_10_06\best_model_excess_over_spy_abs.zip",
+    r"src\agents\PAA_with_autoregressive_rnd_walk_SAA\saved_models\00293_config_20003_26_10_06\best_model_excess_over_spy_abs.zip",
     r"src\agents\PAA_with_autoregressive_rnd_walk_SAA\saved_models\00294_config_20004_26_10_06\best_model_excess_over_spy_abs.zip",
 ]
 CROSS_SECTIONAL_ABLATION_CHECKPOINTS: List[str] = [
+    r"src\agents\PAA_cross_sectional_only\saved_models\00295_config_30001_26_10_07\best_model_excess_over_spy_abs.zip",
+    r"src\agents\PAA_cross_sectional_only\saved_models\00296_config_30002_26_10_07\best_model_excess_over_spy_abs.zip",
+    r"src\agents\PAA_cross_sectional_only\saved_models\00297_config_30003_26_10_07\best_model_excess_over_spy_abs.zip",
     r"src\agents\PAA_cross_sectional_only\saved_models\00298_config_30004_26_10_07\best_model_excess_over_spy_abs.zip",
 ]
 
