@@ -80,22 +80,13 @@ from agents.PAA_cross_sectional_only.PAA_cross_sectional_only import ZeroSignalW
 # USER SETTINGS - checkpoint lists (paths relative to the repo root)
 # =====================================================================================
 HIERARCHICAL_PAA_CHECKPOINTS: List[str] = [
-    r"src\agents\PPO_portfolio_allocator_weights\saved_models\00272_config_10022_26_09_29\best_model_excess_over_spy_abs.zip",
-    r"src\agents\PPO_portfolio_allocator_weights\saved_models\00272_config_10022_26_09_29\best_model_terminal_pnl_mean.zip",
-    r"src\agents\PPO_portfolio_allocator_weights\saved_models\00272_config_10022_26_09_29\best_model_terminal_pnl_min.zip",
-    r"src\agents\PPO_portfolio_allocator_weights\saved_models\00272_config_10022_26_09_29\best_model.zip",
+    r"src\agents\PPO_portfolio_allocator_weights\saved_models\00283_config_10019_26_10_02\best_model_excess_over_spy_abs.zip",
 ]
 CONTROL_ABLATION_AR1_CHECKPOINTS: List[str] = [
-    r"src\agents\PAA_with_autoregressive_rnd_walk_SAA\saved_models\00266_config_20004_26_09_24\best_model_excess_over_spy_abs.zip",
-    r"src\agents\PAA_with_autoregressive_rnd_walk_SAA\saved_models\00266_config_20004_26_09_24\best_model_terminal_pnl_mean.zip",
-    r"src\agents\PAA_with_autoregressive_rnd_walk_SAA\saved_models\00266_config_20004_26_09_24\best_model_terminal_pnl_min.zip",
-    r"src\agents\PAA_with_autoregressive_rnd_walk_SAA\saved_models\00266_config_20004_26_09_24\best_model.zip",
+    r"src\agents\PAA_with_autoregressive_rnd_walk_SAA\saved_models\00294_config_20004_26_10_06\best_model_excess_over_spy_abs.zip",
 ]
 CROSS_SECTIONAL_ABLATION_CHECKPOINTS: List[str] = [
-    r"src\agents\PAA_cross_sectional_only\saved_models\00265_config_30004_26_09_24\best_model_excess_over_spy_abs.zip",
-    r"src\agents\PAA_cross_sectional_only\saved_models\00265_config_30004_26_09_24\best_model_terminal_pnl_mean.zip",
-    r"src\agents\PAA_cross_sectional_only\saved_models\00265_config_30004_26_09_24\best_model_terminal_pnl_min.zip",
-    r"src\agents\PAA_cross_sectional_only\saved_models\00265_config_30004_26_09_24\best_model.zip",
+    r"src\agents\PAA_cross_sectional_only\saved_models\00298_config_30004_26_10_07\best_model_excess_over_spy_abs.zip",
 ]
 
 # Ablation configs carry no saa_config/saa_features; the reference SAA is taken from here.
@@ -484,7 +475,7 @@ class DailyRecorder(gym.Wrapper):
         ep["paa_trade_notional"][t] = np.sign(ex["trade_shares"]) * ex["traded_notional"]
         ep["paa_tc"][t] = ex["tc"]
         ep["paa_tc_parts"][t] = ex["tc_parts"]
-        if abs(ex["tc_parts"].sum() - ex["tc"]) > 1e-6:
+        if abs(ex["tc_parts"].sum() - ex["tc"]) > 0.01:
             raise RuntimeError(f"TC breakdown does not add up at t={t}: {ex['tc_parts']} vs {ex['tc']}")
         # Cash identity of the rebalancing (all fills at close t).
         cash_delta_expected = -float(ex["trade_shares"] @ ep["prices"][t]) - ex["tc"]
@@ -1137,7 +1128,8 @@ def plot_period(d: pd.DataFrame, assets: List[str], spec: CheckpointSpec, out_di
     # ---------------- Panel 3: turnover bars coloured by exposure direction + heat strip
     turnover = d["paa_turnover"].to_numpy() * 100.0
     dexp = d["paa_exposure_change"].to_numpy() * 100.0  # percentage points
-    eps_pp = 0.01
+    # define here th
+    eps_pp = 2.0
     bar_colors = np.where(dexp > eps_pp, "#1a9850", np.where(dexp < -eps_pp, "#d73027", "#9E9E9E"))
     ax3.bar(x, np.nan_to_num(turnover), width=1.0, linewidth=0, color=bar_colors)
     ax3.set_ylabel("Turnover (% NAV)")

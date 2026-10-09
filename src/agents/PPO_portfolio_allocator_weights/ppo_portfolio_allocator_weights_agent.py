@@ -323,6 +323,10 @@ class AllocatorEvalCallback(BaseCallback):
     - highest mean excess return over SPY buy-and-hold (absolute)
     - highest mean terminal PnL (absolute)
     - highest worst-block terminal PnL (absolute)
+
+    Training stops only when all available early-stopping metrics (mean reward,
+    mean Sharpe, and mean excess return over SPY) have failed to improve for
+    `patience` evaluations.
     """
 
     def __init__(
@@ -335,6 +339,7 @@ class AllocatorEvalCallback(BaseCallback):
         patience: int = 7,
         min_delta_reward: float = 0.0,
         min_delta_sharpe: float = 0.0,
+        min_delta_excess: float = 0.0,
         verbose: int = 0
     ):
         super().__init__(verbose)
@@ -355,8 +360,10 @@ class AllocatorEvalCallback(BaseCallback):
         self.patience = patience
         self.min_delta_reward = min_delta_reward
         self.min_delta_sharpe = min_delta_sharpe
+        self.min_delta_excess = min_delta_excess
         self.no_improve_reward = 0
         self.no_improve_sharpe = 0
+        self.no_improve_excess = 0
 
         self.n_eval_calls = 0
         self._sweep_plan: List[Dict[str, Any]] = []
@@ -468,7 +475,12 @@ class AllocatorEvalCallback(BaseCallback):
 
         # --- Checkpoints on the three validation metrics ---
         vcb = self.eval_step_callback
+        excess_improved = False
         if vcb is not None:
+            excess_improved = (
+                vcb.last_excess_over_spy_abs_mean
+                > self.best_excess_over_spy_abs_mean + self.min_delta_excess
+            )
             if vcb.last_excess_over_spy_abs_mean > self.best_excess_over_spy_abs_mean:
                 self.best_excess_over_spy_abs_mean = vcb.last_excess_over_spy_abs_mean
                 self._save_checkpoint("best_model_excess_over_spy_abs")
@@ -527,17 +539,43 @@ class AllocatorEvalCallback(BaseCallback):
                     f"(current={mean_sharpe:.4f}, best={self.best_mean_sharpe:.4f})"
                 )
 
+        mean_excess = vcb.last_excess_over_spy_abs_mean if vcb is not None else -np.inf
+        if excess_improved:
+            self.no_improve_excess = 0
+        else:
+            self.no_improve_excess += 1
+            if mean_excess == -np.inf:
+                print(
+                    "[AllocatorEvalCallback] WARNING: Excess-return buffer was empty this eval - "
+                    "SPY excess-return early stopping condition is inactive."
+                )
+            else:
+                print(
+                    f"[AllocatorEvalCallback] Excess return over SPY has not improved for "
+                    f"{self.no_improve_excess}/{self.patience} eval calls "
+                    f"(current={mean_excess:.4f}, best={self.best_excess_over_spy_abs_mean:.4f})"
+                )
+
         sharpe_available = mean_sharpe > -np.inf
+        excess_available = mean_excess > -np.inf
         if (
             self.no_improve_reward >= self.patience
             and self.no_improve_sharpe >= self.patience
+            and self.no_improve_excess >= self.patience
             and sharpe_available
+            and excess_available
         ):
+            # Preserve the exact model and normalization state at the point where
+            # the stop condition was observed, even if no best metric changed.
+            self._save_checkpoint("last_model")
             print(
                 f"[AllocatorEvalCallback] Early stopping triggered: "
-                f"neither mean reward ({mean_reward:.4f}) nor mean Sharpe ({mean_sharpe:.4f}) "
-                f"have improved for {self.patience} consecutive eval calls. "
-                f"Best reward={self.best_mean_reward:.4f}, best Sharpe={self.best_mean_sharpe:.4f}."
+                f"mean reward ({mean_reward:.4f}), mean Sharpe ({mean_sharpe:.4f}), "
+                f"or mean excess return over SPY ({mean_excess:.4f}) "
+                f"have not improved for {self.patience} consecutive eval calls. "
+                f"Best reward={self.best_mean_reward:.4f}, best Sharpe={self.best_mean_sharpe:.4f}, "
+                f"best excess={self.best_excess_over_spy_abs_mean:.4f}. "
+                "Saved last_model checkpoint."
             )
             return False
 
@@ -1618,7 +1656,8 @@ def build_allocator_eval_callback(
     
     Config Keys Used:
     - training.eval_freq: Steps between evaluations (default: 10000)
-    - training.patience / min_delta_reward / min_delta_sharpe: early stopping
+    - training.patience / min_delta_reward / min_delta_sharpe /
+      min_delta_excess: early stopping
     - training.verbose: Verbosity level (default: 1)
     """
     # Extract training configuration section
@@ -1632,6 +1671,7 @@ def build_allocator_eval_callback(
     patience = int(train_cfg.get("patience", 10))
     min_delta_reward = float(train_cfg.get("min_delta_reward", 0.0))
     min_delta_sharpe = float(train_cfg.get("min_delta_sharpe", 0.0))
+    min_delta_excess = float(train_cfg.get("min_delta_excess", 0.0))
 
     # Verbosity level for logging
     # 0 = silent, 1 = info, 2 = debug
@@ -1663,6 +1703,7 @@ def build_allocator_eval_callback(
         patience=patience, 
         min_delta_reward=min_delta_reward, 
         min_delta_sharpe=min_delta_sharpe,   
+        min_delta_excess=min_delta_excess,
         verbose=verbose                       # Logging verbosity
     )
     
