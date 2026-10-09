@@ -1128,8 +1128,8 @@ def plot_period(d: pd.DataFrame, assets: List[str], spec: CheckpointSpec, out_di
     # ---------------- Panel 3: turnover bars coloured by exposure direction + heat strip
     turnover = d["paa_turnover"].to_numpy() * 100.0
     dexp = d["paa_exposure_change"].to_numpy() * 100.0  # percentage points
-    # define here th
-    eps_pp = 2.0
+    # define here threshold for significant exposure change coloring
+    eps_pp =0.5
     bar_colors = np.where(dexp > eps_pp, "#1a9850", np.where(dexp < -eps_pp, "#d73027", "#9E9E9E"))
     ax3.bar(x, np.nan_to_num(turnover), width=1.0, linewidth=0, color=bar_colors)
     ax3.set_ylabel("Turnover (% NAV)")
