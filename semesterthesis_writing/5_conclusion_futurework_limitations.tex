@@ -1,0 +1,46 @@
+\section{Conclusion, Future Work, and Limitations}
+\label{sec:conclusion}
+
+\textbf{\textit{Working notes for the final chapter. The findings below follow from the validation-selected PAA results; the editorial checks are not intended for the submitted thesis.}}
+
+\subsection{Conclusion}
+
+PyTrade demonstrates that a portfolio-level PPO policy can make profitable, cost-aware cross-sectional allocation decisions within the implemented simulator. The validation-selected hierarchical PAA, AR(1) control, and cross-sectional-only PAA return \(29.46\%\), \(26.63\%\), and \(31.83\%\) on the final test block. All exceed SPY buy-and-hold's \(22.22\%\), but only the cross-sectional-only PAA approximately matches equal-weight buy-and-hold's \(31.80\%\). Positive SPY-relative returns therefore do not establish superiority over all passive alternatives.
+
+The modular interface functions, but the frozen SAA does not provide a consistent performance advantage. Its contribution is associated with stronger allocation in val\_02 and weaker outcomes in val\_03. The cross-sectional-only PAA has the highest selected-model mean validation excess and test return, with a much smaller test drawdown than the hierarchy. The defensible contribution is a tested signal-transfer architecture and evidence that temporal specialization need not improve allocation, not a claim that hierarchy necessarily dominates. Connect this conclusion to Section~\ref{sec:modular-composition} and the controlled comparisons in Section~\ref{sec:paa-results-discussion}.
+
+\subsection{Limitations}
+\label{sec:limitations}
+
+\begin{itemize}
+\item \textbf{Selection and replication.} Checkpoints and run candidates are selected on repeatedly consulted validation blocks. The final test is excluded from selection, but one held-out block does not establish robustness across future regimes. The metadata records repeated seeds for the ablations; the reported candidates do not constitute four documented independent-seed replications per family. Selected-model differences are descriptive, not statistical significance claims.
+\item \textbf{Stochastic control.} The AR(1) control is evaluated with one seeded noise realization on validation and a different seeded realization on test. Its results combine allocator behavior and noise-path variability. Repeated noise-path evaluations are needed to estimate expected control performance.
+\item \textbf{Reward and investment objective.} SPY-relative return is the selection criterion, not a constrained drawdown objective or a test of universal risk-adjusted superiority. The hierarchical PAA's \(24.75\%\) test MDD contrasts with SPY's \(9.13\%\). None of the selected PAAs exceeds SPY or equal-weight buy-and-hold on the exported test Sharpe ratio.
+\item \textbf{Metric conventions.} PAA returns are cumulative, whereas the preceding SAA tables annualize return and alpha. PAA MDDs are positive loss magnitudes. Exported Sharpe uses daily raw returns without subtracting cash carry. Validation and test horizons differ, and block means are not statistics of one compounded path.
+\item \textbf{Execution realism.} Net returns include the configured transaction costs, but high turnover makes them sensitive to the friction assumptions. Daily closing-price replay, exogenous prices, and a parametric impact charge do not reproduce intraday liquidity, executable quotes, or the portfolio's effect on subsequent market prices.
+\item \textbf{Transfer versus bookkeeping.} Agreement between injected and reference shadow signals supports operational correctness, not predictive skill or equality with the standalone SAA evaluation distribution. Freezing and isolating the SAA do not eliminate regime dependence or guarantee that the allocator will discount an unreliable signal.
+\item \textbf{Identification.} The cross-sectional-only ablation retains engineered history-dependent features and running portfolio statistics. It is not a policy with no temporal information. No separate attention ablation establishes that attention itself causes the observed gains.
+\end{itemize}
+
+\subsection{Future Work}
+\label{sec:future-work}
+
+Prioritize matched independent training seeds across the three PAA families, then repeated AR(1) inference seeds. Use additional untouched test windows, or a preregistered rolling evaluation, rather than repeatedly reusing the present test block. Paired return comparisons should account for serial dependence, for example through a block bootstrap, and retain a fixed validation-only selection rule.
+
+The monolithic end-to-end baseline was not implemented. A future comparison should jointly learn temporal representation and allocation from the same features, using comparable architectural building blocks, training budget, simulator, and evaluation conditions. Report the frozen SAA's pretraining cost as part of the hierarchical system's total compute. This is needed to test modular versus joint learning directly; the cross-sectional-only ablation answers a narrower signal-transfer question.
+
+Investigate a regime-conditioned gate or uncertainty feature for the SAA signal, rather than assuming the allocator will always learn when to ignore it. Separate the action signal from the shadow holding fraction in further ablations. An attention-free allocator would distinguish useful market features from gains attributable to cross-sectional attention.
+
+Evaluate higher commissions and spreads, alternative impact assumptions, lower-liquidity settings, and larger capital scales. Compare drawdown-constrained or lower-turnover selection rules against the present SPY-excess objective, using validation only. Recompute conventional excess-over-cash Sharpe ratios from the available daily series before making broader risk-adjusted claims.
+
+\subsection*{Editorial Checks Before Submission}
+
+\begin{itemize}
+\item Verify training-seed provenance against original run artifacts. The exports record seeds 42/42/42/8 for runs 00291--00294 and 42/8/42/8 for runs 00295--00298, rather than four distinct seeds. Do not silently relabel them.
+\item Reconcile the standalone SAA ensemble with the PAA harness's regenerated SAA reference. The earlier val\_02 aggregate reports approximately \(19.5\%\), while the PAA reference reports approximately \(-0.04\%\), despite the shared checkpoint identity. Establish which initialization, normalization, action, or execution settings account for the difference before claiming evaluation equivalence.
+\item Audit Chapter 3's feature counts and active reward terms against the latest environment and the run metadata. In particular, the EFFR-level feature was added after earlier token descriptions; several described reward coefficients are zero in the selected PAA configuration. Distinguish available mechanisms from active penalties.
+\item Retain the acknowledged purge-window limitation: a 60-day gap does not formally cover the FFD cap of 120 days plus subsequent rolling normalization. Document the realized lookback and distinguish historical block holdout from strict chronological walk-forward retraining.
+\item Align the Chapter 4 opening with the completed comparisons; it still anticipates an architectural baseline now reserved for future work. Avoid promises of tests absent from the results.
+\item Six PAA figure placeholders have been added: hierarchy val\_02, hierarchy and cross-sectional-only val\_03, and the test graphs for all three selected models. The corresponding PNGs are not present in the inspected inference folders. Use the final graph exports and retain the more precise JSON values where the graph descriptions round differently.
+\item The thesis entry file currently inputs a differently named, absent final-chapter file. This notes file is deliberately not connected to it yet. Resolve the final input name when integrating the finished chapter.
+\end{itemize}
