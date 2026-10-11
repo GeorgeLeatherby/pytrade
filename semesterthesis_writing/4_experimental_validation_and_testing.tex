@@ -88,7 +88,7 @@ Configurations \texttt{01056} and \texttt{01057} differ only in the reward squas
 \subsubsection{Results}
 \label{sec:saa-results-presentation}
 
-Table~\ref{tab:saa-per-asset-metrics} gives the selected configuration's results. Returns and both alpha measures are annualized. Asset $\alpha$ uses the assigned asset's buy-and-hold return; Market $\alpha$ uses SPY. Turnover sums absolute day-to-day action changes. Cost is cumulative transaction cost relative to initial capital. The symbol \O{} denotes an arithmetic mean across assets or validation blocks.
+Table~\ref{tab:saa-per-asset-metrics} shows the selected configuration's results. Returns and both alpha measures are annualized. Asset $\alpha$ uses the assigned asset's buy-and-hold return; Market $\alpha$ uses SPY. Turnover sums absolute day-to-day action changes. Cost is cumulative transaction cost relative to initial capital. The symbol \O{} denotes an arithmetic mean across assets or validation blocks.
 
 % SAA per-asset performance table (BEGIN)
 \begin{table}[p]
@@ -178,16 +178,17 @@ In val\_02, the equal-weight SAA portfolio rises steadily during the first half 
 \label{fig:saa-agg-val02}
 \end{figure}
 
+
 \begin{figure}[p]
 \centering
-\includegraphics[width=\textwidth]{graphs/asset-specific_saa_portfolio_test_page1_20180227_20190423_26_09_27_14_02.png}
+\includegraphics[width=\textwidth, height=0.99\textheight, keepaspectratio]{graphs/asset-specific_saa_portfolio_test_page1_20180227_20190423_26_09_27_14_02.png}
 \caption{Per-asset evaluation for configuration 01056, val\_02, page 1 of 2.}
 \label{fig:saa-assets-val02-p1}
 \end{figure}
 
 \begin{figure}[p]
 \centering
-\includegraphics[width=\textwidth]{graphs/asset-specific_saa_portfolio_test_page2_20180227_20190423_26_09_27_14_02.png}
+\includegraphics[width=\textwidth, height=0.99\textheight, keepaspectratio]{graphs/asset-specific_saa_portfolio_test_page2_20180227_20190423_26_09_27_14_02.png}
 \caption{Per-asset evaluation for configuration 01056, val\_02, page 2 of 2.}
 \label{fig:saa-assets-val02-p2}
 \end{figure}
@@ -203,14 +204,14 @@ Val\_03 shows a different balance between participation and protection. During t
 
 \begin{figure}[p]
 \centering
-\includegraphics[width=\textwidth]{graphs/asset-specific_saa_portfolio_test_page1_20240226_20250422_26_09_27_14_02.png}
+\includegraphics[width=\textwidth, height=0.99\textheight, keepaspectratio]{graphs/asset-specific_saa_portfolio_test_page1_20240226_20250422_26_09_27_14_02.png}
 \caption{Per-asset evaluation for configuration 01056, val\_03, page 1 of 2.}
 \label{fig:saa-assets-val03-p1}
 \end{figure}
 
 \begin{figure}[p]
 \centering
-\includegraphics[width=\textwidth]{graphs/asset-specific_saa_portfolio_test_page2_20240226_20250422_26_09_27_14_02.png}
+\includegraphics[width=\textwidth, height=0.99\textheight, keepaspectratio]{graphs/asset-specific_saa_portfolio_test_page2_20240226_20250422_26_09_27_14_02.png}
 \caption{Per-asset evaluation for configuration 01056, val\_03, page 2 of 2.}
 \label{fig:saa-assets-val03-p2}
 \end{figure}
@@ -219,9 +220,9 @@ Figure~\ref{fig:saa_train_vs_validation} provides a separate checkpoint-level wa
 
 \begin{figure}[htbp]
   \centering
-  \includegraphics[width=0.95\textwidth]{semesterthesis_writing/graphs/train_pv_minus_selected_asset_bh_abs_mean.png}%
+  \includegraphics[width=0.85\textwidth]{semesterthesis_writing/graphs/train_pv_minus_selected_asset_bh_abs_mean.png}%
   \newline
-  \includegraphics[width=0.95\textwidth, trim={10pt 0 0 0}]{semesterthesis_writing/graphs/validation_pv_minus_selected_asset_bh_abs_mean.png}
+  \includegraphics[width=0.85\textwidth, trim={10pt 0 0 0}]{semesterthesis_writing/graphs/validation_pv_minus_selected_asset_bh_abs_mean.png}
   \caption{Training (top) and validation (bottom) of asset $\alpha$ over training steps for several configurations.}
   \label{fig:saa_train_vs_validation}
 \end{figure}
@@ -230,28 +231,28 @@ The PPO diagnostics do not contradict this choice. Approximate Kullback--Leibler
 
 \begin{figure}[htbp]
     \centering
-    \includegraphics[width=0.95\textwidth]{graphs/train_approx_kl.png}
+    \includegraphics[width=0.85\textwidth]{graphs/train_approx_kl.png}
     \caption{Approximate Kullback--Leibler divergence during training.}
     \label{fig:train_approx_kl}
 \end{figure}
 
 \begin{figure}[htbp]
     \centering
-    \includegraphics[width=0.95\textwidth]{graphs/train_explained_variance.png}
+    \includegraphics[width=0.85\textwidth]{graphs/train_explained_variance.png}
     \caption{Training Explained Variance across Configurations.}
     \label{fig:train_explained_variance}
 \end{figure}
 
 \begin{figure}[htbp]
     \centering
-    \includegraphics[width=0.95\textwidth]{graphs/train_policy_gradient_loss.png}
+    \includegraphics[width=0.85\textwidth]{graphs/train_policy_gradient_loss.png}
     \caption{Training Policy Gradient Loss across Configurations.}
     \label{fig:train_policy_gradient_loss}
 \end{figure}
 
 \begin{figure}[htbp]
     \centering
-    \includegraphics[width=0.95\textwidth]{graphs/train_value_loss.png}
+    \includegraphics[width=0.85\textwidth]{graphs/train_value_loss.png}
     \caption{Training Value Loss across Configurations.}
     \label{fig:train_value_loss}
 \end{figure}
@@ -295,7 +296,7 @@ J_{\mathrm{val}} = \frac{1}{4}\sum_{b=0}^{3}\left(R_{\mathrm{PAA},b}-R_{\mathrm{
 \end{equation}
 Every evaluation starts from \(V_0=\$100{,}000\), so maximizing this criterion is equivalent to maximizing mean dollar excess value. These are cumulative block returns, not the annualized alpha measures used in the preceding SAA tables. Each validation block receives equal weight. Neither test return nor test risk metrics enter selection; only the three validation-selected candidates are reported on the final test block.
 
-All PAA evaluations use deterministic policy actions, meaning that the policy chooses its predicted mean action rather than sampling an action, and a cash-only start. The AR(1) control additionally uses a reproducible noise realization, with separate validation and test seeds. A seed fixes the random-number sequence used in a run. Validation blocks contain 289 or 290 recorded dates; the test block contains 252. Returns are net of simulated transaction costs and include cash carry derived from the Effective Federal Funds Rate (EFFR), as defined in Section~\ref{sec:saa}. The full-feature comparison retains the same reward settings and configured training budget.
+All PAA evaluations use deterministic policy actions, meaning that the policy chooses its predicted mean action rather than sampling an action, and a cash-only start. The AR(1) control additionally uses a reproducible noise realization, with separate validation and test seeds. A seed fixes the random-number sequence used in a run. Validation blocks contain 289 or 290 recorded dates; the test block contains 252, which represents a full trading year. Returns are net of simulated transaction costs and include cash carry derived from the Effective Federal Funds Rate (EFFR), as defined in Section~\ref{sec:saa}. The full-feature comparison retains the same reward settings and configured training budget.
 
 The reported Sharpe ratio is \(\sqrt{252}\,\bar r/s(r)\), where \(\bar r\) is the mean daily simple return and \(s(r)\) its sample standard deviation, calculated after the initialization row. It measures return relative to daily variability; unlike a conventional excess-over-cash Sharpe ratio, this export does not subtract the risk-free rate. Maximum drawdown (MDD) is the largest percentage fall from a preceding portfolio-value peak and is reported as a positive loss magnitude. Net asset value (NAV) is the current value of cash and holdings combined. Turnover sums each day's traded notional divided by that day's NAV, so turnover of \(40\) times NAV describes repeated trading relative to a changing portfolio value, not a \(4000\%\) loss. Risky exposure is the share invested in non-cash assets, including commodities as well as equities. Means of block-level returns, Sharpe ratios, and MDDs are arithmetic summaries of independently reset blocks, not statistics of one concatenated investment path.
 
@@ -340,12 +341,12 @@ Table~\ref{tab:paa-run-selection} reports every eligible candidate. Runs \texttt
 \label{tab:paa-run-selection}
 \end{table}
 
-Run \texttt{00283}, configuration \texttt{10019}, is selected for the hierarchy: its \(7.76\)-point mean excess exceeds the next full-feature candidate's \(4.05\) points. The highest reduced-feature score is \(2.70\) points. For the control, run \texttt{00294}, configuration \texttt{20004}, scores \(5.56\) points, compared with \(2.45\) for its nearest competitor. For the cross-sectional-only PAA, run \texttt{00298}, configuration \texttt{30004}, scores \(8.01\) points, ahead of run \texttt{00295}'s \(6.93\). These selections follow Equation~\ref{eq:paa-selection}; lower drawdown or higher Sharpe is not an alternative selection rule.
+Run \texttt{00283}, configuration \texttt{10019}, is selected for the hierarchy: its \(7.76\)-point mean excess exceeds the next full-feature candidate's \(4.05\) points. A reduced feature hierarchical PAA was also tested in the final runs, however its highest score is only \(2.70\) points. For the control, run \texttt{00294}, configuration \texttt{20004}, scores \(5.56\) points, compared with \(2.45\) for its nearest competitor. For the cross-sectional-only PAA, run \texttt{00298}, configuration \texttt{30004}, scores \(8.01\) points, ahead of run \texttt{00295}'s \(6.93\). These selections follow Equation~\ref{eq:paa-selection}; lower drawdown or higher Sharpe is not an alternative selection rule.
 
 Across all four candidates, mean validation excess is \(3.53\) points for the full-feature hierarchy, \(1.59\) for the reduced-feature hierarchy, \(1.86\) for the control, and \(4.44\) for the cross-sectional-only family. Removing the five-day features lowers the group mean, although two of the four paired seeds improve. The reduced input set was not pursued further.
 
 \paragraph{Validation performance during training.}
-Figure~\ref{fig:excess_return_over_training} follows the four full-feature hierarchical configurations as Proximal Policy Optimization (PPO) updates their weights. Each plotted point evaluates a checkpoint on all four validation blocks; it is not a return earned on the training episodes. The horizontal axis measures training steps in units of \(10^7\), from zero to approximately 16 million steps. The vertical axis reports mean cumulative \emph{dollar excess value}: the final PAA value minus SPY buy-and-hold value, averaged across the four blocks. With \(\$100{,}000\) initial capital, \(\$5{,}000\) excess corresponds to five percentage points in Equation~\ref{eq:paa-selection}.
+Figure~\ref{fig:excess_return_over_training} follows the four full-feature hierarchical configurations. Each plotted point evaluates a checkpoint on all four validation blocks; it is not a return earned on the training episodes. The horizontal axis measures training steps in units of \(10^7\), from zero to approximately 16 million steps. The vertical axis reports mean cumulative \emph{dollar excess value}: the final PAA value minus SPY buy-and-hold value, averaged across the four blocks. With \(\$100{,}000\) initial capital, \(\$5{,}000\) excess corresponds to five percentage points in Equation~\ref{eq:paa-selection}.
 
 Configuration \texttt{10019} (blue) continues to approximately 15.5 million steps. From about 7.5 million steps onwards, its mean excess remains above \(\$5{,}000\), with several peaks near \(\$8{,}000\). The selected checkpoint occurs at approximately 11.25 million steps, within this sustained high-performance region. Five additional checkpoints exceed \(\$7{,}500\). Thus the selected value is accompanied by several similarly performing alternatives rather than standing alone above otherwise weak neighboring checkpoints (Figure~\ref{fig:excess_return_over_training}).
 
@@ -494,7 +495,7 @@ The SAA's incremental contribution is not consistently positive. The selected hi
 
 The cross-sectional-only result does not imply that temporal information is irrelevant. Multi-horizon returns, fractional differentiation, recorded allocation targets, and running account statistics already summarize history (Sections~\ref{sec:state-returns}, \ref{sec:state-ffd}, and~\ref{sec:paa-state}). Moreover, the hierarchy transfers action, exposure, and shadow risk summaries together. Replacing the action source also changes those account histories, while the zero-signal variant retains the risk-summary fields for untraded cash accounts. The comparison therefore tests the combined frozen-policy/shadow-account interface; it cannot isolate an action-only effect or identify which transferred quantity helps or hurts. This qualifies the recurrent-memory motivation reviewed in Chapter~2 \cite{hausknecht2015deep}: usefulness depends on the information already available and its transfer to the allocation objective.
 
-\paragraph{Regime Correspondence Between the Single-Asset Policy and the Hierarchy.}
+\paragraph{Regime Correspondence Between the Single-Asset Policy and the PAA hierarchy.}
 The strongest correspondence occurs in val\_02 and val\_03. The selected SAA's period-average Asset \(\alpha\) is \(20.08\%\) in val\_02 and \(-0.99\%\) in val\_03 (Table~\ref{tab:saa-per-asset-metrics}); the hierarchy likewise leads both ablations in val\_02 but substantially trails them in val\_03. Relative to the cross-sectional-only PAA, its return advantage of \(11.73\) points in val\_02 is more than offset by a \(14.21\)-point shortfall in val\_03. Averaging the blocks therefore conceals a large reversal in the value associated with adding the specialist.
 
 The market conditions in Table~\ref{tab:oos-blocks} help interpret this reversal. Val\_02 contains a broad decline followed by recovery, while gold and equities partly diverge. The standalone SAA ensemble largely preserves earlier gains through the sell-off (Figure~\ref{fig:saa-agg-val02}), consistent with the long-only specialist reducing exposure when holding its assigned asset becomes unattractive. The hierarchical PAA also outperforms the passive market references, but follows a different risk path: it rotates between concentrated risky holdings and incurs a \(15.27\%\) drawdown (Figure~\ref{fig:paa-hier-val02}). Its advantage is compatible with useful timing context being combined with asset selection; it is not evidence that the allocator simply reproduces the SAA ensemble's defensive cash positions.

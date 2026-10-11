@@ -20,9 +20,9 @@ The available history is divided into repeated training and validation blocks, f
 \begin{equation}
 [\text{train}_0][\text{purge}][\text{val}_0]\,[\text{train}_1][\text{purge}][\text{val}_1]\,\cdots\,[\text{purge}][\text{test}].
 \end{equation}
-Each training--validation pair reserves approximately \(20\%\) of its usable dates for validation, separated from training by a 60-trading-day purge. The final test also has a preceding purge. A purge is an interval excluded from both adjacent samples to reduce dependence through overlapping feature histories. Training episodes span 252 trading days and remain entirely within one block; start dates are sampled with block weights proportional to usable length. Evaluation uses the fixed blocks described in Section~\ref{sec:oos-protocol}.
+Each training--validation pair reserves approximately \(20\%\) of its usable dates for validation, separated from training by a 60-trading-day purge. The final test also has a preceding purge. A purge is an interval excluded from both adjacent samples to reduce dependence through overlapping feature histories. During training a randomly starting consecutive 252 day episode is picked from a training block, meaning that each training episode remains entirely within one chosen block. This ensures that the available daily data is used evenly. Evaluation uses the fixed blocks described in Section~\ref{sec:oos-protocol}.
 
-Features are calculated causally, using only information available by the observation date. The purge exceeds the dominant 36-day normalization window, but does not formally cover the maximum 120-day fractional-differentiation lookback plus subsequent normalization (Section~\ref{sec:state-ffd}). No additional purge is placed between a validation block and the following training block. Consequently, this is a purged historical block holdout, not strict walk-forward retraining in which every evaluated date follows all training dates.
+Features are calculated using only information available by the observation date. The purge exceeds the dominant 36-day normalization window, but does not formally cover the maximum 120-day fractional-differentiation lookback plus subsequent normalization (Section~\ref{sec:state-ffd}). However in \cite{LopezdePrado.2018} the impact of days from the second lookback half is examined to be small on the resulting feature. No additional purge is placed between a validation block and the following training block. Consequently, this is a purged historical block holdout, not strict walk-forward retraining in which every evaluated date follows all training dates.
 
 The protocol follows the motivation for purged financial evaluation discussed by L\'opez de Prado \cite{LopezdePrado.2018}: serial dependence and overlapping histories can make shuffled validation misleading. Several historical validation blocks expose regime dependence, while the final test remains excluded from design and checkpoint selection. Full combinatorial purged cross-validation, which evaluates many combinations of held-out blocks, is not used because repeated complete policy training would exceed the computational budget.
 
@@ -87,7 +87,7 @@ The SAA learns position changes for one asset, while the PAA allocates capital a
 
 At each trading day, the observation supplies market features and account information. The policy emits a position change or allocation request; the simulator executes it, revalues the portfolio, and scores the result. PPO updates network parameters from batches of these trajectories. Episodes differ in their historical intervals and initial accounts, but replayed prices do not respond to the agent's trades.
 
-Splitting the temporal problem from the cross-sectional problem is a direct architectural response to two very different structures in the underlying decision problem, not merely a modeling convenience. Learning a good trading rule for one asset from its own price history has a strong sequential-memory requirement: an unusual move today only makes sense read against the last weeks of context, which recurrent networks such as the Long Short-Term Memory (LSTM) cell used here are specifically built to carry forward. Learning how eleven assets should be weighted \emph{against each other}, by contrast, is at every instant a set problem rather than a sequence problem: given today's picture of all eleven assets, the right relative allocation does not fundamentally depend on the order in which the assets happen to be listed, which is exactly the permutation-respecting structure a self-attention mechanism (Section~\ref{sec:paa}) provides and a recurrent network does not. Asking one, monolithic network to learn both structures at once would force it to discover this decomposition on its own, from a reward signal alone; PyTrade instead builds the decomposition directly into the architecture, training a temporal specialist first and a cross-sectional specialist second, and only asking the second network to learn the comparatively narrower problem of how much to trust the first.
+Splitting the temporal problem from the cross-sectional problem is a direct architectural response to two very different structures in the underlying decision problem, not merely a modeling convenience. Learning a good trading rule for one asset from its own price history has a strong sequential-memory requirement: an unusual move today only makes sense read against the last weeks of context, which recurrent networks such as the Long Short-Term Memory (LSTM) cell used here are specifically built to carry forward. Learning how eleven assets should be weighted \emph{against each other}, by contrast, is at every instant a set problem rather than a sequence problem: given today's picture of all eleven assets, the right relative allocation does not fundamentally depend on the order in which the assets happen to be listed, which is exactly the permutation-respecting structure a self-attention mechanism (Section~\ref{sec:paa}) provides and a recurrent network does not. Asking one, monolithic network to learn both structures at once would force it to discover this decomposition on its own, from a single reward signal alone; PyTrade instead builds the decomposition directly into the architecture, training a temporal specialist first and a cross-sectional specialist second, and only asking the second network to learn the comparatively narrower problem of how much to trust the first.
 
 We formalize both layers' decision problems with the same general tuple and instantiate it twice, with agent-specific state, action, and observation spaces, in Sections~\ref{sec:saa} and~\ref{sec:paa}. A Partially Observable Markov Decision Process (POMDP) is a tuple
 
@@ -103,13 +103,13 @@ Partial observability arises because daily prices and engineered features omit m
 \subsection{State Representation: A Shared Feature Engineering Pipeline}
 \label{sec:state}
 
-Raw price levels are generally non-stationary; adding more history does not remove their changing scale. A weakly \emph{stationary} process has a constant mean and variance, with covariance depending on the lag rather than calendar time. Features whose typical scale changes between training and evaluation can weaken a learned decision rule. The enrichment pipeline therefore transforms OHLCV into more stable, comparable quantities. Market features are computed offline and reused; cash, weights, costs, and other action-dependent portfolio quantities are updated each step.
+Raw price levels are generally non-stationary; adding more history often worsens the changing scale. A weakly \emph{stationary} process has a constant mean and variance, with covariance depending on the lag rather than calendar time. Features whose typical scale changes between training and evaluation can weaken a learned decision rule. The enrichment pipeline therefore transforms OHLCV into more stable, comparable quantities. Market features are computed offline and reused; cash, weights, costs, and other action-dependent portfolio quantities are updated each step.
 
 Two transformations recur. Log returns, $r_t^{(N)}=\log(P_t/P_{t-N})$, add across time and represent proportional rather than dollar changes. They still record the net loss from a \(+10\%\) move followed by \(-10\%\); additivity does not cancel that loss. Rolling $z$-score standardization expresses a quantity relative to its recent mean and standard deviation:
 \begin{equation}
 \hat x_t = \frac{x_t - \mu_w(x)_t}{\sigma_w(x)_t + \epsilon},
 \end{equation}
-where $\mu_w$ and $\sigma_w$ are trailing-window statistics and $\epsilon$ prevents division by zero. Most normalization windows span 36 trading days. Some standardized quantities also pass through the hyperbolic tangent, $\tanh$, which bounds them between \(-1\) and \(1\). The same transformations are applied across assets, while each experiment fixes which features reach the specialist and the allocator's asset and portfolio tokens (Sections~\ref{sec:saa} and~\ref{sec:paa}).
+where $\mu_w$ and $\sigma_w$ are trailing-window statistics and $\epsilon$ prevents division by zero. Most normalization windows span 36 trading days, none longer then 60 to honor the purge window. Some standardized quantities also pass through the hyperbolic tangent, $\tanh$, which bounds them between \(-1\) and \(1\). The same transformations are applied across assets, while each experiment fixes which features reach the specialist (SAA) and the allocator's (PAA) asset and portfolio tokens (Sections~\ref{sec:saa} and~\ref{sec:paa}).
 
 \subsubsection{Multi-Horizon Return, Volume, and Volatility Features}
 \label{sec:state-returns}
@@ -306,7 +306,7 @@ where $g_0$ is a dynamic no-penalty band derived from the minimum trade-value th
 \subsection{Layer 1: The Single-Asset Agent}
 \label{sec:saa}
 
-The SAA is the temporal specialist. Each episode assigns one asset, and the agent decides whether to increase, reduce, or retain its position. A two-layer LSTM carries a learned summary across trading days. Market-relative features provide context, but the agent cannot move its capital to another instrument within the episode.
+The SAA is the temporal specialist. Each training episode randomly assigns one asset, and the agent decides whether to increase, reduce, or retain its position each step. A two-layer LSTM carries a learned summary across trading days. Market-relative features provide context, but the agent cannot move its capital to another instrument within the episode.
 
 \subsubsection{State, Observation, and Action Space}
 
@@ -423,7 +423,7 @@ o_t^{\text{paa}} = \big(\mathbf{T}^{(1)}_t,\, \dots,\, \mathbf{T}^{(N)}_t,\, \ma
 
 The shared embedding width is $d_{\text{model}}=64$, following standard Transformer notation \cite{vaswani2017}. Asset and portfolio tokens contain different raw information; separate learned projections map them into the common space before attention compares them.
 
-Each full-feature asset token has 32 raw inputs: 26 market features and six account or policy quantities. The latter are the specialist's current scaled action, its shadow holding fraction, the live allocator weight, the allocator's recorded target weight, and the shadow account's Sortino and drawdown summaries. The market features comprise five return, volatility, and volume quantities at each of three horizons, plus four price-bar measures, three classical indicators, correlation, beta, dispersion, and the fractionally differentiated price feature (Section~\ref{sec:state}). Four of the six added quantities describe the specialist or its hypothetical account; the other two describe the live allocator's position and request.
+Each full-feature asset token has 32 raw inputs: 26 market features and six account or policy quantities. The latter are the specialist's current scaled action, its shadow holding fraction, the live allocator weight, the allocator's recorded target weight, and the shadow account's Sortino and drawdown summaries. The market features comprise five return, volatility, and volume quantities at each of three horizons, plus four price-bar measures, three classical indicators, correlation, beta, dispersion, and the fractionally differentiated price feature (Section~\ref{sec:state}). Four of the six added quantities describe the SAA's shadow account; the other two describe the live allocator's position and request.
 
 The portfolio token has 65 raw inputs: six calendar features, twelve live weights, fourteen scalar account diagnostics, and three eleven-entry vectors containing recorded allocator targets, shadow Sortino summaries, and shadow drawdowns. The scalars comprise daily simple-return excess, rolling Sharpe, drawdown change, recent return variability, weight-change turnover, concentration, current and recorded previous Sortino, moving-average return and downside state, previous maximum drawdown, a standardized cash rate, portfolio excess log return over cash, and the daily cash rate. Observation turnover is half the summed absolute risky-weight changes, not the executed-notional turnover reported in Chapter~4.
 
@@ -462,19 +462,19 @@ This isolation prevents allocator trades from directly changing the specialist's
 \node[saabox, below=of obs1] (saa1) {Frozen SAA\\ LSTM state row $r{=}1$};
 \node[lane, below=of saa1] (sig1) {Signal $a_t^{(1)} = \kappa \cdot \hat{a}^{(1)}$\\ Shadow weight $\rho_t^{(1)}$\\ Shadow Sortino and drawdown};
 % Lane i
-\node[right=18mm of l1top] (litop) {Asset $i$ ($\cdots$)};
+\node[right=30mm of l1top] (litop) {Asset $i$ ($\cdots$)};
 \node[lane, below=of litop] (shadowi) {Shadow sub-portfolio $i$\\ cash$_i$, shares$_i$ (isolated)};
 \node[lane, below=of shadowi] (obsi) {Rebuild SAA obs.\\ market feats. + memory$_i$ + id$_i$};
 \node[saabox, below=of obsi] (saai) {Frozen SAA (shared weights)\\ LSTM state row $r{=}i$};
 \node[lane, below=of saai] (sigi) {Signal $a_t^{(i)} = \kappa \cdot \hat{a}^{(i)}$\\ Shadow weight $\rho_t^{(i)}$\\ Shadow Sortino and drawdown};
 % Lane N
-\node[right=18mm of litop] (lNtop) {Asset $11$};
+\node[right=30mm of litop] (lNtop) {Asset $11$};
 \node[lane, below=of lNtop] (shadowN) {Shadow sub-portfolio 11\\ cash$_{11}$, shares$_{11}$ (isolated)};
 \node[lane, below=of shadowN] (obsN) {Rebuild SAA obs.\\ market feats. + memory$_{11}$ + id$_{11}$};
 \node[saabox, below=of obsN] (saaN) {Frozen SAA (shared weights)\\ LSTM state row $r{=}11$};
 \node[lane, below=of saaN] (sigN) {Signal $a_t^{(11)} = \kappa \cdot \hat{a}^{(11)}$\\ Shadow weight $\rho_t^{(11)}$\\ Shadow Sortino and drawdown};
 % PAA box spanning all lanes
-\node[draw, rounded corners, fill=black!10, minimum width=132mm, minimum height=12mm, below=10mm of sigi, align=center] (paa) {Action and exposure enter asset tokens; shadow risk summaries enter both token types\\ shared attention $\to$ live portfolio weights $\mathbf{w}_t$};
+\node[draw, rounded corners, fill=black!10, minimum width=132mm, minimum height=12mm, below=10mm of sigi, align=center] (paa) {Action and exposure enter asset tokens; shadow risk summaries enter both token types\\ shared attention $\to$ actor head $\to$ live portfolio weights $\mathbf{w}_t$};
 \draw[arr] (shadow1) -- (obs1);
 \draw[arr] (obs1) -- (saa1);
 \draw[arr] (saa1) -- (sig1);
@@ -518,7 +518,7 @@ Three reference accounts must be distinguished. The reward counterfactual is ful
 \subsubsection{Network Architecture: Shared Attention with Private Heads}
 \label{sec:paa-network}
 
-The PAA is an \emph{encoder-only, identity-aware, cross-sectional Transformer actor--critic}. Encoder-only means that attention transforms the current asset and portfolio tokens without a decoder that generates an output sequence. Each decision requests one joint rebalancing vector, not a sequence of future trades, so contextual encoding followed by a fixed-size allocation head matches the control problem. Attention operates across assets at the current date; the PAA has no recurrent temporal state of its own.
+The PAA is an \emph{encoder-only, identity-aware, cross-sectional Transformer actor--critic}. Encoder-only means that attention transforms the current asset and portfolio tokens without a decoder that generates an output sequence. Each decision requests one joint rebalancing vector, not a sequence of future trades, so contextual encoding followed by a fixed-size allocation head matches the control problem. Attention operates across assets and the portfolio at the current date; the PAA has no recurrent temporal state of its own.
 
 Figure~\ref{fig:paa-arch} shows shared attention followed by separate actor and critic processing. The shared encoder has two layers, four attention heads, a 64-dimensional embedding, and 128-unit feed-forward blocks. Normalization precedes each residual block, with zero configured Transformer dropout and a Gaussian error linear unit (GELU), a smooth nonlinear activation. Residual connections add the transformed input to the original input, helping information propagate. One private encoder layer per output branch adapts the shared representation to policy and value estimation.
 
@@ -537,14 +537,15 @@ $+$ SAA signal $a_t^{(1)}$\\
 $+$ shadow holding \% $\rho_t^{(1)}$\\
 $+$ live PAA weight $w_t^{(1)}$\\
 $+$ recorded target weight\\
-$+$ shadow Sortino and drawdown};
-\node[tok, right=of t1] (t2) {\textbf{Asset token $i$}\\[1mm] Same 26 market features\\ + six account/policy quantities\\ (32 raw inputs)};
-\node[tok, right=of t2] (t3) {\textbf{Asset token 11}\\[1mm] Same 26 market features\\ + six account/policy quantities\\ (32 raw inputs)};
+$+$ shadow Sortino \\
+$+$ shadow drawdown};
+\node[tok, right=of t1] (t2) {\textbf{Asset token $i$}\\[1mm] Same 26 market features\\ + six account quantities\\ (32 raw inputs)};
+\node[tok, right=of t2] (t3) {\textbf{Asset token 11}\\[1mm] Same 26 market features\\ + six account quantities\\ (32 raw inputs)};
 \node[tok, right=of t3] (tp) {\textbf{Portfolio token}\\[1mm]
 6 calendar features\\[1mm]
 $+$ 12 live weights (cash $+$ 11)\\
 $+$ 14 scalar account statistics\\
-$+$ 11 targets and 22 shadow-risk values\\ (65 raw inputs)};
+$+$ 11 targets and 22 shadow-risk \\ values (65 raw inputs)};
 \node[fit=(t1)(t2)(t3)(tp), inner sep=0pt] (tokrow) {};
 \node[box, below=13mm of tokrow] (embed) {Project each token to $d_{\text{model}}{=}64$\\ scaled asset-identity embedding and normalization};
 \node[box, below=of embed] (shared) {Shared encoder: 2 layers, 4 heads, normalization, GELU\\ self-attention across all $N{+}1$ tokens};
