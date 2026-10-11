@@ -19,9 +19,10 @@ Reference SAA ("SAA equal-weight"): the per-asset shadow sub-portfolios in Tradi
 depend on market data and the frozen SAA, never on the PAA's actions. A dedicated reference
 pass (SAASignalWrapper, dummy PAA action) therefore yields the SAA's own books for every
 period; they are shared by all agents with the same SAA/env settings and are cross-checked
-against the hierarchical PAA's injected books. Each shadow book starts with the full
-initial capital, so the mean of the N books equals the SAA managing the PAA's capital
-split 1/N per asset (exact up to the sqrt market-impact term, which is not scale-free).
+against the hierarchical PAA's injected books. Each SAA executes at its own training
+capital and with its own training frictions. Exported shadow balances and costs are
+scaled proportionally to the PAA's initial capital; their mean is the normalized
+equal-weight SAA reference, not a re-execution at a different account size.
 
 Usage (from repo root):  python src/utils/paa_val_test_inference.py
 """
@@ -360,6 +361,8 @@ class DailyRecorder(gym.Wrapper):
                 orig_apply(actions_per_asset)
             finally:
                 rec._in_saa_apply = False
+            if te._saa_shadow_envs:
+                rec._saa_tc = te._saa_shadow_transaction_costs.copy()
             cash1, sh1, _, _ = te.episode_buffer.get_saa_sub_state(t)
             px = te.portfolio_state.prices.astype(np.float64)
             post_cash = cash1.astype(np.float64)
@@ -948,9 +951,9 @@ COLUMN_DOC = {
     "ew_bh_value": "1/N equal-weight buy-and-hold of all assets from day 0 (same cost-aware init as SPY B&H).",
     "cash_value": "100% cash compounding at the EFFR carry.",
     "env_benchmark_value": "TradingEnv fixed-weight benchmark (45% SPY, 20% Gold, ...), buy-and-hold.",
-    "saa_ew_value": "Frozen reference SAA managing the PAA's capital split 1/N across its per-asset shadow books.",
+    "saa_ew_value": "Mean of standalone SAA accounts executed at SAA training capital/frictions, normalized to PAA capital.",
     "saa_sub_value_<A> / saa_signal_<A> / saa_sub_weight_post_<A> / saa_trade_notional_<A>":
-        "Reference SAA shadow book of asset A (each started with the full capital): MTM value at t, committed "
+        "Reference SAA account of asset A (balances normalized to PAA capital): MTM value at t, committed "
         "(scaled) target_position_change at t, asset holding share after the day-t SAA trade, signed traded notional.",
     "saa_ew_tc / saa_ew_exposure_post": "Mean shadow-book transaction cost at t and mean holding share after the SAA trade.",
     "inj_*": "Same as saa_* but for the signal actually injected into this PAA (SAA / AR(1) / zero).",
@@ -1014,8 +1017,9 @@ def save_results(res: Dict[str, Any]) -> Path:
             "SPY and equal-weight buy-and-hold use TradingEnv._initialize_portfolio_with_costs (the routine behind the "
             "SPY benchmark the PAA is trained/selected against); residual cash after the cost-aware init is recorded "
             "in consistency_checks.*.*_init_residual_cash.",
-            "saa_ew_value is the mean of N shadow books each started with the full capital; this equals a 1/N capital "
-            "split up to the sqrt market-impact cost term, which is not scale invariant.",
+            "SAA accounts execute at the SAA's own training capital and frictions. Their balances and actual charged "
+            "costs are scaled proportionally to PAA capital before averaging; this is normalization, not re-execution "
+            "at a different trade size. SAA costs are never charged to the live PAA.",
             "AR(1) signals are stochastic; they are reproducible for a fixed seed (see injected_signal.ar1_seed).",
             "TradingEnv stores the shadow books in float32 (relative precision ~1e-5 over a period).",
         ],

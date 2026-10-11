@@ -756,7 +756,7 @@ class SAASignalWrapper(VecEnvWrapper):
     Runs the frozen SAA over every (env, asset) pair and injects its signal into the
     allocator's observations.
 
-    Row layout of the batched SAA forward pass is r = env_index * num_assets + asset_index.
+    Recurrent-state row layout is r = env_index * num_assets + asset_index.
     That mapping must stay fixed for the whole run: the LSTM state carried in
     self.saa_state is indexed by r, so reordering rows would cross-contaminate the
     per-asset recurrent memory.
@@ -778,8 +778,6 @@ class SAASignalWrapper(VecEnvWrapper):
         # Rescales raw SAA policy output into the target_position_change range the SAA was
         # actually trained/executed with (env.step never saw raw actions during SAA training).
         self.action_limiting_factor = float(action_limiting_factor)
-        # Precomputed one-hot asset-ID rows; SAA's InputMLPFeatures expects this trailing block.
-        self._asset_one_hot = np.eye(self.num_assets, dtype=np.float32)
 
         if not hasattr(self.venv, "env_method"):
             raise RuntimeError(
@@ -806,35 +804,24 @@ class SAASignalWrapper(VecEnvWrapper):
                 f"raw_feat_dim={self.raw_feat_dim}, portfolio_dim={self.portfolio_dim}"
             )
 
-        # Cache SAA feature indices once (used every step).
-        self.saa_idx = np.array(
-            [self.feature_to_index[f] for f, on in self.config["saa_features"].items() if on],
-            dtype=int,
-        )
-        if self.saa_idx.size == 0:
-            raise ValueError("No enabled SAA features found in config['saa_features'].")
-        if np.min(self.saa_idx) < 0 or np.max(self.saa_idx) >= self.raw_feat_dim:
+        saa_training_config = _read_saa_training_config(self.config["saa_config"])
+        shadow_shapes = self.venv.env_method("configure_saa_shadow_portfolios", saa_training_config)
+        if any(tuple(shape) != tuple(saa_model.observation_space.shape) for shape in shadow_shapes):
             raise ValueError(
-                "SAA feature indices out of range for raw feature block. "
-                f"raw_feat_dim={self.raw_feat_dim}, min_idx={int(np.min(self.saa_idx))}, "
-                f"max_idx={int(np.max(self.saa_idx))}"
+                f"Standalone SAA observation shapes {shadow_shapes} do not match "
+                f"checkpoint shape {saa_model.observation_space.shape}."
             )
 
-        # One frozen SAA shared by every (env, asset) row; the LSTM state carries the batch
-        # dimension, so separate model copies would be redundant.
         self.saa_model = saa_model
         self.saa_model.policy.to(self.device)
         self.saa_model.device = self.device
         self.saa_model.policy.eval()
 
         self.n_rows = int(venv.num_envs) * self.num_assets
-        self.saa_state: Optional[Any] = None
+        self.saa_state = [None] * self.n_rows
         self.episode_start = np.ones(self.n_rows, dtype=bool)
         self._last_signals = np.zeros((venv.num_envs, self.num_assets, 1), dtype=np.float32)
         self._last_shadow_weights = np.zeros((venv.num_envs, self.num_assets, 1), dtype=np.float32)
-        # Row-aligned one-hot asset IDs, tiled once for the whole batch.
-        self._asset_one_hot_batch = np.tile(self._asset_one_hot, (venv.num_envs, 1))
-
         self.initial_portfolio_value = float(self.venv.get_attr("initial_portfolio_value")[0])
 
         # Resize obs space: add +2 features per asset (SAA signal + shadow-portfolio holding %)
@@ -859,7 +846,7 @@ class SAASignalWrapper(VecEnvWrapper):
         else:
             obs = res
         # Drop recurrent memory: every (env, asset) row starts a fresh episode.
-        self.saa_state = None
+        self.saa_state = [None] * self.n_rows
         self.episode_start[:] = True
         signals, shadow_weights = self._compute_saa_signals(obs)
         self._commit_saa_actions(signals)
@@ -889,76 +876,32 @@ class SAASignalWrapper(VecEnvWrapper):
 
     def _compute_saa_signals(self, obs: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Rebuild the SAA training observation for every (env, asset) row and run a single
-        batched forward pass. Returns (signals, shadow_weights), each shaped (B, N, 1).
-        Advances the LSTM state.
+        Use standalone observations and one-row recurrent inference per (env, asset).
+        Returns (signals, shadow_weights), each shaped (B, N, 1).
         """
         B = obs.shape[0]
         N = self.num_assets
-        asset_block = N * self.raw_feat_dim
-        asset_feats = obs[:, :asset_block].reshape(B, N, self.raw_feat_dim)
-
-        # Selected SAA market features per (env, asset).
-        saa_market_feats = asset_feats[:, :, self.saa_idx]  # (B, N, F_saa)
-
-        # --- Per-asset hypothetical sub-portfolio state, one RPC round trip ---
         bundles = self.venv.env_method("get_saa_signal_inputs")
-        cash_all = np.stack([b["cash"] for b in bundles], axis=0)                       # (B, N)
-        shares_all = np.stack([b["shares"] for b in bundles], axis=0)                   # (B, N)
-        last_act_all = np.stack([b["last_action"] for b in bundles], axis=0)            # (B, N)
-        dret_all = np.stack([b["daily_return"] for b in bundles], axis=0)               # (B, N)
-        prices_all = np.stack([b["prices"] for b in bundles], axis=0)                   # (B, N)
-        rf_z_all = np.asarray([b["rf_zscore"] for b in bundles], dtype=np.float32)      # (B,)
-        alpha_rf_all = np.stack([b["excess_log_return_over_rf"] for b in bundles], axis=0)  # (B, N)
-        effr_level_all = np.asarray([b["effr_level"] for b in bundles], dtype=np.float32)  # (B,)
-
-        asset_notional = shares_all * prices_all
-        # Log-ratios with gating at 0 (matches get_observation_single_step L3973-3976)
-        eps = 1e-12
-        initial_pv = self.initial_portfolio_value
-        cash_log_value = np.where(cash_all > 0, np.log(np.maximum(cash_all, eps) / initial_pv), 0.0).astype(np.float32)
-        asset_log_value = np.where(asset_notional > 0, np.log(np.maximum(asset_notional, eps) / initial_pv), 0.0).astype(np.float32)
-
-        # Shadow sub-portfolio holding percentage: this asset's share of ITS OWN isolated shadow
-        # book (cash_all + asset_notional). Never derived from, or written into, the live PAA
-        # portfolio state - only this scalar crosses the shadow/live boundary.
-        shadow_sub_total = cash_all + asset_notional
-        shadow_weight_all = np.where(
-            shadow_sub_total > eps, asset_notional / np.maximum(shadow_sub_total, eps), 0.0
-        ).astype(np.float32)
-
-        rf_z_rep = np.repeat(rf_z_all[:, None], repeats=N, axis=1)
-        mem_features = [cash_log_value, asset_log_value, dret_all, last_act_all, rf_z_rep, alpha_rf_all]
-        if self.effr_level_active:
-            effr_level_rep = np.repeat(effr_level_all[:, None], repeats=N, axis=1)
-            mem_features.append(effr_level_rep)
-        mem_block = np.stack(mem_features, axis=-1)
-
-        # Flatten to rows r = b * N + a and append the trailing one-hot asset-ID block so the
-        # layout matches SAA training.
-        saa_obs = np.concatenate([saa_market_feats, mem_block], axis=-1).reshape(B * N, -1)
-        one_hot = self._asset_one_hot_batch if B == self.venv.num_envs else np.tile(self._asset_one_hot, (B, 1))
-        batch_obs = np.concatenate([saa_obs, one_hot], axis=-1).astype(np.float32)
-        batch_obs = _normalize_obs_with_vecnormalize(batch_obs, self.saa_vecnormalize)
-
-        # SB3 recurrent policies expect NumPy observations; a CUDA tensor would break
-        # policy.obs_to_tensor's internal np.array() conversion.
-        actions, state_out = self.saa_model.policy.predict(
-            batch_obs,
-            state=self.saa_state,
-            episode_start=np.asarray(self.episode_start[: B * N], dtype=bool),
-            deterministic=True,
-        )
-        self.saa_state = state_out
-
-        if isinstance(actions, torch.Tensor):
-            actions_np = actions.detach().cpu().numpy()
-        else:
-            actions_np = np.asarray(actions)
-        raw_signal = np.clip(actions_np[:, 0:1], -1.0, 1.0)
-        # Rescale to the target_position_change range actually seen by env.step() during
-        # SAA training/inference (see SingleAssetEpisodeAdapter.step() action_factor_fn).
-        signals = (raw_signal * self.action_limiting_factor).reshape(B, N, 1).astype(np.float32)
+        batch_obs = np.stack([bundle["observation"] for bundle in bundles]).reshape(B * N, -1)
+        if self.saa_vecnormalize is not None:
+            batch_obs = self.saa_vecnormalize.normalize_obs(batch_obs)
+        signals = np.empty((B * N, 1), dtype=np.float32)
+        for row in range(B * N):
+            if self.episode_start[row]:
+                self.saa_state[row] = None
+            actions, self.saa_state[row] = self.saa_model.predict(
+                batch_obs[row:row + 1],
+                state=self.saa_state[row],
+                episode_start=self.episode_start[row:row + 1],
+                deterministic=True,
+            )
+            signals[row] = np.clip(
+                np.asarray(actions, dtype=np.float32)[0] * self.action_limiting_factor, -1.0, 1.0
+            )
+        signals = signals.reshape(B, N, 1)
+        cash_all = np.stack([bundle["cash"] for bundle in bundles])
+        asset_notional = np.stack([bundle["shares"] * bundle["prices"] for bundle in bundles])
+        shadow_weight_all = asset_notional / (cash_all + asset_notional)
         shadow_weights = shadow_weight_all.reshape(B, N, 1).astype(np.float32)
         self._last_signals = signals
         self._last_shadow_weights = shadow_weights
@@ -1317,6 +1260,13 @@ class SAATokenizer(BaseFeaturesExtractor):
         return full_sequence.flatten(start_dim=1)     
 
     
+def _read_saa_training_config(saa_config: Mapping[str, Any]) -> Dict[str, Any]:
+    saa_agent_root = os.path.dirname(saa_config["saa_base_dir"])
+    config_path = os.path.join(saa_agent_root, f"config_{saa_config['saa_config_id']}.json")
+    with open(config_path, "r") as config_file:
+        return json.load(config_file)
+
+
 # Utility function to load SAA model and VecNormalize stats from config
 def _load_saa_from_config(saa_config: Dict[str, Any]) -> Tuple[Any, Optional[VecNormalize], torch.device, float, bool]:
     """
@@ -1353,16 +1303,11 @@ def _load_saa_from_config(saa_config: Dict[str, Any]) -> Tuple[Any, Optional[Vec
     # same inheritance pattern main.py._maybe_inherit_saa_training_config uses for test_agent runs:
     # saved_models/<run_dir_name> sits under <saa_agent_root>/saved_models, config lives at
     # <saa_agent_root>/config_<config_id>.json.
-    saa_agent_root = os.path.dirname(base_dir)
-    saa_training_config_path = os.path.join(saa_agent_root, f"config_{config_id}.json")
-    if not os.path.isfile(saa_training_config_path):
-        raise FileNotFoundError(f"SAA training config not found: {saa_training_config_path}")
-    with open(saa_training_config_path, "r") as f:
-        saa_training_config = json.load(f)
+    saa_training_config = _read_saa_training_config(saa_config)
     agent_cfg = saa_training_config.get("agent", {})
     if "action_limiting_factor_end" not in agent_cfg:
         raise ValueError(
-            f"SAA training config {saa_training_config_path} is missing "
+            f"SAA training config {config_id} is missing "
             "'agent.action_limiting_factor_end', required to rescale raw SAA actions."
         )
     action_limiting_factor = float(agent_cfg["action_limiting_factor_end"])
