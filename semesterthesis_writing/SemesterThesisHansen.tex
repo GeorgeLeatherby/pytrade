@@ -65,6 +65,7 @@
 %\usepackage{mathptmx} % skalierbare Formelschriften
 \usepackage{xstring} % Textmanipulation
 \usepackage{xcolor} % Farbdefinitionen
+\usepackage{scrlayer-scrpage} % Page styles and page numbers
 
 \usepackage{etoolbox} % Toggle-Definitionen
 \newtoggle{StellenausschreibungGrafikOpportunities}
@@ -152,7 +153,7 @@
 
 \usepackage[a4paper,
 top=\TextOben,
-bottom=\Seitenrand,
+bottom=\TextOben,
 inner=\SeitenrandLinks,
 outer=\SeitenrandLinks,
 foot=0cm,
@@ -174,6 +175,9 @@ head=0cm
 \setcounter{secnumdepth}{3}
 \setcounter{tocdepth}{2}
 \setkomafont{disposition}{\normalfont\bfseries}
+\clearpairofpagestyles
+\cfoot*{\pagemark}
+\setlength{\footskip}{\dimexpr\TextOben/2\relax}
 
 \RedeclareSectionCommand[
 	beforeskip=1.5\baselineskip,
@@ -187,6 +191,13 @@ head=0cm
 
 
 \newcommand{\TopicHeader}{\begin{flushleft}{\fontsize{19}{25}\selectfont\vspace*{0.8mm}\ThesisTopic}\end{flushleft}}
+\newlength{\AuthorContactToIntroduction}
+\setlength{\AuthorContactToIntroduction}{0.25\baselineskip}
+\newcommand{\AuthorContact}{%
+	\noindent Simon Hansen, %
+	\href{mailto:simon.hansen@tum.de}{simon.hansen@tum.de}\par
+	\vspace{\AuthorContactToIntroduction}%
+}
 \newcommand{\MinorHeader}[1]{\textbf{#1}\vspace*{-\baselineskip}}
 
 \newcommand{\ChairHeader}{%
@@ -220,13 +231,14 @@ head=0cm
 \begin{document}
 \pagenumbering{arabic}
 \setcounter{page}{1}
-\pagestyle{plain}
+\pagestyle{scrheadings}
 \ChairHeader
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 \TopicHeader
 
+\AuthorContact
 \input{semesterthesis_writing/1_introduction}
 \input{semesterthesis_writing/2_literature_review}
 \input{semesterthesis_writing/3_system_design_and_methodology}
