@@ -1,21 +1,21 @@
 \section{Experimental Validation and Testing}
 \label{sec:validation}
 
-Section~\ref{sec:system-design} explained how PyTrade is built and why each design choice was made; this chapter reports what happens when the resulting agents are actually run on data they have never been trained on. Every comparison below follows directly from a claim made in Section~\ref{sec:system-design}. The excess-return reward design (Section~\ref{sec:excess-return}) is only meaningful if the agent it trains is actually shown to beat the $100\%$ B\&H it is scored against, not merely a strawman that is easy to beat. The shadow-portfolio mechanism that injects the Single-Asset Agent's (SAA) signal into the Portfolio Allocator Agent (PAA, Section~\ref{sec:info-flow}) is only justified if removing or corrupting that signal measurably hurts the PAA. The modular decomposition itself (Section~\ref{sec:overview}) is only a defensible answer to this thesis's research question if the resulting two-layer system outperforms both a signal-free cross-sectional model and, budget permitting, a monolithic single-network alternative trained end to end with comparable computational budget. Baselines throughout this chapter are therefore chosen to isolate one specific claim each, and the purged, block-level out-of-sample protocol recalled in Section~\ref{sec:oos-protocol} is what makes any of these comparisons trustworthy rather than an artifact of in-sample memorization.
+This chapter evaluates the agents on blocks excluded from parameter fitting. Passive buy-and-hold references test return relative to the reward counterfactual (Section~\ref{sec:excess-return}); signal-free and randomized-signal ablations test whether the frozen specialist adds allocation value (Section~\ref{sec:info-flow}). These comparisons distinguish profitable allocation from a benefit attributable to signal transfer. They follow the purged block protocol, with validation used for selection and the final test excluded from design decisions. Joint end-to-end learning remains a future comparison rather than a result reported here.
 
 This chapter is organized in the order its two agents were introduced. Section~\ref{sec:oos-protocol} recaps the evaluation protocol shared by both agents and introduces the validation periods used. Section~\ref{sec:saa-results} reports SAA results on the validation periods. Section~\ref{sec:paa-results} reports the PAA results on both validation and test periods.
 
 \subsection{Out-of-Sample Protocol}
 \label{sec:oos-protocol}
 
-Every result in this chapter is reported on the purged, block-level split introduced in Section~\ref{sec:simulator}: repeated purged train/validation cycles carved out of the full 2000--2025 history, each separated from its own preceding training block by a 60-trading-day purge gap, followed by one held-out test block preceded by its own purge gap. Applied to the current dataset, this scheme yields four validation blocks, each spanning a distinct historical regime, and one test block reserved for a single, final evaluation. The distinction between these two evaluation surfaces matters for how the rest of this chapter should be read. The four validation blocks are used iteratively, both for the "peak alpha" checkpoint selection and for every diagnostic plot in this chapter; because they are consulted repeatedly during development, a result reported only on a validation block is evidence of learning, not yet evidence of genuine, unseen-data skill. The test block is touched exactly once, after every design and checkpoint decision has already been made on the validation blocks alone, which is precisely what separates a legitimate out-of-sample result from an inflated, cherry-picked headline number.
+The split in Section~\ref{sec:simulator} provides four historical validation blocks and one final test block, each preceded by a 60-trading-day purge from its preceding training block. A \emph{checkpoint} is a snapshot of learned parameters during training. Validation is consulted repeatedly to select checkpoints and inspect behavior; its results therefore do not constitute a fresh test after model development. Only validation-selected models are reported on the final test, which is reserved until design and selection decisions are fixed.
 
 
-Table~\ref{tab:oos-blocks} names each validation block by its calendar date range and summarizes the macroeconomic and financial-market conditions realized within it. This step is necessary because a purged split only guarantees that training and evaluation windows do not overlap in time; it does not guarantee that the resulting blocks sample comparable market regimes. An agent evaluated only on calm, trending markets can appear skillful without having learned genuine risk management, since correctly timing entries and exits is easier when volatility and drawdowns are historically low. Conversely, an agent evaluated on a block dominated by a single macroeconomic shock can be penalized for defensive behavior, such as temporarily reducing exposure, that is rational given that shock but is scored harshly by a reward function tuned to reward decisiveness. Naming the realized regime of every block turns this risk into an explicit, auditable property of the evaluation protocol rather than a hidden confound.
+Table~\ref{tab:oos-blocks} describes the realized market context of each validation interval. Non-overlapping dates do not imply comparable regimes: rising markets can reward persistent exposure, whereas shocks can reveal its downside. Reporting each block separately therefore helps distinguish timing, asset selection, and risk reduction. The event narrative provides context, not proof that a policy responded to a particular announcement.
 
-Four technical terms recur in Table~\ref{tab:oos-blocks} and are defined here once. \emph{Quantitative easing} (QE) is a central bank's large-scale purchase of government or other securities, undertaken once its short-term policy rate is already near zero, with the aim of lowering long-term interest rates; it matters for an evaluation window because it can suppress volatility and support asset prices independent of the underlying economic performance of any single firm or country. A \emph{yield-curve inversion} occurs when short-maturity government bonds yield more than long-maturity bonds, the reverse of the usual relationship; it is a widely cited leading indicator of recession, because it reflects an expectation among bond investors that the central bank will need to cut rates in the future in response to a weakening economy. The \emph{VIX} is an index of the market's expectation of near-term S\&P 500 volatility, implied by option prices; a sharp rise in the VIX signals a sudden increase in perceived risk and is commonly referred to as a volatility spike. A \emph{carry trade} is a strategy of borrowing in a currency with a low interest rate to invest in higher-yielding assets denominated in another currency; an \emph{unwind} of such a trade, triggered for instance by a rise in the funding currency's interest rate, forces borrowers to close these positions quickly, producing fast, correlated selling across otherwise unrelated asset classes.
+Four terms recur. \emph{Quantitative easing} (QE) denotes large-scale central-bank securities purchases intended to ease financial conditions \cite{FedAssetPurchasesSeptember2012}. A \emph{yield-curve inversion} means short-maturity government bonds yield more than longer-maturity bonds; the Treasury maturity spread records this relationship \cite{FREDTreasurySpread}. The Chicago Board Options Exchange's \emph{Volatility Index} (VIX) measures near-term S\&P 500 volatility implied by option prices \cite{BISVolatility2018}. A \emph{carry trade} borrows in a low-interest-rate currency to invest in higher-yielding assets elsewhere; closing such positions during stress can amplify currency and asset-price movements \cite{BISCarryTrades2024}.
 
-The test block (final row of Table~\ref{tab:oos-blocks}) is deliberately not characterized narratively in advance of evaluation. Naming its dominant events before the single, final evaluation pass described above would risk tempting a post-hoc, narrative-driven justification of whatever result that pass produces, which is precisely what the purged protocol is designed to prevent. Its realized composition is instead reported alongside its results.
+The test block is not used for narrative-driven model selection. Its portfolio outcomes are reported only after the validation decisions are fixed.
 
 \begin{table}[p]
 \centering
@@ -25,27 +25,27 @@ The test block (final row of Table~\ref{tab:oos-blocks}) is deliberately not cha
 \textbf{Block (dates)} & \textbf{Realized economic and financial-market conditions} & \textbf{Relevance to agent training and evaluation} \\
 \midrule
 val\_00 \newline (2005-12-16 to \newline 2007-02-14) &
-The U.S. policy rate stood at a cyclical peak of 5.25\%. The U.S. yield curve was inverted for much of 2006. U.S. and European equities advanced together at low realized volatility, a period later called the "Great Moderation". Asian equities advanced alongside strong global trade. Oil and gold both trended upward. Late in the block, U.S. subprime-mortgage delinquencies began rising, and a major subprime lender reported large losses. Prices had not yet reacted by the block's end. &
-Nearly every instrument trends in the same direction at low volatility. This is the regime least likely to penalize a non-diversifying policy. The block ends just before, not during, a realized shock. Comparing performance here against val\_02 and val\_03 helps separate general risk management from a fit to one calm regime (Section~\ref{sec:saa-robustness}). \\
+The Federal Reserve raised its target rate to 5.25\% on 29 June 2006 \cite{FedRateJune2006}. The Treasury yield curve inverted during 2006, while major equity markets advanced at relatively low volatility \cite{FREDTreasurySpread,BISFinancialMarkets2007}. This occurred within the broader period known as the Great Moderation \cite{BernankeGreatModeration2004}. Oil rose into mid-2006 before reversing, while gold gained over the year \cite{WorldBankCommodityPrices}. Mortgage-credit deterioration became visible before the subsequent crisis \cite{FCIC2011}. &
+Broad equity gains make this a useful contrast with the later stress blocks. Positive absolute return alone is weak evidence of timing skill when passive assets also rise. Comparing it with val\_02 and val\_03 helps assess regime dependence (Section~\ref{sec:saa-robustness}). \\
 \addlinespace
 val\_01 \newline (2012-01-12 to \newline 2013-03-20) &
-European sovereign-debt stress continued. Greek government debt was restructured in March 2012, and Spanish and Italian bond yields stayed elevated. European equities moved with this stress. The European Central Bank pledged in July 2012 to preserve the euro. The Federal Reserve announced a third round of asset purchases (QE3) in September 2012. Gold traded near record levels. Asian equities recorded inflows attributed to a search for yield. Oil stayed elevated on supply concerns linked to sanctions on Iran. &
-Policy announcements, not firm fundamentals, dominate this block. European equities move together on crisis news, largely apart from Asian equities and commodities. A checkpoint whose relative ranking across instruments differs sharply from val\_00 is responding to regime, not repeating one fixed allocation. \\
+European sovereign-debt stress continued, including elevated Spanish and Italian borrowing costs \cite{BISPolicyMeasures2012}. Greek government debt was restructured in March 2012 \cite{GreekDebtRestructuring2013}. The European Central Bank pledged on 26 July to preserve the euro \cite{DraghiEuroJuly2012}. The Federal Reserve announced its third quantitative-easing round (QE3) on 13 September \cite{FedAssetPurchasesSeptember2012}. Low rates encouraged a search for yield \cite{BISPolicyMeasures2012}. Restrictions on Iranian oil were part of the supply-policy backdrop \cite{EUIranSanctions2012}. &
+Debt stress and policy interventions provide contrasting conditions for regional equities and commodities. Changes in asset rankings can be examined alongside this context, without attributing them solely to policy announcements. \\
 \addlinespace
 val\_02 \newline (2018-02-27 to \newline 2019-04-23) &
-The block opens just after a sharp volatility spike indicated by VIX and the collapse of several short-volatility products in February 2018. The U.S. and China imposed successive tariffs on each other. The Federal Reserve raised its policy rate four times. Export-oriented Asian and European equities moved with the tariff dispute; UK equities also traded through separate withdrawal negotiations from the European Union. Equities fell sharply together in December 2018. Oil fell over the same weeks, while gold rose. From January 2019, after the Fed signaled a pause, equities recovered. &
-This block contains a decline and a recovery inside one window. It is where equity-oil co-movement is clearest, with gold moving the other way. Tests whether the agent can shift from a defensive posture back to a risk-seeking one as conditions improve, rather than only having learned to reduce exposure. \\
+The block opens after the February 2018 volatility spike and losses in products betting on continued low volatility \cite{BISVolatility2018}. The United States and China imposed successive tariffs \cite{BownTradeWarTariffs}, and the Federal Reserve raised rates four times in 2018 \cite{FedPolicyDecisions2018}. United Kingdom withdrawal negotiations added uncertainty. Equities and oil fell late in 2018, while gold rose; equities recovered from January 2019 as policy signals became more flexible \cite{BISRetreatRebound2019,WorldBankCommodityPrices}. &
+This block contains a decline and recovery within one window. Contrasting equity, oil, and gold paths permit examination of defensive allocation followed by renewed exposure as conditions improve, rather than exposure reduction alone. \\
 \addlinespace
 val\_03 \newline (2024-02-26 to \newline 2025-04-22) &
-U.S. equity gains concentrated in a few large technology firms. Taiwanese equities, weighted toward semiconductor manufacturing, moved closely with this trend. The Federal Reserve began cutting its policy rate in September 2024. In August 2024, following a Bank of Japan rate increase, Japanese equities recorded their largest single-day decline since 1987, attributed to an unwind of yen-funded carry positions; other equities fell by a smaller amount the same day. Gold reached repeated record levels. In April 2025, new U.S. tariffs were followed by a broad, short-lived decline across nearly all equities and in oil. &
-This block contains two shocks of different origin: a single-country, rate-driven decline, and a broad, trade-policy-driven decline. It also contains a narrow, concentration-driven rally that a diversified allocation is not automatically exposed to. Comparing the response to each shock tests whether risk behavior generalizes, rather than having been fit to one event (Section~\ref{sec:saa-robustness}). \\
+United States equity gains concentrated in large technology firms, while technology-heavy Asian markets also experienced cross-market stress \cite{BISCarryTrades2024}. The Federal Reserve began cutting rates on 18 September 2024 \cite{FedRateCutSeptember2024}. Early-August turbulence followed changing policy expectations and weak economic news; Japanese equities suffered a double-digit daily decline as yen-funded positions unwound, with international spillovers \cite{BISCarryTrades2024}. Gold reached repeated records in 2024 \cite{WorldGoldCouncil2024}. Tariffs announced on 2 April 2025 were followed by broad equity and oil declines \cite{USReciprocalTariffs2025,IMFGlobalStabilityApril2025,WorldBankCommodityPrices}. &
+Japan-centered financial turbulence and later trade-policy stress provide different tests of allocation behavior. The technology-led rally also makes diversification an opportunity-cost question, not an automatic return advantage (Section~\ref{sec:saa-robustness}). \\
 \addlinespace
 test\_00 \newline (2025-07-21 to \newline 2026-08-06) &
 Not characterized in advance of evaluation, for the reason given above. &
 Reserved for the single, final evaluation described later in this section. \\
 \bottomrule
 \end{tabular}
-\caption{Calendar date ranges of the four validation blocks and the single test block, the market conditions observable within each, and their role in selecting a checkpoint (Section~\ref{sec:saa-robustness}).}
+\caption{Calendar ranges from the evaluation protocol and the corresponding market context. External sources support event dates and market conditions, not causal attribution of agent decisions. The test block is excluded from checkpoint selection.}
 \label{tab:oos-blocks}
 \end{table}
 
@@ -54,7 +54,7 @@ Reserved for the single, final evaluation described later in this section. \\
 \label{sec:saa-results}
 
 
-This section compares the three final SAA candidates on all four validation blocks. The selection criterion is mean Asset $\alpha$: annualized agent return minus the annualized buy-and-hold return of the same asset. This directly measures the timing information later passed to the PAA. Risk, consistency, and turnover are used as secondary checks.
+This section compares three final SAA candidates on all four validation blocks. Mean Asset $\alpha$ is annualized agent return minus the same asset's annualized buy-and-hold return; it measures relative performance, not a regression-based market alpha. Maximum drawdown (MDD) is the largest fall from a previous value peak, reported here with a negative sign. Sharpe compares return with total variability, Sortino with downside variability, and Calmar divides annualized return by absolute maximum drawdown. Turnover measures cumulative position-changing activity. These metrics provide secondary checks alongside the selection criterion.
 
 \begin{table}[htbp]
 \centering
@@ -62,7 +62,7 @@ This section compares the three final SAA candidates on all four validation bloc
 \setlength{\tabcolsep}{5pt}
 \begin{tabular}{@{}lSSS@{}}
 \toprule
-{Setting or metric} & {config\_01056} & {config\_01057} & {config\_01058} \\
+{Setting or metric} & {01056} & {01057} & {01058} \\
 \midrule
 SAA linear scale & 10.0 & 10.0 & 2.5 \\
 SAA excess-return scale & 50.0 & 50.0 & 10.0 \\
@@ -88,7 +88,7 @@ Configurations \texttt{01056} and \texttt{01057} differ only in the reward squas
 \subsubsection{Results}
 \label{sec:saa-results-presentation}
 
-Table~\ref{tab:saa-per-asset-metrics} gives the detailed results for the selected configuration. Returns and both alpha measures are annualized. Asset $\alpha$ uses the assigned asset's buy-and-hold return. Market $\alpha$ uses SPY buy-and-hold. Turnover sums absolute day-to-day action changes. Cost is cumulative transaction cost as a share of initial capital.
+Table~\ref{tab:saa-per-asset-metrics} gives the selected configuration's results. Returns and both alpha measures are annualized. Asset $\alpha$ uses the assigned asset's buy-and-hold return; Market $\alpha$ uses SPY. Turnover sums absolute day-to-day action changes. Cost is cumulative transaction cost relative to initial capital. The symbol \O{} denotes an arithmetic mean across assets or validation blocks.
 
 % SAA per-asset performance table (BEGIN)
 \begin{table}[p]
@@ -97,7 +97,7 @@ Table~\ref{tab:saa-per-asset-metrics} gives the detailed results for the selecte
 \setlength{\tabcolsep}{3.5pt}
 \begin{tabular}{llS[table-format=-3.2]S[table-format=-3.2]S[table-format=-3.2]S[table-format=-3.2]S[table-format=-2.2]S[table-format=-2.2]S[table-format=-3.2]S[table-format=-3.2]S[table-format=5.2]S[table-format=2.2]}
 \toprule
-\textbf{Period} & \textbf{Asset} & {Agt. Ret.} & {B\&H Ret.} & {Asset $\alpha$ } & {Mkt.\ $\alpha$ } & {Sharpe} & {Sortino} & {MDD } & {Calmar} & {Turnover } & {Cost } \\
+\textbf{Period} & \textbf{Asset} & {\makecell{Agent\\return}} & {\makecell{Passive\\return}} & {Asset $\alpha$ } & {Market $\alpha$ } & {Sharpe} & {Sortino} & {MDD } & {Calmar} & {Turnover } & {Cost } \\
 \midrule
 \multirow{12}{*}{\makecell{ val\_00 \\ 2005/12/16 to \\ 2007/02/14}} & Crude & 16.19 & -0.04 & 16.23 & 3.06 & 1.29 & 0.94 & -13.75 & 1.18 & 2663.52 & 0.26 \\
  & EWG & 7.83 & 33.02 & -25.20 & -5.30 & 0.88 & 0.66 & -9.32 & 0.84 & 2334.12 & 0.25 \\
@@ -158,7 +158,7 @@ Table~\ref{tab:saa-per-asset-metrics} gives the detailed results for the selecte
 \multicolumn{2}{l}{\bfseries 4-Period \O{}} & \bfseries 17.69 & \bfseries 9.35 & \bfseries 8.34 & \bfseries 7.71 & \bfseries 1.40 & \bfseries 1.68 & \bfseries -10.63 & \bfseries 2.40 & \bfseries 3200.31 & \bfseries 0.34 \\
 \bottomrule
 \end{tabular}
-\caption{Per-asset validation metrics for config\_01056. Return, alpha, MDD, turnover, and cost are in \si{\percent}; return and alpha are annualized.}
+\caption{Per-asset validation metrics for configuration 01056. Return, alpha, maximum drawdown, turnover, and cost are percentages; return and alpha are annualized.}
 \label{tab:saa-per-asset-metrics}
 \end{table}
 % SAA per-asset performance table (END)
@@ -174,21 +174,21 @@ In val\_02, the equal-weight SAA portfolio rises steadily during the first half 
 \begin{figure}[htbp]
 \centering
 \includegraphics[width=0.95\textwidth]{graphs/aggregate_saa_portfolio_test_20180227_20190423_26_09_27_14_02.png}
-\caption{Aggregate shadow-portfolio inference for config\_01056, val\_02 (2018/02/27 to 2019/04/23).}
+\caption{Aggregate shadow-portfolio evaluation for configuration 01056, val\_02 (2018/02/27 to 2019/04/23).}
 \label{fig:saa-agg-val02}
 \end{figure}
 
 \begin{figure}[p]
 \centering
 \includegraphics[width=\textwidth]{graphs/asset-specific_saa_portfolio_test_page1_20180227_20190423_26_09_27_14_02.png}
-\caption{Per-asset inference for config\_01056, val\_02, page 1 of 2.}
+\caption{Per-asset evaluation for configuration 01056, val\_02, page 1 of 2.}
 \label{fig:saa-assets-val02-p1}
 \end{figure}
 
 \begin{figure}[p]
 \centering
 \includegraphics[width=\textwidth]{graphs/asset-specific_saa_portfolio_test_page2_20180227_20190423_26_09_27_14_02.png}
-\caption{Per-asset inference for config\_01056, val\_02, page 2 of 2.}
+\caption{Per-asset evaluation for configuration 01056, val\_02, page 2 of 2.}
 \label{fig:saa-assets-val02-p2}
 \end{figure}
 
@@ -197,21 +197,21 @@ Val\_03 shows a different balance between participation and protection. During t
 \begin{figure}[htbp]
 \centering
 \includegraphics[width=0.95\textwidth]{graphs/aggregate_saa_portfolio_test_20240226_20250422_26_09_27_14_02.png}
-\caption{Aggregate shadow-portfolio inference for config\_01056, val\_03 (2024/02/26 to 2025/04/22).}
+\caption{Aggregate shadow-portfolio evaluation for configuration 01056, val\_03 (2024/02/26 to 2025/04/22).}
 \label{fig:saa-agg-val03}
 \end{figure}
 
 \begin{figure}[p]
 \centering
 \includegraphics[width=\textwidth]{graphs/asset-specific_saa_portfolio_test_page1_20240226_20250422_26_09_27_14_02.png}
-\caption{Per-asset inference for config\_01056, val\_03, page 1 of 2.}
+\caption{Per-asset evaluation for configuration 01056, val\_03, page 1 of 2.}
 \label{fig:saa-assets-val03-p1}
 \end{figure}
 
 \begin{figure}[p]
 \centering
 \includegraphics[width=\textwidth]{graphs/asset-specific_saa_portfolio_test_page2_20240226_20250422_26_09_27_14_02.png}
-\caption{Per-asset inference for config\_01056, val\_03, page 2 of 2.}
+\caption{Per-asset evaluation for configuration 01056, val\_03, page 2 of 2.}
 \label{fig:saa-assets-val03-p2}
 \end{figure}
 
@@ -226,12 +226,12 @@ Figure~\ref{fig:saa_train_vs_validation} provides a separate checkpoint-level wa
   \label{fig:saa_train_vs_validation}
 \end{figure}
 
-The PPO diagnostics do not contradict this choice. Approximate KL remains below the $0.01$ target for all runs (Figure~\ref{fig:train_approx_kl}). Explained variance ends near $0.92$ for \texttt{01056}, compared with $0.86$ for \texttt{01057} and $0.93$ for \texttt{01058} (Figure~\ref{fig:train_explained_variance}). Value loss reaches about $0.10$ for \texttt{01056} and \texttt{01058}, while \texttt{01057} plateaus near $0.16$ (Figure~\ref{fig:train_value_loss}). The losses show stable optimization, but they do not measure trading quality. Corrected inference alpha therefore remains the deciding evidence.
+The PPO diagnostics do not contradict this choice. Approximate Kullback--Leibler (KL) divergence measures how much the updated action distribution differs from the preceding policy; it remains below the $0.01$ target (Figure~\ref{fig:train_approx_kl}). Explained variance measures how much variation in reward targets the critic predicts and ends near $0.92$ for \texttt{01056}, against $0.86$ and $0.93$ for the alternatives (Figure~\ref{fig:train_explained_variance}). Value loss measures critic prediction error and reaches about $0.10$ for \texttt{01056} and \texttt{01058}, while \texttt{01057} plateaus near $0.16$ (Figure~\ref{fig:train_value_loss}). Policy-gradient loss tracks the actor's optimization objective rather than portfolio return (Figure~\ref{fig:train_policy_gradient_loss}). These diagnostics describe learning, not trading quality; deterministic evaluation alpha remains decisive.
 
 \begin{figure}[htbp]
     \centering
     \includegraphics[width=0.95\textwidth]{graphs/train_approx_kl.png}
-    \caption{Training Approximate KL Divergence across Configurations.}
+    \caption{Approximate Kullback--Leibler divergence during training.}
     \label{fig:train_approx_kl}
 \end{figure}
 
@@ -261,21 +261,27 @@ The PPO diagnostics do not contradict this choice. Approximate KL remains below 
 
 \label{sec:saa-robustness}
 
-The corrected results support a different checkpoint choice. Run \texttt{00233}, config\_01056, has the highest mean Asset $\alpha$, the best mean Sharpe ratio, and the least severe mean maximum drawdown. Run \texttt{00234}, config\_01057, is positive in more asset-period cells and trades less, but its mean Asset $\alpha$ is lower and its mean drawdown is worse. Run \texttt{00239}, config\_01058, is weaker on the main performance measures.
+Run \texttt{00233}, configuration 01056, has the highest mean Asset $\alpha$, the best mean Sharpe ratio, and the least severe mean maximum drawdown. Run \texttt{00234}, configuration 01057, is positive in more asset-period cells and trades less, but has lower mean alpha and worse mean drawdown. Run \texttt{00239}, configuration 01058, is weaker on the main performance measures.
 
 The selected policy remains regime-dependent: its mean Asset $\alpha$ is strongest in val\_01 and val\_02, and slightly negative in val\_00 and val\_03. This pattern is visible in the two graph periods. In val\_02, the SAA ensemble retreats through a sharp benchmark drawdown; in val\_03, its more defensive exposure limits the fall but also misses part of the Gold and German-equity rallies. Gold's agent portfolio still gains about $49\%$ in val\_03, but buy-and-hold gains about $68\%$, leaving a cumulative graph alpha of $-18.73$ percentage points. This is a useful reminder that high absolute return is not the same as successful timing.
 
 These outcomes follow from the SAA's action design in Section~\ref{sec:saa}. Its scalar action requests a bounded change in position, scaled by $\kappa_t$; it is not a target portfolio weight. The agent is long-only, so its defensive response is to reduce or close its holding and earn cash carry, not to short a falling asset. The drawdown-aware reward (Section~\ref{sec:drawdown}) can favor this risk reduction, while Asset $\alpha$ still records the opportunity cost when an asset continues to rally. Market-relative and cross-asset features (Section~\ref{sec:state}) inform each decision, but the SAA cannot reallocate its capital to another instrument.
 
-The PAA can make that cross-sectional choice. Under the shadow-portfolio design (Section~\ref{sec:info-flow}), each frozen SAA copy maintains its own cash, holdings, and recurrent state, isolated from the live PAA portfolio. Its emitted action and shadow holding fraction $\rho_t^{(i)}$ enter the asset token alongside market features and the asset's live PAA weight (Section~\ref{sec:paa-state}). The action and $\rho_t^{(i)}$ provide different context: the first is a requested position change, while the second describes the shadow account's current exposure. The PAA's attention network can weigh both against the other assets and the portfolio token rather than treating an SAA action as an allocation instruction (Section~\ref{sec:paa-network}).
+The PAA can make that cross-sectional choice. Each frozen SAA maintains isolated cash, holdings, and recurrent state (Section~\ref{sec:info-flow}). Its action and shadow holding fraction enter the asset token alongside live weight and recorded allocator target. Shadow Sortino and drawdown summaries also enter both token types (Section~\ref{sec:paa-state}). The action requests a position change; the other shadow quantities describe accumulated exposure and simulated account performance. Attention can weigh this combined information against the other assets rather than treating the action as an allocation instruction.
 
-Config\_01056 therefore supplies a useful, but imperfect, timing signal for continued PAA training. Its positive mean Asset $\alpha$ and broad gains in val\_02 justify carrying it forward; the losses and regime variation in val\_03 justify leaving the PAA free to discount it. Run \texttt{00233} is the checkpoint selected for that purpose. The final test block remains untouched until PAA design and checkpoint choices are fixed.
+Configuration 01056 therefore supplies a useful, but imperfect, timing signal for PAA training. Its positive mean Asset $\alpha$ and broad gains in val\_02 support carrying it forward; val\_03 justifies leaving the allocator free to discount it. Run \texttt{00233} is selected for that purpose. The final test remains excluded until allocator design and checkpoint choices are fixed.
 
 
 \subsection{Portfolio Allocator Agent Results}
 \label{sec:paa-results}
 
-This section evaluates the hierarchical PAA against the autoregressive random-signal control and the cross-sectional-only ablation. Only runs \texttt{00283}--\texttt{00298}, trained under the latest environment implementation, are considered. Results are presented first; their implications for signal transfer and allocation are discussed separately.
+This section evaluates three versions of the Portfolio Allocator Agent (PAA): the hierarchical PAA, an autoregressive random-signal control, and a cross-sectional-only ablation. An \emph{ablation} removes or replaces one component while retaining the surrounding system, so that its contribution can be assessed. Only runs \texttt{00283}--\texttt{00298}, trained under the latest environment implementation, are considered. Results are presented first; their implications for signal transfer and allocation are discussed separately.
+
+The \textbf{hierarchical PAA} is the proposed two-layer system. It receives the frozen SAA's requested position change, shadow holding fraction, and environment-maintained shadow Sortino and drawdown summaries, alongside market features and live allocator information. These quantities describe the specialist's decision and hypothetical account history without requiring the allocator to obey it (Section~\ref{sec:info-flow}).
+
+The \textbf{autoregressive random-signal control} replaces the learned SAA action with synthetic noise. An autoregressive process of order one, abbreviated AR(1), constructs today's signal from a fraction of yesterday's signal plus a new random disturbance. Here the retained fraction is \(0.9\), and the disturbance has standard deviation \(0.15\); clipping bounds the signal before the action scale is applied. Consequently, the noise is persistent rather than independently redrawn each day. It trades the same shadow accounts, producing corresponding exposure, Sortino, and drawdown histories. This replaces the source of the entire specialist-derived information stream, not merely one isolated scalar.
+
+The \textbf{cross-sectional-only ablation} omits the learned specialist: its action and shadow holding fraction are zero, and its shadow accounts are never traded. The shadow risk-summary fields remain, but describe those untraded cash accounts; they are not separately masked to zero. \emph{Cross-sectional} means comparing assets at the same decision date. The allocator retains market features, live statistics, and recorded targets, including historical summaries. It therefore removes learned specialist behavior, not all temporal or shadow-account information. Neither ablation runs the frozen SAA; all three full-feature variants retain the same architecture and input dimensions.
 
 \subsubsection{Results}
 \label{sec:paa-results-presentation}
@@ -289,23 +295,24 @@ J_{\mathrm{val}} = \frac{1}{4}\sum_{b=0}^{3}\left(R_{\mathrm{PAA},b}-R_{\mathrm{
 \end{equation}
 Every evaluation starts from \(V_0=\$100{,}000\), so maximizing this criterion is equivalent to maximizing mean dollar excess value. These are cumulative block returns, not the annualized alpha measures used in the preceding SAA tables. Each validation block receives equal weight. Neither test return nor test risk metrics enter selection; only the three validation-selected candidates are reported on the final test block.
 
-All PAA evaluations use deterministic policy actions and a cash-only start. The AR(1) control additionally uses a reproducible noise realization, with separate validation and test seeds. Validation blocks contain 289 or 290 recorded dates; the test block contains 252. Returns are net of simulated transaction costs and include cash carry. The reported Sharpe ratio is \(\sqrt{252}\,\bar r/s(r)\), calculated from daily simple returns after the initialization row; the export does not subtract the risk-free rate. Maximum drawdown (MDD) is reported as a positive loss magnitude. Means of block-level returns, Sharpe ratios, and MDDs are arithmetic summaries, not statistics of one concatenated investment path.
+All PAA evaluations use deterministic policy actions, meaning that the policy chooses its predicted mean action rather than sampling an action, and a cash-only start. The AR(1) control additionally uses a reproducible noise realization, with separate validation and test seeds. A seed fixes the random-number sequence used in a run. Validation blocks contain 289 or 290 recorded dates; the test block contains 252. Returns are net of simulated transaction costs and include cash carry derived from the Effective Federal Funds Rate (EFFR), as defined in Section~\ref{sec:saa}. The full-feature comparison retains the same reward settings and configured training budget.
 
-The full-feature comparison retains the same allocator architecture, token dimensions, reward settings, and configured training budget. The hierarchical PAA receives the frozen SAA's action and shadow holding fraction. The control replaces the action source with clipped AR(1) noise (coefficient \(0.9\), innovation standard deviation \(0.15\)), committed through the same shadow-book mechanism. The cross-sectional-only PAA receives zero action and zero shadow holding fraction; its shadow accounts are never traded. Neither ablation runs the frozen SAA.
+The reported Sharpe ratio is \(\sqrt{252}\,\bar r/s(r)\), where \(\bar r\) is the mean daily simple return and \(s(r)\) its sample standard deviation, calculated after the initialization row. It measures return relative to daily variability; unlike a conventional excess-over-cash Sharpe ratio, this export does not subtract the risk-free rate. Maximum drawdown (MDD) is the largest percentage fall from a preceding portfolio-value peak and is reported as a positive loss magnitude. Net asset value (NAV) is the current value of cash and holdings combined. Turnover sums each day's traded notional divided by that day's NAV, so turnover of \(40\) times NAV describes repeated trading relative to a changing portfolio value, not a \(4000\%\) loss. Risky exposure is the share invested in non-cash assets, including commodities as well as equities. Means of block-level returns, Sharpe ratios, and MDDs are arithmetic summaries of independently reset blocks, not statistics of one concatenated investment path.
 
 \paragraph{Validation-only checkpoint selection.}
-Table~\ref{tab:paa-run-selection} reports every eligible candidate. Runs \texttt{00283}--\texttt{00286} retain all 26 asset-token market features. Runs \texttt{00287}--\texttt{00290} remove the five five-day asset-token features, leaving the frozen SAA unchanged. Each hierarchical feature set uses seeds 42, 8, 12, and 14. The ablation metadata instead records repeated seeds, shown explicitly in the table; these are four run candidates per family, not four documented independent seeds.
+Table~\ref{tab:paa-run-selection} reports every eligible candidate. Runs \texttt{00283}--\texttt{00286} retain all 26 asset-token market features. Runs \texttt{00287}--\texttt{00290} remove the five market features calculated at the five-day horizon from the asset tokens, leaving the frozen SAA unchanged. Each feature set and model family is compared across seeds 42, 8, 12, and 14, as listed in the table. This matters because initialization, sampled episodes, and policy exploration can lead PPO to different solutions despite otherwise identical settings.
 
 \begin{table}[htbp]
 \centering
 \small
 \setlength{\tabcolsep}{5pt}
+\sisetup{detect-weight=true, mode=text}
 \begin{tabular}{@{}llrS[table-format=2.2]S[table-format=-1.2]S[table-format=1.2]S[table-format=2.2]@{}}
 \toprule
-{Run} & {Config} & {Seed} & {Mean return (\%)} & {Excess (pp)} & {Sharpe} & {MDD (\%)} \\
+{Run} & {Configuration} & {Seed} & {Mean return (\%)} & {Excess (points)} & {Sharpe} & {MDD (\%)} \\
 \midrule
 \multicolumn{7}{l}{Hierarchical PAA: full feature set} \\
-\textbf{00283} & 10019 & 42 & 19.34 & 7.76 & 0.96 & 16.35 \\
+\bfseries 00283 & \bfseries 10019 & \bfseries 42 & \bfseries 19.34 & \bfseries 7.76 & \bfseries 0.96 & \bfseries 16.35 \\
 00284 & 10020 & 8 & 15.64 & 4.05 & 0.96 & 13.57 \\
 00285 & 10021 & 12 & 13.55 & 1.97 & 0.87 & 14.29 \\
 00286 & 10022 & 14 & 11.91 & 0.32 & 0.78 & 14.77 \\
@@ -318,27 +325,41 @@ Table~\ref{tab:paa-run-selection} reports every eligible candidate. Runs \texttt
 \midrule
 \multicolumn{7}{l}{AR(1) random-signal control} \\
 00291 & 20001 & 42 & 12.32 & 0.74 & 0.75 & 15.08 \\
-00292 & 20002 & 42 & 14.03 & 2.45 & 0.81 & 15.18 \\
-00293 & 20003 & 42 & 10.25 & -1.33 & 0.55 & 17.03 \\
-\textbf{00294} & 20004 & 8 & 17.15 & 5.56 & 0.94 & 15.33 \\
+00292 & 20002 & 8 & 14.03 & 2.45 & 0.81 & 15.18 \\
+00293 & 20003 & 12 & 10.25 & -1.33 & 0.55 & 17.03 \\
+\bfseries 00294 & \bfseries 20004 & \bfseries 14 & \bfseries 17.15 & \bfseries 5.56 & \bfseries 0.94 & \bfseries 15.33 \\
 \midrule
 \multicolumn{7}{l}{Cross-sectional-only PAA} \\
 00295 & 30001 & 42 & 18.51 & 6.93 & 1.04 & 12.13 \\
 00296 & 30002 & 8 & 14.48 & 2.90 & 0.89 & 14.10 \\
-00297 & 30003 & 42 & 11.52 & -0.06 & 0.75 & 14.27 \\
-\textbf{00298} & 30004 & 8 & 19.59 & 8.01 & 1.20 & 12.48 \\
+00297 & 30003 & 12 & 11.52 & -0.06 & 0.75 & 14.27 \\
+\bfseries 00298 & \bfseries 30004 & \bfseries 14 & \bfseries 19.59 & \bfseries 8.01 & \bfseries 1.20 & \bfseries 12.48 \\
 \bottomrule
 \end{tabular}
-\caption{Four-block validation means for runs 00283--00298. Excess is cumulative return minus SPY buy-and-hold return, in percentage points (pp). Bold run identifiers mark the validation-selected candidate in each family. No test metrics enter this table.}
+\caption{Four-block validation means for runs 00283--00298. Excess is cumulative return minus SPY buy-and-hold return, in percentage points. Bold rows mark the validation-selected candidate in each family. No test metrics enter this table.}
 \label{tab:paa-run-selection}
 \end{table}
 
-Run \texttt{00283}, config \texttt{10019}, is selected for the hierarchy: its \(7.76\)-point mean excess exceeds the next full-feature candidate's \(4.05\) points. The highest reduced-feature score is \(2.70\) points. For the control, run \texttt{00294}, config \texttt{20004}, scores \(5.56\) points, compared with \(2.45\) for its nearest competitor. For the cross-sectional-only PAA, run \texttt{00298}, config \texttt{30004}, scores \(8.01\) points, ahead of run \texttt{00295}'s \(6.93\). These selections follow Equation~\ref{eq:paa-selection}; lower drawdown or higher Sharpe is not an alternative selection rule.
+Run \texttt{00283}, configuration \texttt{10019}, is selected for the hierarchy: its \(7.76\)-point mean excess exceeds the next full-feature candidate's \(4.05\) points. The highest reduced-feature score is \(2.70\) points. For the control, run \texttt{00294}, configuration \texttt{20004}, scores \(5.56\) points, compared with \(2.45\) for its nearest competitor. For the cross-sectional-only PAA, run \texttt{00298}, configuration \texttt{30004}, scores \(8.01\) points, ahead of run \texttt{00295}'s \(6.93\). These selections follow Equation~\ref{eq:paa-selection}; lower drawdown or higher Sharpe is not an alternative selection rule.
 
 Across all four candidates, mean validation excess is \(3.53\) points for the full-feature hierarchy, \(1.59\) for the reduced-feature hierarchy, \(1.86\) for the control, and \(4.44\) for the cross-sectional-only family. Removing the five-day features lowers the group mean, although two of the four paired seeds improve. The reduced input set was not pursued further.
 
+\paragraph{Validation performance during training.}
+Figure~\ref{fig:excess_return_over_training} follows the four full-feature hierarchical configurations as Proximal Policy Optimization (PPO) updates their weights. Each plotted point evaluates a checkpoint on all four validation blocks; it is not a return earned on the training episodes. The horizontal axis measures training steps in units of \(10^7\), from zero to approximately 16 million steps. The vertical axis reports mean cumulative \emph{dollar excess value}: the final PAA value minus SPY buy-and-hold value, averaged across the four blocks. With \(\$100{,}000\) initial capital, \(\$5{,}000\) excess corresponds to five percentage points in Equation~\ref{eq:paa-selection}.
+
+Configuration \texttt{10019} (blue) continues to approximately 15.5 million steps. From about 7.5 million steps onwards, its mean excess remains above \(\$5{,}000\), with several peaks near \(\$8{,}000\). The selected checkpoint occurs at approximately 11.25 million steps, within this sustained high-performance region. Five additional checkpoints exceed \(\$7{,}500\). Thus the selected value is accompanied by several similarly performing alternatives rather than standing alone above otherwise weak neighboring checkpoints (Figure~\ref{fig:excess_return_over_training}).
+
+The other curves have lower peaks and subsequently decline. Configuration \texttt{10020} (orange) reaches approximately \(\$4{,}000\) at 7.2 million steps, then falls to about \(-\$500\) by its endpoint near 11.2 million steps. Configuration \texttt{10021} (green) peaks near \(\$2{,}000\) shortly before six million steps and deteriorates before ending near ten million. Configuration \texttt{10022} (red) remains mostly negative, briefly reaching about \(\$420\) near 4.7 million steps, and ends around 8.7 million. The differing endpoints reflect the multi-metric early-stopping rule: training ends when validation reward, Sharpe, and SPY-relative excess all fail to improve for roughly four million steps. This rule limits training duration; the retained checkpoint is still selected by validation excess alone.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.98\textwidth]{semesterthesis_writing/graphs/validation_excess_return_over_spy_abs_mean.png}
+\caption{Mean cumulative dollar excess over SPY across the four validation blocks during training of configurations 10019--10022. The horizontal axis is in units of \(10^7\) training steps. Configuration 10019's selected checkpoint is at approximately 11.25 million steps.}
+\label{fig:excess_return_over_training}
+\end{figure}
+
 \paragraph{Selected models across validation regimes.}
-Table~\ref{tab:paa-validation-blocks} separates return, risk, and trading activity by block. The hierarchy beats SPY in two blocks; the control and cross-sectional-only model each do so in three. Every selected PAA has a positive cumulative return in all four blocks. Relative to equal-weight buy-and-hold, the hierarchy wins three blocks, the control two, and the cross-sectional-only model all four.
+Table~\ref{tab:paa-validation-blocks} separates return, risk, and trading activity by block. Equal-weight buy-and-hold (EW) allocates equally across assets initially, then retains those holdings. The hierarchy beats SPY in two blocks; the control and cross-sectional-only model each do so in three. Every selected PAA has a positive cumulative return in all four blocks. Against EW, the hierarchy wins three blocks, the control two, and the cross-sectional-only model all four.
 
 \begin{table}[p]
 \centering
@@ -368,39 +389,38 @@ Table~\ref{tab:paa-validation-blocks} separates return, risk, and trading activi
 \label{tab:paa-validation-blocks}
 \end{table}
 
-In val\_00, the hierarchy and cross-sectional-only PAA finish almost identically, at \(32.52\%\) and \(32.54\%\). In val\_01, all three underperform SPY, despite positive absolute returns. Val\_02 gives the hierarchy its clearest advantage over the ablations: \(23.97\%\), against \(19.67\%\) for the control and \(12.24\%\) for the cross-sectional-only model. Figure~\ref{fig:paa-hier-val02} shows a substantial interim decline followed by recovery. Its \(15.27\%\) MDD is below SPY's \(20.18\%\), but above the cross-sectional-only PAA's \(11.89\%\). Cash remains a narrow band while Crude, Gold, and the equity ETFs exchange large portfolio shares.
+In val\_00, the hierarchy and cross-sectional-only PAA finish almost identically, at \(32.52\%\) and \(32.54\%\), both above equal-weight buy-and-hold's \(24.58\%\). Their risk measures differ: the hierarchy has a smaller MDD, but the cross-sectional-only model has a higher Sharpe and lower turnover (Table~\ref{tab:paa-validation-blocks}). In val\_01, all three underperform SPY's \(20.20\%\), despite positive absolute returns. The hierarchy's \(18.80\%\) is the highest active-model return in that block, whereas the control's \(8.40\%\) falls below both SPY and equal-weight buy-and-hold.
+
+\paragraph{Reading the three-panel performance figures.}
+Figures~\ref{fig:paa-hier-val02}, \ref{fig:paa-hier-val03}, \ref{fig:paa-cross-val03}, \ref{fig:paa-hier-test}, \ref{fig:paa-ar1-test}, and~\ref{fig:paa-cross-test} share a calendar-date horizontal axis and three panels. Panel (a) plots cumulative percentage return relative to initial capital: black is the PAA, blue SPY buy-and-hold, green equal-weight buy-and-hold, dashed pink the SAA equal-weight reference, and dotted grey cash/EFFR. Its inset bars show daily PAA return minus daily SPY return in basis points; one basis point is \(0.01\) percentage points. These daily differences are not the same quantity as the cumulative endpoint excess in the tables.
+
+Panel (b) shows post-rebalance portfolio weights as a stacked area totaling \(100\%\), with grey for cash and separate colours for each asset. A band's height is its share of portfolio value, not its return contribution. The country equity instruments are exchange-traded funds (ETFs); their symbols and markets are listed in Section~\ref{sec:universe}. Panel (c) plots daily turnover as a percentage of NAV. Green and red bars denote increased and reduced non-cash exposure; grey bars denote reallocation with little net exposure change, using a \(0.5\)-percentage-point classification threshold. The strip beneath the bars records the signed change in risky exposure. The SAA curve in panel (a) is a common reference, including for the ablations that do not consume its signal.
+
+Val\_02 gives the hierarchy its clearest advantage over the ablations: \(23.97\%\), against \(19.67\%\) for the control and \(12.24\%\) for the cross-sectional-only model. In Figure~\ref{fig:paa-hier-val02}(a), the hierarchical portfolio experiences a pronounced interim drawdown, then recovers to finish above SPY (\(6.71\%\)), equal-weight buy-and-hold (\(-3.82\%\)), and the nearly flat SAA reference. Its \(15.27\%\) MDD is below SPY's \(20.18\%\), but above the cross-sectional-only PAA's \(11.89\%\). Panel (b) shows extended Crude-heavy allocations alternating with larger Gold and ETF holdings, while cash remains a narrow base layer. Panel (c) records both sizeable exposure adjustments and numerous exposure-neutral reallocations, totaling \(44.51\) times NAV. The return advantage therefore accompanies substantial changes within the risky portfolio, not a prolonged cash-only position (Figure~\ref{fig:paa-hier-val02}).
 
 \begin{figure}[p]
 \centering
-\fbox{\parbox[c][0.78\textheight][c]{0.94\textwidth}{\centering
-Three-panel graph placeholder\\[1em]
-Hierarchical PAA: run 00283, config 10019, val\_02\\[1em]
-\texttt{best\_model\_excess\_over\_spy\_abs\_\_validation\_val\_02\_3panel.png}
-}}
+\includegraphics[width=0.98\textwidth]{semesterthesis_writing/graphs/best_model_excess_over_spy_abs__validation_val_02_3panel.png}
 \caption{Selected hierarchical PAA in val\_02: cumulative performance and daily excess over SPY, portfolio composition, and daily turnover with exposure changes.}
 \label{fig:paa-hier-val02}
 \end{figure}
 
-The ordering reverses in val\_03. The hierarchy returns \(2.07\%\), compared with \(22.32\%\) for the control and \(16.28\%\) for the cross-sectional-only PAA. It also has the largest MDD, \(20.58\%\), and the lowest Sharpe, \(0.19\). Figures~\ref{fig:paa-hier-val03} and~\ref{fig:paa-cross-val03} show this contrast: the hierarchy loses much of its early gain and recovers only partly, while the cross-sectional-only PAA ends above SPY and equal-weight buy-and-hold. Both remain mostly invested and repeatedly rotate among risky assets.
+The ordering reverses in val\_03. The hierarchy returns \(2.07\%\), compared with \(22.32\%\) for the control and \(16.28\%\) for the cross-sectional-only PAA. It also has the largest MDD, \(20.58\%\), and the lowest Sharpe, \(0.19\) (Table~\ref{tab:paa-validation-blocks}).
+
+Figure~\ref{fig:paa-hier-val03}(a) shows the hierarchy rising early, suffering a deep interim decline, and recovering only partly. Its endpoint is below SPY, equal-weight buy-and-hold, the SAA reference, and cash. Panel (b) shows repeated Crude concentration followed by reversals towards Gold, SPY, and international ETFs; the cash layer remains small throughout. Panel (c) contains recurrent turnover spikes, producing the hierarchy's highest validation turnover, \(48.48\) times NAV. This block combines its weakest return with its greatest trading intensity, rather than showing an inactive policy (Figure~\ref{fig:paa-hier-val03}).
 
 \begin{figure}[p]
 \centering
-\fbox{\parbox[c][0.78\textheight][c]{0.94\textwidth}{\centering
-Three-panel graph placeholder\\[1em]
-Hierarchical PAA: run 00283, config 10019, val\_03\\[1em]
-\texttt{best\_model\_excess\_over\_spy\_abs\_\_validation\_val\_03\_3panel.png}
-}}
+\includegraphics[width=0.98\textwidth]{semesterthesis_writing/graphs/best_model_excess_over_spy_abs__validation_val_03_3panel.png}
 \caption{Selected hierarchical PAA in val\_03, its weakest validation block by excess return over SPY.}
 \label{fig:paa-hier-val03}
 \end{figure}
 
+The cross-sectional-only PAA follows a different path in the same block (Figure~\ref{fig:paa-cross-val03}). Panel (a) ends at \(16.28\%\), above every displayed reference, with a \(9.62\%\) MDD. Panel (b) still shows sizeable rotations between Crude, Gold, SPY, and international ETFs; it is not a static equal-weight strategy. Yet its \(37.19\)-times-NAV turnover and \(0.67\%\) cost are lower than the hierarchy's, despite slightly higher average risky exposure (\(92.78\%\)). The paired figures show different returns and drawdowns within two predominantly invested portfolios, not simply different choices between equities and cash (Figures~\ref{fig:paa-hier-val03} and~\ref{fig:paa-cross-val03}).
+
 \begin{figure}[p]
 \centering
-\fbox{\parbox[c][0.78\textheight][c]{0.94\textwidth}{\centering
-Three-panel graph placeholder\\[1em]
-Cross-sectional-only PAA: run 00298, config 30004, val\_03\\[1em]
-\texttt{best\_model\_excess\_over\_spy\_abs\_\_validation\_val\_03\_3panel.png}
-}}
+\includegraphics[width=0.98\textwidth]{semesterthesis_writing/graphs/00298_best_model_excess_over_spy_abs__validation_val_03_3panel.png}
 \caption{Selected cross-sectional-only PAA in val\_03, for direct comparison with Figure~\ref{fig:paa-hier-val03}.}
 \label{fig:paa-cross-val03}
 \end{figure}
@@ -437,37 +457,29 @@ Cash/EFFR & 3.54 & {--} & 0.00 & 3.88 & {--} & 0.00 \\
 
 All three selected PAAs beat SPY on test. Their excess returns are \(7.24\), \(4.40\), and \(9.61\) percentage points for the hierarchy, control, and cross-sectional-only model. The last also finishes \(0.03\) points above equal-weight buy-and-hold, an approximately equal endpoint. All three exceed the fixed-weight benchmark's \(23.06\%\) return. None exceeds SPY or equal-weight buy-and-hold on the reported Sharpe ratio.
 
-Figure~\ref{fig:paa-hier-test} shows the hierarchy rising above \(50\%\) cumulative return before giving back part of the gain and finishing at \(29.46\%\). Its \(24.75\%\) MDD exceeds both passive market references. The control finishes at \(26.63\%\), with a \(17.12\%\) MDD (Figure~\ref{fig:paa-ar1-test}). The cross-sectional-only model ends at \(31.83\%\), with a \(9.51\%\) MDD; its path differs from equal-weight buy-and-hold despite the similar endpoint (Figure~\ref{fig:paa-cross-test}). Test turnover is \(36.85\), \(45.38\), and \(36.50\) times NAV, with costs of \(0.93\%\), \(1.02\%\), and \(0.67\%\), respectively. Mean risky exposure remains between \(90.41\%\) and \(92.71\%\).
+The hierarchy's test path is shown in Figure~\ref{fig:paa-hier-test}. Panel (a) rises sharply during the middle of the block, exceeds \(50\%\) cumulative return, then gives back part of that gain to finish at \(29.46\%\). The terminal advantage over SPY therefore coexists with a \(24.75\%\) MDD, substantially larger than either passive market reference. Panel (b) shows sustained Crude-heavy stretches interrupted by rotations towards Gold and the ETF sleeve, with cash remaining around the high-single-digit range. Panel (c) combines many exposure-neutral reallocations with isolated large increases and decreases in exposure. Total turnover is \(36.85\) times NAV, cost \(0.93\%\) of initial capital, and average risky exposure \(90.41\%\) (Figure~\ref{fig:paa-hier-test}).
 
 \begin{figure}[p]
 \centering
-\fbox{\parbox[c][0.78\textheight][c]{0.94\textwidth}{\centering
-Three-panel graph placeholder\\[1em]
-Hierarchical PAA: run 00283, config 10019, test\_00\\[1em]
-\texttt{best\_model\_excess\_over\_spy\_abs\_\_test\_test\_00\_3panel.png}
-}}
+\includegraphics[width=0.98\textwidth]{semesterthesis_writing/graphs/best_model_excess_over_spy_abs__test_test_00_3panel.png}
 \caption{Final test performance, composition, and trading activity of the validation-selected hierarchical PAA.}
 \label{fig:paa-hier-test}
 \end{figure}
 
+The AR(1) control returns \(26.63\%\) on test, above SPY but below equal-weight buy-and-hold (Figure~\ref{fig:paa-ar1-test}(a)). The upward path includes repeated reversals, with a \(17.12\%\) MDD and a \(1.34\) Sharpe. Panel (b) alternates between Crude-heavy, Gold-heavy, and broader ETF allocations, again with a thin cash layer. Panel (c) shows frequent internal reallocations as well as net exposure changes: total turnover reaches \(45.38\) times NAV, above both other selected models, with \(1.02\%\) cost and \(91.97\%\) average risky exposure. Thus the control remains profitable despite a non-informative signal source, but has the lowest selected-model test return and the greatest trading intensity (Figure~\ref{fig:paa-ar1-test}).
+
 \begin{figure}[p]
 \centering
-\fbox{\parbox[c][0.78\textheight][c]{0.94\textwidth}{\centering
-Three-panel graph placeholder\\[1em]
-AR(1) control: run 00294, config 20004, test\_00\\[1em]
-\texttt{best\_model\_excess\_over\_spy\_abs\_\_test\_test\_00\_3panel.png}
-}}
+\includegraphics[width=0.98\textwidth]{semesterthesis_writing/graphs/00294_best_model_excess_over_spy_abs__test_test_00_3panel.png}
 \caption{Final test performance, composition, and trading activity of the validation-selected AR(1) random-signal control.}
 \label{fig:paa-ar1-test}
 \end{figure}
 
+The cross-sectional-only PAA finishes at \(31.83\%\), approximately matching equal-weight buy-and-hold, but through a visibly different path (Figure~\ref{fig:paa-cross-test}(a)). Its \(9.51\%\) MDD is slightly below that benchmark's \(10.19\%\), although its \(1.52\) Sharpe remains lower. Panel (b) shows changing commodity and international-equity concentrations, rather than the benchmark's initially equal allocation left to drift with prices. In panel (c), numerous grey reallocations coexist with occasional larger exposure adjustments. Turnover is \(36.50\) times NAV, cost \(0.67\%\), and average risky exposure \(92.71\%\). Among the selected models, this is the highest test return and the lowest drawdown and cost, achieved without a learned SAA signal (Figure~\ref{fig:paa-cross-test}).
+
 \begin{figure}[p]
 \centering
-\fbox{\parbox[c][0.78\textheight][c]{0.94\textwidth}{\centering
-Three-panel graph placeholder\\[1em]
-Cross-sectional-only PAA: run 00298, config 30004, test\_00\\[1em]
-\texttt{best\_model\_excess\_over\_spy\_abs\_\_test\_test\_00\_3panel.png}
-}}
+\includegraphics[width=0.98\textwidth]{semesterthesis_writing/graphs/00298_best_model_excess_over_spy_abs__test_test_00_3panel.png}
 \caption{Final test performance, composition, and trading activity of the validation-selected cross-sectional-only PAA.}
 \label{fig:paa-cross-test}
 \end{figure}
@@ -476,29 +488,45 @@ Cross-sectional-only PAA: run 00298, config 30004, test\_00\\[1em]
 \label{sec:paa-results-discussion}
 
 \paragraph{Allocation success is not the same as successful signal transfer.}
-The PAAs show positive SPY-relative performance on validation averages and on the final test. This is consistent with the continuous-control motivation in the literature review: allocation decisions can exploit cross-asset opportunities rather than merely predict one asset's next return. It supports the usefulness of the implemented allocator, but does not establish that attention is superior to another allocation architecture, since that component is not separately ablated.
+The PAAs show positive SPY-relative performance on validation averages and on the final test. This is consistent with the continuous-control motivation in the literature review: allocation decisions can exploit cross-asset opportunities rather than merely predict one asset's next return. The changing asset weights in Figures~\ref{fig:paa-hier-test}, \ref{fig:paa-ar1-test}, and~\ref{fig:paa-cross-test} illustrate that distinction. Each policy repeatedly chooses both how much risky exposure to hold and which assets should carry it, the two decisions coupled by the live portfolio state and transaction costs in Section~\ref{sec:paa-action}. These results support the usefulness of the implemented allocator, but do not establish that attention is superior to another allocation architecture, since that component is not separately ablated.
 
-The SAA's incremental contribution is not consistently positive. The selected hierarchy exceeds the random-signal control by \(2.20\) points in mean validation return and \(2.83\) points on test, but trails the cross-sectional-only PAA by \(0.25\) and \(2.37\) points. The four-run full-feature hierarchy also has a lower mean validation excess than the cross-sectional-only family. Positive results without a learned SAA signal show that the market features and live portfolio state already contain sufficient information for profitable allocation in these blocks.
+The SAA's incremental contribution is not consistently positive. The selected hierarchy exceeds the random-signal control by \(2.20\) points in mean validation return and \(2.83\) points on test, but trails the cross-sectional-only PAA by \(0.25\) and \(2.37\) points. The four-run full-feature hierarchy also has a lower mean validation excess than the cross-sectional-only family. Consequently, beating a random-signal control is not enough to establish useful transfer: the learned signal must also improve on omitting the specialist. Positive results without it show that the retained market features and live portfolio state already permit profitable allocation in these blocks.
 
-The regime contrast is more informative than a single average. The hierarchy leads both ablations in val\_02, yet substantially trails them in val\_03 (Figures~\ref{fig:paa-hier-val02}--\ref{fig:paa-cross-val03}). This is compatible with a conditionally useful temporal signal, not a uniformly beneficial one. Section~\ref{sec:modular-composition} explicitly distinguishes architectural specialization from successful transfer; the present results preserve that distinction. They do not identify whether the weak blocks arise from the frozen signal, the allocator's use of it, or training variability.
+The cross-sectional-only result does not imply that temporal information is irrelevant. Multi-horizon returns, fractional differentiation, recorded allocation targets, and running account statistics already summarize history (Sections~\ref{sec:state-returns}, \ref{sec:state-ffd}, and~\ref{sec:paa-state}). Moreover, the hierarchy transfers action, exposure, and shadow risk summaries together. Replacing the action source also changes those account histories, while the zero-signal variant retains the risk-summary fields for untraded cash accounts. The comparison therefore tests the combined frozen-policy/shadow-account interface; it cannot isolate an action-only effect or identify which transferred quantity helps or hurts. This qualifies the recurrent-memory motivation reviewed in Chapter~2 \cite{hausknecht2015deep}: usefulness depends on the information already available and its transfer to the allocation objective.
+
+\paragraph{Regime Correspondence Between the Single-Asset Policy and the Hierarchy.}
+The strongest correspondence occurs in val\_02 and val\_03. The selected SAA's period-average Asset \(\alpha\) is \(20.08\%\) in val\_02 and \(-0.99\%\) in val\_03 (Table~\ref{tab:saa-per-asset-metrics}); the hierarchy likewise leads both ablations in val\_02 but substantially trails them in val\_03. Relative to the cross-sectional-only PAA, its return advantage of \(11.73\) points in val\_02 is more than offset by a \(14.21\)-point shortfall in val\_03. Averaging the blocks therefore conceals a large reversal in the value associated with adding the specialist.
+
+The market conditions in Table~\ref{tab:oos-blocks} help interpret this reversal. Val\_02 contains a broad decline followed by recovery, while gold and equities partly diverge. The standalone SAA ensemble largely preserves earlier gains through the sell-off (Figure~\ref{fig:saa-agg-val02}), consistent with the long-only specialist reducing exposure when holding its assigned asset becomes unattractive. The hierarchical PAA also outperforms the passive market references, but follows a different risk path: it rotates between concentrated risky holdings and incurs a \(15.27\%\) drawdown (Figure~\ref{fig:paa-hier-val02}). Its advantage is compatible with useful timing context being combined with asset selection; it is not evidence that the allocator simply reproduces the SAA ensemble's defensive cash positions.
+
+Val\_03 contains a concentration-led rally and two distinct shocks. The SAA's defensive behavior misses part of the Gold and German-equity rallies, leaving seven assets below their own buy-and-hold benchmarks (Section~\ref{sec:saa-results-discussion}). The hierarchy is also weak in this block, but not merely because it holds too much cash: average risky exposure remains \(91.35\%\), and its return is below cash carry as well as the market references. Figure~\ref{fig:paa-hier-val03} instead shows repeated concentration and reversal within the risky portfolio. The cross-sectional-only PAA achieves a higher return and a shallower drawdown through its own rotations (Figure~\ref{fig:paa-cross-val03}). This pattern is consistent with the frozen specialist failing to add reliable guidance under these conditions, but the plots cannot distinguish an unreliable source signal from an allocator that uses it poorly.
+
+The other blocks prevent a simple rule that stronger SAA alpha necessarily means stronger hierarchical allocation. In val\_00, the SAA's mean Asset \(\alpha\) is slightly negative (\(-0.94\%\)), yet the hierarchy earns \(32.52\%\) and almost matches the cross-sectional-only PAA. In val\_01, the SAA's \(15.19\%\) mean Asset \(\alpha\) coexists with the hierarchy's small shortfall to SPY. These measures answer different questions: SAA alpha compares each instrument with its \emph{own} passive benchmark, whereas PAA excess compares a multi-asset portfolio with \emph{SPY}. Successful isolated timing can therefore coexist with an allocation that misses the strongest market opportunity. The SAA supplies a position-change signal, not a ranking of expected cross-asset returns (Sections~\ref{sec:saa} and~\ref{sec:paa-state}).
 
 \paragraph{What the shadow portfolios establish.}
-The recorded consistency checks for run \texttt{00283} show no missing shadow-action commits, no non-finite portfolio values, and zero discrepancy between injected and independently regenerated SAA signals and shadow values in every block. This supports the operational correctness of the interface in Section~\ref{sec:info-flow}. It does not prove that the transferred signal improves returns or that the shadow observations reproduce the standalone SAA evaluation distribution. Isolation prevents the PAA's trades from directly rewriting the SAA's account state; it cannot remove a weak or regime-dependent policy's forecasting errors.
+The recorded consistency checks for run \texttt{00283} show no missing shadow-action commits, no non-finite portfolio values, and zero discrepancy between injected and independently regenerated SAA signals and shadow values in every block. This supports the operational correctness of the interface in Section~\ref{sec:info-flow}. Isolation prevents the PAA's trades from directly rewriting the SAA's account state, addressing the specific domain-shift risk identified in Section~\ref{sec:saa-stability}. It does not improve an unreliable policy by itself or prove equivalence with the standalone evaluation.
 
-Section~\ref{sec:paa-state} exposes the SAA action and shadow holding fraction as features, not binding instructions. The PAA can therefore discount them through the attention network (Section~\ref{sec:paa-network}), but that flexibility does not guarantee that PPO learns when to do so. The AR(1) control also demonstrates that smoothness and an evolving shadow book are insufficient evidence of useful temporal information. Its strong val\_03 result is not evidence that random signals predict returns; useful decisions can still arise from its other inputs, with additional variation from training and the noise realization.
+Indeed, the standalone SAA ensemble and the regenerated PAA-harness reference have different return paths: the former gains approximately \(19.5\%\) in val\_02 (Figure~\ref{fig:saa-agg-val02}), while the latter is nearly flat (Figure~\ref{fig:paa-hier-val02}). Their shared checkpoint identity therefore does not make the two evaluations interchangeable. The regime correspondence discussed above is descriptive evidence, not a decomposition of PAA returns into the previously reported SAA gains. The ablation comparisons within the common PAA harness provide the more direct evidence about transfer.
+
+The transferred action, holding fraction, Sortino, and drawdown are features rather than instructions (Section~\ref{sec:paa-state}). They combine a requested trade with exposure and risk summaries, but do not include hidden state or calibrated forecast confidence. The shadow Sortino input uses the environment-specific return proxy described in Section~\ref{sec:info-flow}; its cash-carry sign differs from ordinary net return, so it is not directly comparable with the financial ratios reported here. Both actor and critic can use these summaries through contextualized tokens (Section~\ref{sec:paa-network}), but that does not guarantee that PPO learns which component to discount. The AR(1) control's strong val\_03 result likewise does not show that random signals predict returns: useful allocation remains possible through other inputs, with variation from training and noise.
 
 \paragraph{Return, risk, and the reward counterfactual.}
-The choice of SPY as the excess-return counterfactual (Section~\ref{sec:excess-return}) explains why positive reward-relative performance need not imply the best diversified investment outcome. On test, the hierarchy beats SPY but trails equal-weight buy-and-hold and experiences roughly \(2.7\) times SPY's MDD. The control likewise trails equal-weight buy-and-hold. The cross-sectional-only model nearly matches that benchmark's return and has a slightly smaller MDD, but a lower reported Sharpe. Thus the strongest conclusion concerns net return relative to SPY, not general risk-adjusted dominance over passive investing.
+The choice of SPY as the excess-return counterfactual (Section~\ref{sec:excess-return}) explains why positive reward-relative performance need not imply the best diversified investment outcome. On test, the hierarchy beats SPY but trails equal-weight buy-and-hold and experiences roughly \(2.7\) times SPY's MDD (Figure~\ref{fig:paa-hier-test}). The control likewise trails equal-weight buy-and-hold (Figure~\ref{fig:paa-ar1-test}). The cross-sectional-only model nearly matches that benchmark's return and has a slightly smaller MDD, but a lower reported Sharpe (Figure~\ref{fig:paa-cross-test}). Its smaller drawdown is attractive to an investor concerned with peak-to-trough losses, while the lower Sharpe cautions against describing it as uniformly more efficient per unit of daily variability. The strongest conclusion concerns net return relative to SPY, not general risk-adjusted dominance over passive investing.
 
-The composition panels are consistent with cross-sectional rotation, the role assigned to attention in Section~\ref{sec:self-attention}. Average risky exposure stays near \(90\)--\(93\%\), while commodity and equity weights change markedly. Nevertheless, exposure is not a complete risk measure: replacing equity with Crude can change concentration and volatility without changing total risky exposure. Grey turnover bars should therefore be read as approximately exposure-neutral reallocations, not risk-neutral trades. The graphs show neither a predominantly cash-timing policy nor uniformly successful diversification.
+The composition panels are consistent with cross-sectional rotation, the role assigned to attention in Section~\ref{sec:self-attention}. Average risky exposure stays near \(90\)--\(93\%\), while commodity and equity weights change markedly in Figures~\ref{fig:paa-hier-val02}, \ref{fig:paa-hier-val03}, and~\ref{fig:paa-cross-test}. The fixed cash logit of Section~\ref{sec:paa-action} makes cash available as an allocation choice; it does not fix its portfolio weight. Remaining mostly invested is therefore an observed policy outcome. Nevertheless, exposure is not a complete risk measure: replacing equities with Crude can change concentration and volatility without changing total risky exposure. Grey turnover bars are approximately exposure-neutral reallocations, not risk-neutral trades. The plots demonstrate active selection, not uniformly successful diversification.
 
-The drawdown penalties and partial execution of Sections~\ref{sec:drawdown} and~\ref{sec:paa-action} discourage losses and abrupt reallocations; they do not impose a hard portfolio-risk limit. The hierarchical test drawdown illustrates that distinction. Likewise, positive net returns already absorb the configured friction, but turnover of tens of times NAV makes their economic value sensitive to the commission, spread, and impact assumptions in Section~\ref{sec:friction}. The lower cross-sectional-only costs are an additional practical advantage in this comparison, not evidence that the cost model captures all live-trading frictions.
+The drawdown penalties and partial execution of Sections~\ref{sec:drawdown} and~\ref{sec:paa-action} discourage losses and abrupt reallocations; they do not impose a hard portfolio-risk limit. The hierarchy's loss of a substantial part of its test-period peak illustrates that distinction (Figure~\ref{fig:paa-hier-test}). Similarly, the literature review's hybrid-policy studies motivate combining temporal representation and allocation, but report performance under their own data, trading frequencies, and risk settings \cite{JunKevin.2025,GabrielNixonRaj.2025}. Their reported gains cannot establish that this particular frozen interface will be best under the present objective.
+
+Positive net returns already absorb the configured friction, but turnover of tens of times NAV makes their economic value sensitive to the commission, spread, and impact assumptions in Section~\ref{sec:friction}. In val\_03, the hierarchy trades more than the cross-sectional-only model while earning less; on test, the control trades most but has the lowest active-model return. These comparisons show that trading intensity is not a proxy for decision quality (Figures~\ref{fig:paa-hier-val03}, \ref{fig:paa-cross-val03}, and~\ref{fig:paa-ar1-test}). The cross-sectional-only model's lower costs add to its practical appeal here, but do not establish that the simulator captures all live-trading frictions.
+
+\paragraph{Checkpoint stability and seed dependence.}
+Figure~\ref{fig:excess_return_over_training} materially strengthens the case for selecting configuration \texttt{10019}. Its broad region of positive validation excess, including five additional checkpoints above \(\$7{,}500\), makes the selected checkpoint less dependent on one isolated favorable evaluation. Remaining above \(\$5{,}000\) after approximately 7.5 million steps provides little evidence of sustained validation deterioration within the observed interval. This contrasts with the post-peak declines of configurations \texttt{10020}--\texttt{10022}, which are consistent with overfitting or unstable learning: further optimization does not preserve their earlier validation performance. The graph does not by itself identify which mechanism causes the decline.
+
+The separate SAA training comparison already warned that a high validation peak can be followed by deterioration (Figure~\ref{fig:saa_train_vs_validation}). The selected hierarchy instead maintains several high-performing checkpoints (Figure~\ref{fig:excess_return_over_training}), showing that this warning does not apply equally to every stage and seed. At the same time, those checkpoints share training data and validation blocks; they are not independent replications. The plateau supports \emph{within-run checkpoint stability}, not universal robustness of the hierarchical architecture or a statistically established SAA contribution. The weaker runs under the same full-feature architecture remain evidence of seed sensitivity.
 
 \paragraph{Generalization and strength of evidence.}
-Test returns and reported Sharpe ratios exceed each selected model's validation mean, so the final block shows no uniform collapse in performance. However, the hierarchy and control incur larger test drawdowns, and test excess over SPY falls from \(7.76\) to \(7.24\) points and from \(5.56\) to \(4.40\) points. Only the cross-sectional-only model improves both SPY-relative excess and MDD. Higher absolute test returns also coincide with stronger passive returns and a different evaluation horizon. They are therefore not, by themselves, evidence that the policies generalize better than their validation scores suggest.
+Test returns and reported Sharpe ratios exceed each selected model's validation mean, so the final block shows no uniform collapse in performance (Table~\ref{tab:paa-validation-test}). However, the hierarchy and control incur larger test drawdowns, and test excess over SPY falls from \(7.76\) to \(7.24\) points and from \(5.56\) to \(4.40\) points. Only the cross-sectional-only model improves both SPY-relative excess and MDD. Higher absolute test returns also coincide with stronger passive returns and a different evaluation horizon. They are therefore not, by themselves, evidence that the policies generalize better than their validation scores suggest. The more defensible observation is that each validation-selected model retains a positive net advantage over the chosen SPY counterfactual in one previously unused block, with different risk costs.
 
-Validation-only selection preserves the separation required by Section~\ref{sec:oos-protocol}, but choosing the maximum across checkpoints and configurations can still inflate validation performance, the backtest-selection concern discussed by L\'opez de Prado \cite{LopezdePrado.2018}. Run variation is substantial: full-feature hierarchical validation excess ranges from \(0.32\) to \(7.76\) points, and cross-sectional-only excess from \(-0.06\) to \(8.01\). The \(0.25\)-point gap between the selected models is small relative to those ranges. Repeated recorded seeds, different selected seeds, and a single AR(1) realization per evaluation prevent these rankings from being interpreted as statistically established causal effects of the SAA.
+Validation-only selection preserves the separation required by Section~\ref{sec:oos-protocol}, but choosing the maximum across checkpoints and configurations can still inflate validation performance, the backtest-selection concern discussed by L\'opez de Prado \cite{LopezdePrado.2018}. Run variation is substantial: full-feature hierarchical validation excess ranges from \(0.32\) to \(7.76\) points, and cross-sectional-only excess from \(-0.06\) to \(8.01\). The \(0.25\)-point gap between the selected models is small relative to those ranges. Four seeds per family reveal variation, but selecting the best seed separately for each family is not a paired statistical comparison. Different selected seeds, one AR(1) realization per evaluation, and one held-out block prevent these rankings from being interpreted as statistically established causal effects of the SAA. The small mean gap and the large regime reversals deserve separate conclusions, rather than one unqualified winner claim.
 
-\textbf{\textit{TensorBoard figure to add: plot validation/excess\_return\_over\_spy\_abs\_mean against environment steps for the full-feature candidates, mark their selected checkpoints, and include the per-block val\_03 excess curve. The argument is whether the selected mean reflects sustained validation performance or a brief peak masking deterioration in one regime. Do not infer this behavior from the final-checkpoint tables alone.}}
-
-Overall, the evidence supports an effective SPY-relative allocator and a functioning shadow-portfolio interface, but not a general performance benefit from the frozen SAA. The most competitive selected model here is cross-sectional-only. The hierarchical signal remains useful in some validation regimes, while its added temporal information is redundant or associated with weaker outcomes in others. This is an empirical qualification of the proposed decomposition, not a failure of its implementation.
+Overall, the evidence supports effective SPY-relative allocation, a functioning shadow-portfolio interface, and a selected hierarchical run whose high validation performance persists across many checkpoints. It does not establish a general performance benefit from the frozen SAA. The cross-sectional-only model is the most competitive selected model on aggregate validation and test results, while the hierarchy's advantage in val\_02 shows that the comparison remains regime-dependent. The thesis therefore distinguishes three achievements: implementing temporal-to-cross-sectional transfer, learning profitable allocation, and demonstrating the transfer's incremental value. The first two are supported here; the third is conditional rather than universal. This empirical qualification of the proposed decomposition is the central result of the controlled comparison.
