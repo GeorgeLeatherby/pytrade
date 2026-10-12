@@ -1657,6 +1657,19 @@ class MarketDataCache:
             return np.zeros((self.num_assets, self.num_features), dtype=np.float32)
         
         return self.features[step_idx]
+
+    def get_spy_log_close_return_at_step(self, step_idx: int) -> float:
+        """Return SPY's one-day log close return without adding a repeated asset feature."""
+        spy_index = self.asset_to_index.get("SPY")
+        if spy_index is None:
+            raise ValueError("SPY is required for the SPY market-context observation feature.")
+        if step_idx <= 0 or step_idx >= self.num_days:
+            return 0.0
+        previous_close = float(self.close_prices[step_idx - 1, spy_index])
+        current_close = float(self.close_prices[step_idx, spy_index])
+        if previous_close <= 0.0 or current_close <= 0.0:
+            raise ValueError(f"Invalid SPY close prices at step {step_idx}: {previous_close}, {current_close}")
+        return float(np.log(current_close / previous_close))
     
     # NEW: Utility functions
     def get_selected_feature_names(self) -> List[str]:
@@ -1965,6 +1978,10 @@ class TradingEnv(gym.Env):
         self.include_risk_free_zscore_feature = bool(config["environment"].get("z_score_60_effr", True))
         # Raw EFFR level is opt-in so older checkpoints retain their observation shape.
         self.effr_level_active = bool(config["environment"].get("effr_level_active", False))
+        # Optional scalar market-context input for standalone SAA observations.
+        self.include_spy_log_close_return_feature = bool(
+            config["environment"].get("include_spy_log_close_return_1d", False)
+        )
 
         self.quantity_type = config["environment"].get("quantity_type", "shares")
         self.price_source = config["environment"].get("price_source", "next_open")  # "next_open" | "current_close"
@@ -2107,6 +2124,7 @@ class TradingEnv(gym.Env):
                 5
                 + (1 if self.include_risk_free_zscore_feature else 0)
                 + (1 if self.effr_level_active else 0)
+                + (1 if self.include_spy_log_close_return_feature else 0)
             )
 
         else:
@@ -5245,6 +5263,10 @@ class TradingEnv(gym.Env):
                     self.market_data_cache.get_risk_free_rate_pa_at_step(self.current_absolute_step)
                 ) / 0.1
                 portfolio_feature_list.append(effr_level_scaled)
+            if self.include_spy_log_close_return_feature:
+                portfolio_feature_list.append(
+                    self.market_data_cache.get_spy_log_close_return_at_step(self.current_absolute_step)
+                )
 
             portfolio_features = np.array(portfolio_feature_list, dtype=np.float32)
 

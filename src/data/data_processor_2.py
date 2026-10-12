@@ -50,6 +50,7 @@ class DataEnricher:
 
         # Convert 'Date' columns to datetime objects immediately after loading
         self.raw_indices_data['Date'] = pd.to_datetime(self.raw_indices_data['Date'])
+        self.correct_ohlc_bounds()
 
         # Asset configuration
         self.assets = sorted(self.raw_indices_data['Symbol'].dropna().unique().tolist())  # list all symbols to use here
@@ -68,6 +69,24 @@ class DataEnricher:
 
         # start enrichment process
         self.enrich_data()
+
+    def correct_ohlc_bounds(self):
+        """Ensure Open and Close prices are contained by each day's Low/High."""
+        required_columns = {'Open', 'High', 'Low', 'Close'}
+        missing_columns = required_columns.difference(self.raw_indices_data.columns)
+        if missing_columns:
+            raise ValueError(f"Raw data is missing OHLC columns: {sorted(missing_columns)}")
+
+        lower_bound = self.raw_indices_data[['Open', 'Close']].min(axis=1)
+        upper_bound = self.raw_indices_data[['Open', 'Close']].max(axis=1)
+        invalid_low = self.raw_indices_data['Low'] > lower_bound
+        invalid_high = self.raw_indices_data['High'] < upper_bound
+
+        corrections = int(invalid_low.sum() + invalid_high.sum())
+        self.raw_indices_data.loc[invalid_low, 'Low'] = lower_bound[invalid_low]
+        self.raw_indices_data.loc[invalid_high, 'High'] = upper_bound[invalid_high]
+        if corrections:
+            print(f"Corrected {corrections} implausible OHLC bounds before feature calculation.")
 
     def init_data_NaN_inf_check(self, df):
         # Initial NaN and Inf check on raw data
@@ -471,8 +490,20 @@ class DataEnricher:
         df['market_dispersion'] = df['Date'].map(np.log(dispersion + 1e-8))
         
         # Z-score the dispersion to make it stationary
-        df['z_market_dispersion'] = (df['market_dispersion'] - df['market_dispersion'].rolling(window=self.max_norm_horizon, min_periods=5).mean()) / \
-                                    (df['market_dispersion'].rolling(window=self.max_norm_horizon, min_periods=5).std() + 1e-8)
+        dispersion_dates = df[['Date', 'market_dispersion']].drop_duplicates('Date').sort_values('Date')
+        dispersion_mean = dispersion_dates['market_dispersion'].rolling(
+            window=self.max_norm_horizon, min_periods=5
+        ).mean()
+        dispersion_std = dispersion_dates['market_dispersion'].rolling(
+            window=self.max_norm_horizon, min_periods=5
+        ).std()
+        dispersion_dates['z_market_dispersion'] = (
+            (dispersion_dates['market_dispersion'] - dispersion_mean)
+            / (dispersion_std + 1e-8)
+        )
+        df['z_market_dispersion'] = df['Date'].map(
+            dispersion_dates.set_index('Date')['z_market_dispersion']
+        )
 
         # --- 4. Rolling Beta (FIXED) ---
         def calc_beta(group):
@@ -496,7 +527,7 @@ class DataEnricher:
         # Final Z-score for Beta to normalize across assets
         df['z_beta_spy'] = df.groupby('Symbol')['beta_spy'].transform(
             lambda x: (x - x.rolling(window=self.max_norm_horizon, min_periods=5).mean()) / (x.rolling(window=self.max_norm_horizon, min_periods=5).std() + 1e-8)
-        )
+        ).clip(-3, 3)
 
         # Add the new features to enriched_data at correct symbol and time alignment
         for feature in ['z_fisher_corr_spy', 'z_market_dispersion','z_beta_spy']:
@@ -637,16 +668,26 @@ class DataEnricher:
         # Features for compact intraday information (Open, High, Low)
         log_intra_vol = np.log(df['High']/(df['Low']))
         closing_strength = (df['Close'] - df['Low']) / (df['High'] - df['Low'])
-        log_overnight_gap = np.log(df['Open'] / df['Close'].shift(1))
+        log_overnight_gap = np.log(
+            df['Open'] / df.groupby('Symbol')['Close'].shift(1)
+        )
         shadow_ratio = (df['High'] - np.max(df[['Open', 'Close']], axis=1)) / (df['High'] - df['Low'])
 
         # Make stationary (z-scoring or MinMax scaling)
-        rolling_mean = log_intra_vol.rolling(window=self.max_norm_horizon).mean()
-        rolling_std = log_intra_vol.rolling(window=self.max_norm_horizon).std()
+        rolling_mean = log_intra_vol.groupby(df['Symbol']).transform(
+            lambda x: x.rolling(window=self.max_norm_horizon).mean()
+        )
+        rolling_std = log_intra_vol.groupby(df['Symbol']).transform(
+            lambda x: x.rolling(window=self.max_norm_horizon).std()
+        )
         z_log_intra_vol = np.tanh((log_intra_vol - rolling_mean) / (rolling_std + 1e-8))
 
-        rolling_mean_og = log_overnight_gap.rolling(window=self.max_norm_horizon).mean()
-        rolling_std_og = log_overnight_gap.rolling(window=self.max_norm_horizon).std()
+        rolling_mean_og = log_overnight_gap.groupby(df['Symbol']).transform(
+            lambda x: x.rolling(window=self.max_norm_horizon).mean()
+        )
+        rolling_std_og = log_overnight_gap.groupby(df['Symbol']).transform(
+            lambda x: x.rolling(window=self.max_norm_horizon).std()
+        )
         z_log_overnight_gap = np.tanh((log_overnight_gap - rolling_mean_og) / (rolling_std_og + 1e-8))
 
         df['z_log_intra_vol'] = z_log_intra_vol

@@ -95,6 +95,10 @@ def _standalone_cache(cache, saa):
     )
 
 
+def _saa_observation_dim(cache, saa):
+    return TradingEnv(copy.deepcopy(saa), _standalone_cache(cache, saa), "validation").observation_space.shape[0]
+
+
 def _make_paa_adapter(paa, cache, options):
     adapter = allocator.PortfolioEpisodeAdapter(TradingEnv(copy.deepcopy(paa), cache, "validation"))
     adapter.set_plan_queue([options] * 20)
@@ -148,6 +152,22 @@ def test_shadow_accounts_match_standalone(configs, cache, zscore, effr_level):
     np.testing.assert_array_equal(parent.get_saa_signal_inputs()["observation"], observations)
 
 
+def test_spy_market_context_is_shared_by_standalone_and_shadow_saa(configs, cache):
+    paa, saa = configs
+    cache.close_prices[:, cache.asset_to_index["SPY"]] = np.arange(cache.num_days, dtype=np.float32) + 100.0
+    saa_cache = _standalone_cache(cache, saa)
+    parent = TradingEnv(paa, cache, "validation")
+    parent.configure_saa_shadow_portfolios(saa)
+    parent.reset(seed=42, option=_options(start=1))
+    standalone = TradingEnv(copy.deepcopy(saa), saa_cache, "validation")
+    standalone_obs, _ = standalone.reset(seed=42, option=_options(start=1), asset="SPY")
+
+    expected = cache.get_spy_log_close_return_at_step(1)
+    assert saa["environment"]["include_spy_log_close_return_1d"] is True
+    np.testing.assert_allclose(standalone_obs[-cache.num_assets - 1], expected)
+    np.testing.assert_allclose(parent.get_saa_signal_inputs()["observation"][0, -cache.num_assets - 1], expected)
+
+
 @pytest.mark.parametrize("multiprocess,norm_obs", [(False, True), (False, False), (True, True)])
 def test_recurrent_wrapper_matches_standalone(configs, cache, monkeypatch, multiprocess, norm_obs):
     paa, saa = configs
@@ -157,7 +177,7 @@ def test_recurrent_wrapper_matches_standalone(configs, cache, monkeypatch, multi
     options = [_options(), _options(start=2, length=5)]
     factories = [partial(_make_paa_adapter, paa, cache, option) for option in options]
     raw = SubprocVecEnv(factories, start_method="spawn") if multiprocess else DummyVecEnv(factories)
-    observation_dim = saa_cache.num_features + 6 + cache.num_assets
+    observation_dim = _saa_observation_dim(cache, saa)
     observation_space = gym.spaces.Box(-np.inf, np.inf, shape=(observation_dim,), dtype=np.float32)
     norm = VecNormalize(
         DummyVecEnv([lambda: allocator._ObsNormDummyEnv(observation_space)]),
@@ -253,7 +273,7 @@ def test_standalone_tester_matches_training_adapter(configs, cache):
 
     _, saa = configs
     saa_cache = _standalone_cache(cache, saa)
-    model = FixedPolicy(saa_cache.num_features + 6 + cache.num_assets, 0.123456)
+    model = FixedPolicy(_saa_observation_dim(cache, saa), 0.123456)
     reference = _run_asset_episode(
         saa_cache, saa, model, None, "SPY", 0.3, True, torch.device("cpu"), "synthetic", 0, 8, 42
     )
@@ -274,7 +294,7 @@ def test_wrapper_clips_after_action_scaling(configs, cache, monkeypatch):
     paa, saa = configs
     monkeypatch.setattr(allocator, "_read_saa_training_config", lambda _config: copy.deepcopy(saa))
     raw = DummyVecEnv([partial(_make_paa_adapter, paa, cache, _options())])
-    model = FixedPolicy(32 + 6 + cache.num_assets, 0.75)
+    model = FixedPolicy(_saa_observation_dim(cache, saa), 0.75)
     wrapper = allocator.SAASignalWrapper(
         raw, model, None, cache.num_assets, torch.device("cpu"), paa, cache.feature_to_index, 3.0, False
     )
@@ -292,7 +312,7 @@ def test_recorder_keeps_saa_costs_separate(configs, cache, monkeypatch):
     monkeypatch.setattr(allocator, "_read_saa_training_config", lambda _config: copy.deepcopy(saa))
     raw = DummyVecEnv([lambda: DailyRecorder(_make_paa_adapter(paa, cache, _options()))])
     recorder = raw.envs[0]
-    model = FixedPolicy(32 + 6 + cache.num_assets, 0.5)
+    model = FixedPolicy(_saa_observation_dim(cache, saa), 0.5)
     wrapper = allocator.SAASignalWrapper(
         raw, model, None, cache.num_assets, torch.device("cpu"), paa, cache.feature_to_index, 0.3, False
     )
@@ -459,7 +479,7 @@ def test_terminal_wrappers_use_final_features_and_holdings(configs, cache, monke
     recorder = raw.envs[0]
     predictions = []
     if family == 'hierarchical':
-        model = FixedPolicy(32 + 6 + cache.num_assets, 0.5)
+        model = FixedPolicy(_saa_observation_dim(cache, saa), 0.5)
         original_predict = model.predict
 
         def predict(observations, **kwargs):
@@ -629,7 +649,7 @@ def test_allocator_ppo_bootstraps_real_terminal_portfolios(configs, cache, monke
     raw = DummyVecEnv([partial(_make_paa_adapter, paa, cache, _options(length=3))])
     if family == 'hierarchical':
         wrapper = allocator.SAASignalWrapper(
-            raw, FixedPolicy(32 + 6 + cache.num_assets, 0.5), None, cache.num_assets,
+            raw, FixedPolicy(_saa_observation_dim(cache, saa), 0.5), None, cache.num_assets,
             torch.device('cpu'), paa, cache.feature_to_index, 0.3, False,
         )
     elif family == 'ar1':
