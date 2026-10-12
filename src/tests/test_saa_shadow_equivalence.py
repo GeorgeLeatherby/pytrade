@@ -3,11 +3,14 @@ import json
 import sys
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
+from dataclasses import replace
 
 import gymnasium as gym
 import numpy as np
 import pytest
 import torch
+from stable_baselines3 import PPO
 from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 
@@ -15,7 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from agents.PPO_portfolio_allocator_weights import ppo_portfolio_allocator_weights_agent as allocator
-from environment.trading_environment import MarketDataCache, TradingEnv
+from environment.trading_environment import EpisodeBuffer, MarketDataCache, TradingEnv
 
 
 @pytest.fixture
@@ -171,7 +174,8 @@ def test_recurrent_wrapper_matches_standalone(configs, cache, monkeypatch, multi
     received = []
 
     def predict_and_record(observations, **kwargs):
-        received.append(observations.copy())
+        if len(observations) == 2 * cache.num_assets:
+            received.append(observations.copy())
         return original_predict(observations, **kwargs)
 
     monkeypatch.setattr(model, "predict", predict_and_record)
@@ -304,3 +308,388 @@ def test_recorder_keeps_saa_costs_separate(configs, cache, monkeypatch):
         assert np.all(episode["sub_committed"][:-1])
     finally:
         wrapper.close()
+
+
+def test_allocator_can_request_ninety_percent_cash(configs, cache):
+    paa, _ = configs
+    parent = TradingEnv(paa, cache, 'validation')
+    parent.reset(seed=42, option=_options())
+    np.testing.assert_array_equal(parent.action_space.low, np.full(cache.num_assets, -5))
+    parent.step(np.full(cache.num_assets, -5, dtype=np.float32))
+    target_cash = parent.episode_buffer.actions[1, 0]
+    assert target_cash >= 0.9
+    assert target_cash == pytest.approx(1 / (1 + cache.num_assets * np.exp(-5)))
+
+
+@pytest.mark.parametrize('lookback', [0, 3])
+def test_risk_windows_include_current_step_and_exclude_warmup(lookback):
+    buffer = EpisodeBuffer(12, 1, lookback, bool(lookback))
+    for step, value in enumerate([100., 80., 70.]):
+        buffer.record_portfolio_snapshot(
+            step, value, np.array([0., 1.]), np.array([1.]),
+            0. if step == 0 else -0.2, np.array([value]),
+        )
+        if step > 0:
+            assert buffer.calculate_max_drawdown(10) == pytest.approx(1 - value / 100)
+            assert buffer.saa_calculate_max_drawdown(0, 10) == pytest.approx(1 - value / 100)
+    np.testing.assert_allclose(buffer.get_returns_window(2), [-0.2, -0.2])
+
+
+def test_holdings_encoding_distinguishes_empty_and_full(configs, cache):
+    _, saa = configs
+    single_cache = _standalone_cache(cache, saa)
+    single = TradingEnv(saa, single_cache, 'validation')
+    cash_observation, _ = single.reset(seed=42, option=_options(), asset='SPY')
+    asset_index = cache.asset_to_index['SPY']
+    single.episode_buffer.portfolio_weights[0] = 0
+    single.episode_buffer.portfolio_weights[0, asset_index + 1] = 1
+    asset_observation = single.get_observation_single_step()
+    offset = single_cache.num_features
+    np.testing.assert_allclose(cash_observation[offset:offset + 2], [np.log(2), 0])
+    np.testing.assert_allclose(asset_observation[offset:offset + 2], [0, np.log(2)])
+    assert not np.array_equal(cash_observation, asset_observation)
+
+
+def test_saa_return_is_percentage_nav_change(configs, cache):
+    _, saa = configs
+    saa['environment'].update(execution_min_days_between_trades=0)
+    cache.close_prices[:] = 100
+    cache.risk_free_rate_daily[:] = 0
+    single_cache = _standalone_cache(cache, saa)
+    single = TradingEnv(saa, single_cache, 'validation')
+    single.reset(seed=42, option=_options(), asset='SPY')
+    for action in [0.1, -0.1, 0.0]:
+        before = single.portfolio_state.get_total_value()
+        observation, _, _, _, _ = single.step(np.array([action], dtype=np.float32), asset='SPY')
+        expected = single.portfolio_state.get_total_value() / before - 1
+        assert single.episode_buffer.saa_returns[single.current_step] == pytest.approx(expected, abs=1e-8)
+        assert observation[single_cache.num_features + 2] == pytest.approx(expected, abs=1e-8)
+        if action != 0:
+            assert expected < 0
+    cache.risk_free_rate_daily[:] = 0.001
+    before = single.portfolio_state.get_total_value()
+    single.step(np.zeros(1, dtype=np.float32), asset='SPY')
+    assert single.episode_buffer.saa_returns[single.current_step] > 0
+    assert single.episode_buffer.saa_returns[single.current_step] == pytest.approx(
+        single.portfolio_state.get_total_value() / before - 1, abs=1e-8
+    )
+
+
+def test_hold_price_gain_does_not_create_execution_gap(configs, cache, monkeypatch):
+    _, saa = configs
+    saa['environment'].update(execution_min_days_between_trades=0, commission_bps=0, half_spread_bps=0, impact_coeff=0)
+    cache.close_prices[:] = 100
+    cache.close_prices[2:] = 120
+    cache.risk_free_rate_daily[:] = 0
+    single = TradingEnv(saa, _standalone_cache(cache, saa), 'validation')
+    original = single.calculate_saa_step_reward
+    parts = []
+
+    def capture(*args, **kwargs):
+        result = original(*args, **kwargs)
+        parts.append(result[1])
+        return result
+
+    monkeypatch.setattr(single, 'calculate_saa_step_reward', capture)
+    single.reset(seed=42, option=_options(), asset='SPY')
+    single.step(np.array([0.3], dtype=np.float32), asset='SPY')
+    single.step(np.zeros(1, dtype=np.float32), asset='SPY')
+    assert parts[-1]['execution_gap_penalty'] == 0
+
+
+def test_saa_drawdown_penalty_is_immediate_and_episode_metric_is_correct(configs, cache, monkeypatch):
+    _, saa = configs
+    saa['environment'].update(execution_min_days_between_trades=0, commission_bps=0, half_spread_bps=0, impact_coeff=0)
+    cache.close_prices[:] = 100
+    cache.close_prices[1] = 90
+    cache.close_prices[2:] = 70
+    cache.risk_free_rate_daily[:] = 0
+    single = TradingEnv(saa, _standalone_cache(cache, saa), 'validation')
+    original = single.calculate_saa_step_reward
+    parts = []
+
+    def capture(*args, **kwargs):
+        result = original(*args, **kwargs)
+        parts.append(result[1])
+        return result
+
+    monkeypatch.setattr(single, 'calculate_saa_step_reward', capture)
+    single.reset(seed=42, option=_options(), asset='SPY')
+    single.step(np.ones(1, dtype=np.float32), asset='SPY')
+    assert parts[-1]['max_drawdown'] == pytest.approx(0.1)
+    assert single.episode_buffer.drawdown[1] == pytest.approx(0.1)
+    for _ in range(6):
+        result = single.step(np.zeros(1, dtype=np.float32), asset='SPY')
+    assert result[3]
+    assert result[4]['episode_max_drawdown'] == pytest.approx(0.3)
+
+
+def test_allocator_sortino_has_half_percent_std_floor(configs, cache):
+    paa, _ = configs
+    parent = TradingEnv(paa, cache, 'validation')
+    parent.reset(seed=42, option=_options())
+    parent.step(np.zeros(cache.num_assets, dtype=np.float32))
+    assert parent.episode_buffer.downside_var_sqrt[1] == pytest.approx(0.005)
+
+
+def test_shadow_drawdown_includes_trade_costs_without_mutating_history(configs, cache):
+    paa, saa = configs
+    cache.close_prices[:] = 100
+    cache.risk_free_rate_daily[:] = 0
+    parent = TradingEnv(paa, cache, 'validation')
+    parent.configure_saa_shadow_portfolios(saa)
+    parent.reset(seed=42, option=_options())
+    parent.apply_saa_sub_actions(np.full(cache.num_assets, 0.3, dtype=np.float32))
+    np.testing.assert_array_equal(parent.episode_buffer.shadow_nav[0], paa['environment']['initial_portfolio_value'])
+    parent.step(np.zeros(cache.num_assets, dtype=np.float32))
+    expected = 1 - parent.episode_buffer.shadow_nav[1] / parent.episode_buffer.shadow_nav[0]
+    np.testing.assert_allclose(parent.episode_buffer.shadow_drawdown[1], expected, atol=1e-7)
+    assert np.all(expected > 0)
+
+
+@pytest.mark.parametrize('family', ['hierarchical', 'ar1', 'zero'])
+def test_terminal_wrappers_use_final_features_and_holdings(configs, cache, monkeypatch, family):
+    from agents.PAA_with_autoregressive_rnd_walk_SAA.PAA_with_autoregressive_rnd_walk_SAA import AR1SignalWrapper
+    from agents.PAA_cross_sectional_only.PAA_cross_sectional_only import ZeroSignalWrapper
+    from utils.paa_val_test_inference import DailyRecorder
+
+    paa, saa = configs
+    monkeypatch.setattr(allocator, '_read_saa_training_config', lambda _config: copy.deepcopy(saa))
+    raw = DummyVecEnv([lambda: DailyRecorder(_make_paa_adapter(paa, cache, _options(length=3)))])
+    recorder = raw.envs[0]
+    predictions = []
+    if family == 'hierarchical':
+        model = FixedPolicy(32 + 6 + cache.num_assets, 0.5)
+        original_predict = model.predict
+
+        def predict(observations, **kwargs):
+            predictions.append((observations.copy(), kwargs['episode_start'].copy()))
+            return original_predict(observations, **kwargs)
+
+        monkeypatch.setattr(model, 'predict', predict)
+        wrapper = allocator.SAASignalWrapper(
+            raw, model, None, cache.num_assets, torch.device('cpu'), paa, cache.feature_to_index, 0.3, False
+        )
+    elif family == 'ar1':
+        wrapper = AR1SignalWrapper(raw, cache.num_assets, cache.feature_to_index, 0.9, 0.15, 1., 0.3, 42, saa)
+    else:
+        wrapper = ZeroSignalWrapper(raw, cache.num_assets, cache.feature_to_index)
+    try:
+        recorder.arm()
+        wrapper.reset()
+        for _ in range(2):
+            _, _, done, infos = wrapper.step(np.zeros((1, cache.num_assets), dtype=np.float32))
+        assert done[0] and infos[0]['TimeLimit.truncated']
+        terminal = infos[0]['terminal_observation']
+        block_size = cache.num_assets * (cache.num_features + 2)
+        asset_features = terminal[:block_size].reshape(cache.num_assets, cache.num_features + 2)
+        np.testing.assert_array_equal(asset_features[:, :cache.num_features], cache.features[2])
+        np.testing.assert_array_equal(asset_features[:, -1], infos[0]['terminal_shadow_weights'])
+        assert terminal[block_size:block_size + cache.num_assets + 1].sum() == pytest.approx(1)
+        assert not recorder.completed['sub_committed'][-1]
+        if family == 'hierarchical':
+            np.testing.assert_array_equal(predictions[-2][0], infos[0]['terminal_saa_observations'])
+            assert not predictions[-2][1].any()
+            assert predictions[-1][1].all()
+    finally:
+        wrapper.close()
+
+
+def test_recurrent_ppo_bootstraps_genuine_terminal_observations(configs, cache, monkeypatch):
+    from agents.RecurrPPO_target_position_agent.recurr_ppo_target_pos_agent import SingleAssetEpisodeAdapter
+
+    _, saa = configs
+    adapter = SingleAssetEpisodeAdapter(
+        TradingEnv(saa, _standalone_cache(cache, saa), 'validation'), action_factor_fn=lambda **kwargs: 0.3
+    )
+    original_reset = adapter.reset
+
+    def reset(**kwargs):
+        adapter.set_forced_episode_once('SPY', _options(length=3))
+        return original_reset(**kwargs)
+
+    monkeypatch.setattr(adapter, 'reset', reset)
+    vector = DummyVecEnv([lambda: adapter])
+    torch.set_num_threads(1)
+    model = RecurrentPPO(
+        'MlpLstmPolicy', vector, n_steps=4, batch_size=4, n_epochs=1, seed=42, device='cpu',
+        policy_kwargs={'lstm_hidden_size': 8, 'net_arch': {'pi': [8], 'vf': [8]}},
+    )
+    original_values = model.policy.predict_values
+    observations = []
+
+    def predict_values(observation, *args, **kwargs):
+        observations.append(observation.detach().cpu().numpy().copy())
+        return original_values(observation, *args, **kwargs)
+
+    monkeypatch.setattr(model.policy, 'predict_values', predict_values)
+    try:
+        model.learn(total_timesteps=4)
+        assert len(observations) >= 3
+        for observation in observations:
+            np.testing.assert_array_equal(observation[:, -cache.num_assets:].sum(axis=1), [1.])
+    finally:
+        vector.close()
+
+
+def test_ar1_books_match_standalone_execution_without_loading_policy(configs, cache, monkeypatch):
+    from agents.PAA_with_autoregressive_rnd_walk_SAA.PAA_with_autoregressive_rnd_walk_SAA import AR1SignalWrapper
+    from utils.paa_val_test_inference import DailyRecorder
+
+    paa, saa = configs
+    raw = DummyVecEnv([lambda: DailyRecorder(_make_paa_adapter(paa, cache, _options()))])
+    recorder = raw.envs[0]
+    wrapper = AR1SignalWrapper(raw, cache.num_assets, cache.feature_to_index, 1., 0., 1., 0.3, 42, saa)
+    monkeypatch.setattr(wrapper, '_draw_stationary', lambda shape: np.ones(shape, dtype=np.float32))
+    singles = [TradingEnv(copy.deepcopy(saa), _standalone_cache(cache, saa), 'validation') for _ in cache.asset_names]
+    for single, asset in zip(singles, cache.asset_names):
+        single.reset(seed=42, option=_options(), asset=asset)
+    try:
+        recorder.arm()
+        wrapper.reset()
+        for _ in range(7):
+            for single, asset in zip(singles, cache.asset_names):
+                single.step(np.array([0.3], dtype=np.float32), asset=asset)
+            wrapper.step(np.zeros((1, cache.num_assets), dtype=np.float32))
+        scale = paa['environment']['initial_portfolio_value'] / saa['environment']['initial_portfolio_value']
+        expected_nav = np.column_stack([single.episode_buffer.portfolio_values[:8] for single in singles]) * scale
+        expected_cost = np.column_stack([single.episode_buffer.transaction_costs[1:8] for single in singles]) * scale
+        np.testing.assert_allclose(recorder.completed['sub_value_mtm'], expected_nav, rtol=1e-6, atol=0.02)
+        np.testing.assert_allclose(recorder.completed['sub_tc'][:-1], expected_cost, rtol=1e-6, atol=1e-6)
+        assert np.all(np.isfinite(recorder.completed['sub_weight_post'][:-1]))
+    finally:
+        wrapper.close()
+
+
+@pytest.mark.parametrize('fixed_fee', [0., 10.])
+def test_generic_shadow_buys_reserve_transaction_costs(configs, cache, fixed_fee):
+    paa, _ = configs
+    cache.close_prices[:] = 100
+    parent = TradingEnv(paa, cache, 'validation')
+    parent.reset(seed=42, option=_options())
+    parent.config['environment']['fixed_fee_per_order'] = fixed_fee
+    for _ in range(4):
+        parent.apply_saa_sub_actions(np.ones(cache.num_assets, dtype=np.float32))
+        cash, _, _, _ = parent.episode_buffer.get_saa_sub_state(parent.current_step)
+        assert np.all(cash >= 0)
+        parent.step(np.zeros(cache.num_assets, dtype=np.float32))
+
+
+def test_test_block_is_always_final_252_dates(cache):
+    dates = np.array([str(date) for date in np.arange('2020-01-01', '2021-05-15', dtype='datetime64[D]')])
+    expanded = replace(cache, dates=dates, num_days=len(dates))
+    expanded._create_time_series_blocks(1., 0.2)
+    assert expanded.test_blocks[0].start_date_idx == len(dates) - 252
+    assert expanded.test_blocks[0].num_days == 252
+
+
+@pytest.mark.parametrize('reload_stats', [False, True])
+def test_saa_validation_syncs_normalization_every_sweep(tmp_path, reload_stats):
+    from agents.RecurrPPO_target_position_agent.recurr_ppo_target_pos_agent import EvalCallbackWithMetrics
+
+    space = gym.spaces.Box(-np.inf, np.inf, shape=(3,), dtype=np.float32)
+    factory = lambda: allocator._ObsNormDummyEnv(space)
+    train = VecNormalize(DummyVecEnv([factory]))
+    if reload_stats:
+        path = tmp_path / 'normalization.pkl'
+        train.save(str(path))
+        evaluation = VecNormalize.load(str(path), DummyVecEnv([factory]))
+        evaluation.training = False
+        evaluation.norm_reward = False
+    else:
+        evaluation = VecNormalize(DummyVecEnv([factory]), training=False, norm_reward=False)
+    callback = EvalCallbackWithMetrics(evaluation, None, None, 1, 1, True, False)
+    callback._run_deterministic_validation_grid = lambda step_callback: ([0.], [7], 1)
+    model = SimpleNamespace(
+        logger=SimpleNamespace(record=lambda *args, **kwargs: None), get_env=lambda: train, num_timesteps=1
+    )
+    callback.init_callback(model)
+    callback.n_calls = 1
+    try:
+        for mean in [4., 8.]:
+            train.obs_rms.mean[:] = mean
+            train.obs_rms.var[:] = mean / 2
+            callback._on_step()
+            np.testing.assert_array_equal(evaluation.obs_rms.mean, train.obs_rms.mean)
+            np.testing.assert_array_equal(evaluation.obs_rms.var, train.obs_rms.var)
+            assert evaluation.obs_rms is not train.obs_rms
+            assert not evaluation.training and not evaluation.norm_reward
+    finally:
+        train.close()
+        evaluation.close()
+
+
+@pytest.mark.parametrize('family', ['hierarchical', 'ar1', 'zero'])
+def test_allocator_ppo_bootstraps_real_terminal_portfolios(configs, cache, monkeypatch, family):
+    from agents.PAA_with_autoregressive_rnd_walk_SAA.PAA_with_autoregressive_rnd_walk_SAA import AR1SignalWrapper
+    from agents.PAA_cross_sectional_only.PAA_cross_sectional_only import ZeroSignalWrapper
+
+    paa, saa = configs
+    monkeypatch.setattr(allocator, '_read_saa_training_config', lambda _config: copy.deepcopy(saa))
+    raw = DummyVecEnv([partial(_make_paa_adapter, paa, cache, _options(length=3))])
+    if family == 'hierarchical':
+        wrapper = allocator.SAASignalWrapper(
+            raw, FixedPolicy(32 + 6 + cache.num_assets, 0.5), None, cache.num_assets,
+            torch.device('cpu'), paa, cache.feature_to_index, 0.3, False,
+        )
+    elif family == 'ar1':
+        wrapper = AR1SignalWrapper(raw, cache.num_assets, cache.feature_to_index, 0.9, 0.15, 1., 0.3, 42, saa)
+    else:
+        wrapper = ZeroSignalWrapper(raw, cache.num_assets, cache.feature_to_index)
+    policy_kwargs = dict(
+        n_assets=cache.num_assets, d_model=16, n_heads=2, n_layers=1, dim_feedforward=32,
+        transformer_encoder_dropout=0., transformer_activation_fn='gelu', log_std_init=-1.,
+        features_extractor_class=allocator.SAATokenizer,
+        features_extractor_kwargs=dict(
+            num_assets=cache.num_assets, raw_feat_dim=cache.num_features, d_model=16,
+            asset_feature_idx=[cache.feature_to_index[name] for name, enabled in paa['paa_asset_token_features'].items() if enabled],
+            portfolio_time_idx=[cache.feature_to_index[name] for name, enabled in paa['paa_portfolio_token_features'].items() if enabled],
+        ),
+    )
+    torch.set_num_threads(1)
+    model = PPO(
+        allocator.TransformerAllocatorPolicy, wrapper, policy_kwargs=policy_kwargs,
+        n_steps=4, batch_size=4, n_epochs=1, seed=42, device='cpu',
+    )
+    original_values = model.policy.predict_values
+    observations = []
+
+    def predict_values(observation, *args, **kwargs):
+        observations.append(observation.detach().cpu().numpy().copy())
+        return original_values(observation, *args, **kwargs)
+
+    monkeypatch.setattr(model.policy, 'predict_values', predict_values)
+    try:
+        model.learn(total_timesteps=4)
+        assert len(observations) >= 3
+        portfolio_offset = cache.num_assets * (cache.num_features + 2)
+        for observation in observations:
+            np.testing.assert_allclose(
+                observation[:, portfolio_offset:portfolio_offset + cache.num_assets + 1].sum(axis=1), [1.], atol=1e-6
+            )
+        assert all(torch.isfinite(parameter).all() for parameter in model.policy.parameters())
+    finally:
+        wrapper.close()
+
+
+def test_ar1_inference_constructor_uses_execution_configuration(configs, cache, tmp_path, monkeypatch):
+    from utils import paa_val_test_inference as inference
+
+    paa, saa = configs
+    paa['shadow_execution_config_path'] = 'synthetic.json'
+    monkeypatch.setattr(inference, '_load_json', lambda path: copy.deepcopy(saa))
+    dimension = cache.num_assets * (cache.num_features + 2) + cache.num_assets + 1 + 14 + 3 * cache.num_assets
+    space = gym.spaces.Box(-np.inf, np.inf, shape=(dimension,), dtype=np.float32)
+    normalization = VecNormalize(DummyVecEnv([lambda: allocator._ObsNormDummyEnv(space)]))
+    path = tmp_path / 'normalization.pkl'
+    normalization.save(str(path))
+    normalization.close()
+    spec = SimpleNamespace(family=inference.FAMILY_AR1, vecnorm_path=path)
+    vector, recorder, info = inference.build_agent_venv(spec, paa, cache, 'validation')
+    try:
+        assert len(recorder.te._saa_shadow_envs) == cache.num_assets
+        assert recorder.te._saa_shadow_envs[0].initial_portfolio_value == saa['environment']['initial_portfolio_value']
+        assert info['injected_signal'] == 'AR(1) noise'
+        assert not vector.training and not vector.norm_reward
+    finally:
+        vector.close()

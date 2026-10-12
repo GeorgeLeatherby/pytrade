@@ -615,6 +615,7 @@ def build_agent_venv(spec: CheckpointSpec, cfg: Dict[str, Any], cache: MarketDat
             ar1_phi=float(ar1.get("phi", 0.9)), ar1_sigma=float(ar1.get("sigma", 0.15)),
             ar1_clip=float(ar1.get("clip", 1.0)), action_limiting_factor=float(ar1.get("action_limiting_factor", 0.3)),
             seed=ar1_seed,
+            shadow_execution_config=_load_json(REPO_ROOT / cfg['shadow_execution_config_path']),
         )
         wrapper_info.update({"injected_signal": "AR(1) noise", "ar1_seed": ar1_seed, "ar1_params": ar1})
     elif spec.family == FAMILY_XSEC:

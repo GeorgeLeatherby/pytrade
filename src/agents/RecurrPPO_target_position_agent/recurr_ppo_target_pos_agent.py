@@ -56,7 +56,7 @@ from sb3_contrib import RecurrentPPO
 from sb3_contrib.ppo_recurrent import MlpLstmPolicy
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.evaluation import evaluate_policy
-from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv, SubprocVecEnv
+from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv, SubprocVecEnv, sync_envs_normalization
 #from stable_baselines3.common.utils import configure_logger
 
 import gymnasium as gym
@@ -736,6 +736,7 @@ class EvalCallbackWithMetrics(BaseCallback):
 
     def _on_step(self) -> bool:
         if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
+            sync_envs_normalization(self.model.get_env(), self.eval_env)
             def _step_cb(locals_, globals_):
                 if self.eval_step_callback is None:
                     return True

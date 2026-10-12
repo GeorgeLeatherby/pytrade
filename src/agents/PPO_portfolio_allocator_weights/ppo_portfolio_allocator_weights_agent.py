@@ -859,14 +859,30 @@ class SAASignalWrapper(VecEnvWrapper):
         obs, rewards, dones, infos = self.venv.step_wait()
         dones_arr = np.asarray(dones, dtype=bool)  # shape (B,)
 
-        # Terminal observations belong to the finished episode; augment them with the last
-        # known signal only - no LSTM advance, no sub-portfolio commit.
         for i, info in enumerate(infos):
             if info.get("terminal_observation", None) is not None:
+                terminal_signals = self._last_signals[i]
+                if info.get("TimeLimit.truncated", False):
+                    terminal_obs = info['terminal_saa_observations']
+                    if self.saa_vecnormalize is not None:
+                        terminal_obs = self.saa_vecnormalize.normalize_obs(terminal_obs)
+                    start_row = i * self.num_assets
+                    end_row = start_row + self.num_assets
+                    terminal_state = None if self.saa_state is None else tuple(
+                        component[:, start_row:end_row, :].copy() for component in self.saa_state
+                    )
+                    terminal_actions, _ = self.saa_model.predict(
+                        terminal_obs, state=terminal_state,
+                        episode_start=np.zeros(self.num_assets, dtype=bool), deterministic=True,
+                    )
+                    terminal_signals = np.clip(
+                        np.asarray(terminal_actions, dtype=np.float32) * self.action_limiting_factor, -1.0, 1.0
+                    ).reshape(self.num_assets, 1)
+                terminal_weights = np.asarray(info['terminal_shadow_weights'], dtype=np.float32).reshape(self.num_assets, 1)
                 info["terminal_observation"] = self._inject_signals(
                     info["terminal_observation"][None, ...],
-                    self._last_signals[i][None, ...],
-                    self._last_shadow_weights[i][None, ...],
+                    terminal_signals[None, ...],
+                    terminal_weights[None, ...],
                 )[0]
 
         # VecEnv auto-resets, so the obs returned here is already the next episode's first

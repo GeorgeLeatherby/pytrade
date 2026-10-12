@@ -71,7 +71,7 @@ class AR1SignalWrapper(VecEnvWrapper):
 
     def __init__(self, venv: VecEnv, num_assets: int, feature_to_index: Mapping[str, int],
                  ar1_phi: float, ar1_sigma: float, ar1_clip: float,
-                 action_limiting_factor: float, seed: int):
+                 action_limiting_factor: float, seed: int, shadow_execution_config: Mapping[str, Any]):
         super().__init__(venv)
 
         self.num_assets = num_assets
@@ -86,6 +86,7 @@ class AR1SignalWrapper(VecEnvWrapper):
                 "AR1SignalWrapper requires a VecEnv exposing env_method(); place it directly "
                 "around the raw DummyVecEnv/SubprocVecEnv (no VecNormalize in between)."
             )
+        self.venv.env_method('configure_saa_shadow_portfolios', dict(shadow_execution_config), False)
 
         obs_len = int(self.observation_space.shape[0])
         self.raw_feat_dim = int(len(feature_to_index))
@@ -144,21 +145,19 @@ class AR1SignalWrapper(VecEnvWrapper):
         obs, rewards, dones, infos = self.venv.step_wait()
         dones_arr = np.asarray(dones, dtype=bool)
 
-        # Terminal observations belong to the finished episode; augment with the last
-        # known signal only - no AR(1) advance, no sub-portfolio commit.
-        for i, info in enumerate(infos):
-            if info.get("terminal_observation", None) is not None:
-                info["terminal_observation"] = self._inject_signals(
-                    info["terminal_observation"][None, ...],
-                    self._last_signals[i][None, ...],
-                    self._last_shadow_weights[i][None, ...],
-                )[0]
-
         # AR(1) recurrence for continuing rows; fresh stationary draw for envs that just
         # auto-reset (mirrors SAASignalWrapper dropping LSTM state on episode_start).
         eps = self.rng.normal(0.0, self.ar1_sigma, size=(self.n_envs, self.num_assets)).astype(np.float32)
         advanced = np.clip(self.ar1_phi * self.ar_state + eps, -self.ar1_clip, self.ar1_clip)
         fresh = self._draw_stationary((self.n_envs, self.num_assets))
+        for i, info in enumerate(infos):
+            if info.get('terminal_observation', None) is not None:
+                terminal_signals = (advanced[i] * self.action_limiting_factor).reshape(self.num_assets, 1)
+                terminal_weights = np.asarray(info['terminal_shadow_weights'], dtype=np.float32).reshape(self.num_assets, 1)
+                info['terminal_observation'] = self._inject_signals(
+                    info['terminal_observation'][None, ...],
+                    terminal_signals[None, ...], terminal_weights[None, ...],
+                )[0]
         self.ar_state = np.where(dones_arr[:, None], fresh, advanced)
 
         signals, shadow_weights = self._compute_signals(obs)
@@ -174,17 +173,8 @@ class AR1SignalWrapper(VecEnvWrapper):
         B = obs.shape[0]
         N = self.num_assets
 
-        bundles = self.venv.env_method("get_saa_signal_inputs")
-        cash_all = np.stack([b["cash"] for b in bundles], axis=0)      # (B, N)
-        shares_all = np.stack([b["shares"] for b in bundles], axis=0)  # (B, N)
-        prices_all = np.stack([b["prices"] for b in bundles], axis=0)  # (B, N)
-
-        asset_notional = shares_all * prices_all
-        shadow_sub_total = cash_all + asset_notional
-        eps = 1e-12
-        shadow_weight_all = np.where(
-            shadow_sub_total > eps, asset_notional / np.maximum(shadow_sub_total, eps), 0.0
-        ).astype(np.float32)
+        bundles = self.venv.env_method('get_saa_signal_inputs', True)
+        shadow_weight_all = np.stack([bundle['shadow_weights'] for bundle in bundles])
 
         signals = (self.ar_state[:B] * self.action_limiting_factor).reshape(B, N, 1).astype(np.float32)
         shadow_weights = shadow_weight_all.reshape(B, N, 1).astype(np.float32)
@@ -254,16 +244,20 @@ def _build_ar1_wrapped_envs(
     sigma = float(ar1_cfg.get("sigma", 0.15))
     clip_value = float(ar1_cfg.get("clip", 1.0))
     action_limiting_factor = float(ar1_cfg.get("action_limiting_factor", 0.3))
+    with open(config['shadow_execution_config_path'], 'r', encoding='utf-8') as execution_config_file:
+        shadow_execution_config = json.load(execution_config_file)
 
     vec_train_ar1 = AR1SignalWrapper(
         vec_train_raw, num_assets, cache.feature_to_index,
         ar1_phi=phi, ar1_sigma=sigma, ar1_clip=clip_value,
         action_limiting_factor=action_limiting_factor, seed=seed,
+        shadow_execution_config=shadow_execution_config,
     )
     vec_eval_ar1 = AR1SignalWrapper(
         vec_eval_raw, num_assets, cache.feature_to_index,
         ar1_phi=phi, ar1_sigma=sigma, ar1_clip=clip_value,
         action_limiting_factor=action_limiting_factor, seed=seed + 10_000,
+        shadow_execution_config=shadow_execution_config,
     )
     return vec_train_ar1, vec_eval_ar1
 

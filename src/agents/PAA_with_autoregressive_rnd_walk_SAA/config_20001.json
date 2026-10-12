@@ -1,4 +1,5 @@
 {
+    "shadow_execution_config_path": "src/agents/RecurrPPO_target_position_agent/config_01056.json",
     "ar1_ablation": {
         "phi": 0.9,
         "sigma": 0.15,
