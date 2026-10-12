@@ -818,7 +818,10 @@ class SAASignalWrapper(VecEnvWrapper):
         self.saa_model.policy.eval()
 
         self.n_rows = int(venv.num_envs) * self.num_assets
-        self.saa_state = [None] * self.n_rows
+        # Batched recurrent state for all (environment, asset) rows.  The policy receives
+        # one row per independent SAA account; episode_start masks reset individual rows
+        # without sharing recurrent history between assets.
+        self.saa_state: Optional[Tuple[np.ndarray, ...]] = None
         self.episode_start = np.ones(self.n_rows, dtype=bool)
         self._last_signals = np.zeros((venv.num_envs, self.num_assets, 1), dtype=np.float32)
         self._last_shadow_weights = np.zeros((venv.num_envs, self.num_assets, 1), dtype=np.float32)
@@ -846,7 +849,7 @@ class SAASignalWrapper(VecEnvWrapper):
         else:
             obs = res
         # Drop recurrent memory: every (env, asset) row starts a fresh episode.
-        self.saa_state = [None] * self.n_rows
+        self.saa_state = None
         self.episode_start[:] = True
         signals, shadow_weights = self._compute_saa_signals(obs)
         self._commit_saa_actions(signals)
@@ -881,28 +884,24 @@ class SAASignalWrapper(VecEnvWrapper):
         """
         B = obs.shape[0]
         N = self.num_assets
-        bundles = self.venv.env_method("get_saa_signal_inputs")
+        bundles = self.venv.env_method("get_saa_signal_inputs", True)
         batch_obs = np.stack([bundle["observation"] for bundle in bundles]).reshape(B * N, -1)
         if self.saa_vecnormalize is not None:
             batch_obs = self.saa_vecnormalize.normalize_obs(batch_obs)
-        signals = np.empty((B * N, 1), dtype=np.float32)
-        for row in range(B * N):
-            if self.episode_start[row]:
-                self.saa_state[row] = None
-            actions, self.saa_state[row] = self.saa_model.predict(
-                batch_obs[row:row + 1],
-                state=self.saa_state[row],
-                episode_start=self.episode_start[row:row + 1],
-                deterministic=True,
-            )
-            signals[row] = np.clip(
-                np.asarray(actions, dtype=np.float32)[0] * self.action_limiting_factor, -1.0, 1.0
-            )
+        # RecurrentPPO accepts a batched tuple of LSTM states and an episode-start mask.
+        # This preserves independent state for every row while reducing one model call per
+        # asset to one model call per vectorized environment step.
+        actions, self.saa_state = self.saa_model.predict(
+            batch_obs,
+            state=self.saa_state,
+            episode_start=self.episode_start,
+            deterministic=True,
+        )
+        signals = np.clip(
+            np.asarray(actions, dtype=np.float32) * self.action_limiting_factor, -1.0, 1.0
+        )
         signals = signals.reshape(B, N, 1)
-        cash_all = np.stack([bundle["cash"] for bundle in bundles])
-        asset_notional = np.stack([bundle["shares"] * bundle["prices"] for bundle in bundles])
-        shadow_weight_all = asset_notional / (cash_all + asset_notional)
-        shadow_weights = shadow_weight_all.reshape(B, N, 1).astype(np.float32)
+        shadow_weights = np.stack([bundle["shadow_weights"] for bundle in bundles]).reshape(B, N, 1)
         self._last_signals = signals
         self._last_shadow_weights = shadow_weights
         return signals, shadow_weights

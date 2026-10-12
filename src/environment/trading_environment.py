@@ -2804,7 +2804,7 @@ class TradingEnv(gym.Env):
                 if shadow.current_absolute_step != self.current_absolute_step:
                     raise RuntimeError("SAA shadow and allocator dates are not aligned.")
                 observation, _, terminated, _, _ = shadow.step(
-                    np.array([actions_per_asset[asset_index]], dtype=np.float32), asset=asset
+                    actions_per_asset[asset_index:asset_index + 1], asset=asset
                 )
                 if terminated and self.current_step < self.current_episode_length - 2:
                     raise RuntimeError(
@@ -2870,16 +2870,27 @@ class TradingEnv(gym.Env):
             last_action=actions_per_asset.astype(np.float32),
         )
 
-    def get_saa_signal_inputs(self) -> Dict[str, np.ndarray]:
+    def get_saa_signal_inputs(self, compact: bool = False) -> Dict[str, np.ndarray]:
         """
-        Per-asset state the allocator's SAASignalWrapper needs to rebuild SAA training
-        observations. Returned as a bundle so it survives one SubprocVecEnv round trip.
+        Per-asset state used by the allocator's SAA signal wrapper.
+
+        ``compact=True`` returns only the standalone observations and current shadow
+        holding weights required by the wrapper. The full bundle remains available for
+        diagnostics and compatibility.
         """
         if self._saa_shadow_envs:
             if any(shadow.current_absolute_step != self.current_absolute_step for shadow in self._saa_shadow_envs):
                 raise RuntimeError("SAA shadow observations requested before allocator time advancement.")
+            observations = np.stack(self._saa_shadow_observations).copy()
+            if compact:
+                weights = np.asarray([
+                    shadow.portfolio_state.positions[asset_index] * self.portfolio_state.prices[asset_index]
+                    / max(shadow.portfolio_state.get_total_value(), 1e-12)
+                    for asset_index, shadow in enumerate(self._saa_shadow_envs)
+                ], dtype=np.float32)
+                return {"observation": observations, "shadow_weights": weights}
             return {
-                "observation": np.stack(self._saa_shadow_observations).copy(),
+                "observation": observations,
                 "cash": np.array([shadow.portfolio_state.cash for shadow in self._saa_shadow_envs]),
                 "shares": np.array([
                     shadow.portfolio_state.positions[asset_index]

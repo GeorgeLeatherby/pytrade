@@ -187,18 +187,20 @@ def test_recurrent_wrapper_matches_standalone(configs, cache, monkeypatch, multi
     try:
         wrapper.reset()
         for _ in range(10):
-            assert len(received) == len(standalone)
+            assert len(received) == 1
             expected_done = np.zeros(2, dtype=bool)
             for row, single in enumerate(standalone):
                 normalized = norm.normalize_obs(observations[row][None])
-                np.testing.assert_array_equal(received[row], normalized)
+                np.testing.assert_allclose(received[0][row:row + 1], normalized, rtol=1e-6, atol=1e-7)
                 action, states[row] = original_predict(
                     normalized, state=states[row],
                     episode_start=np.array([single.current_step == 0]), deterministic=True,
                 )
                 scaled = np.clip(action[0], -1, 1) * 0.3
                 env_index, asset_index = divmod(row, cache.num_assets)
-                np.testing.assert_array_equal(wrapper._last_signals[env_index, asset_index], scaled)
+                np.testing.assert_allclose(
+                    wrapper._last_signals[env_index, asset_index], scaled, rtol=1e-6, atol=1e-7
+                )
                 observations[row], _, terminated, truncated, _ = single.step(
                     scaled.astype(np.float32), asset=cache.asset_names[asset_index]
                 )
