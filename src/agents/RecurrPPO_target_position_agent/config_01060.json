@@ -111,7 +111,7 @@
         "device": "cuda",
         "verbose": 1,
         "n_epochs": 4,
-        "n_steps": 1008,
+        "n_steps": 504,
         "batch_size": 252,
         "gamma": 0.988,
         "gae_lambda": 0.98,
@@ -149,7 +149,7 @@
 
     "training": {
         "seed": 42,
-        "n_envs": 8,
+        "n_envs": 16,
         "vec_env_start_method": "spawn",
         "total_timesteps": 8000000,
         "train_log_freq": 1,

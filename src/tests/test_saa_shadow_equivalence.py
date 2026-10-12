@@ -713,3 +713,212 @@ def test_ar1_inference_constructor_uses_execution_configuration(configs, cache, 
         assert not vector.training and not vector.norm_reward
     finally:
         vector.close()
+
+
+class CountingRecurrentPolicy:
+    def __init__(self):
+        self.masks = []
+
+    def predict(self, observations, state=None, episode_start=None, deterministic=False):
+        assert deterministic
+        self.masks.append(episode_start.copy())
+        counts = np.zeros(len(observations)) if state is None else state[0].copy()
+        counts[episode_start] = 0
+        actions = (0.15 + counts * 0.01).astype(np.float32)[:, None]
+        return actions, (counts + 1,)
+
+
+def _validation_blocks():
+    return [
+        SimpleNamespace(block_id='val_00', start_date_idx=0, min_start_step=0, end_date_idx=12),
+        SimpleNamespace(block_id='val_01', start_date_idx=20, min_start_step=20, end_date_idx=29),
+    ]
+
+
+def _run_saa_validation(vector, policy):
+    from agents.RecurrPPO_target_position_agent.recurr_ppo_target_pos_agent import EvalCallbackWithMetrics, ValidationMetricsCallback
+
+    callback = EvalCallbackWithMetrics(vector, None, None, 1, 1, True, False)
+    callback.model = policy
+    metrics = ValidationMetricsCallback()
+    final_infos = []
+
+    def collect(locals_, globals_):
+        info = locals_['infos'][0]
+        metrics.collect_info(info)
+        final_infos.append(info)
+
+    result = callback._run_deterministic_validation_grid(collect)
+    assert metrics.eval_episode_count == result[2]
+    return result, final_infos
+
+
+@pytest.mark.parametrize('subprocesses', [False, True])
+def test_parallel_saa_validation_matches_serial_full_block_sweep(configs, cache, subprocesses):
+    from agents.RecurrPPO_target_position_agent.recurr_ppo_target_pos_agent import build_env, _build_validation_vec_env
+
+    _, saa = configs
+    cache.validation_blocks = _validation_blocks()
+    single_cache = _standalone_cache(cache, saa)
+    factory = partial(build_env, single_cache, saa, seed=42, for_eval=True)
+    serial = DummyVecEnv([factory])
+    parallel = _build_validation_vec_env(single_cache, saa, 42, 'spawn') if subprocesses else DummyVecEnv([factory] * 4)
+    try:
+        serial_policy = CountingRecurrentPolicy()
+        parallel_policy = CountingRecurrentPolicy()
+        serial_result, serial_infos = _run_saa_validation(serial, serial_policy)
+        parallel_result, parallel_infos = _run_saa_validation(parallel, parallel_policy)
+        repeated_result, repeated_infos = _run_saa_validation(parallel, parallel_policy)
+        assert parallel.num_envs == 4
+        assert parallel_result[2] == 2 * cache.num_assets
+        assert parallel_result[1] == [11] * cache.num_assets + [8] * cache.num_assets
+        np.testing.assert_allclose(parallel_result[0], serial_result[0], rtol=0, atol=1e-7)
+        assert parallel_result == repeated_result
+        expected_pairs = {(asset, block.block_id) for asset in cache.asset_names for block in cache.validation_blocks}
+        actual_pairs = [(info['validation_asset'], info['block_id']) for info in parallel_infos]
+        assert set(actual_pairs) == expected_pairs
+        assert len(actual_pairs) == len(set(actual_pairs))
+        serial_values = {(info['validation_asset'], info['block_id']): info['portfolio_final_value'] for info in serial_infos}
+        for info in parallel_infos + repeated_infos:
+            assert info['exposure_start'] == 0
+            assert info['portfolio_final_value'] == serial_values[info['validation_asset'], info['block_id']]
+        assert any(mask.any() and not mask.all() for mask in parallel_policy.masks)
+    finally:
+        serial.close()
+        parallel.close()
+
+
+def test_parallel_saa_validation_ignores_idle_workers(configs, cache, monkeypatch):
+    from agents.RecurrPPO_target_position_agent.recurr_ppo_target_pos_agent import build_env, SingleAssetEpisodeAdapter
+
+    _, saa = configs
+    cache.validation_blocks = _validation_blocks()[:1]
+    original_plan = SingleAssetEpisodeAdapter.get_validation_sweep_plan
+    monkeypatch.setattr(SingleAssetEpisodeAdapter, 'get_validation_sweep_plan', lambda self: original_plan(self)[:2])
+    factory = partial(build_env, _standalone_cache(cache, saa), saa, seed=42, for_eval=True)
+    vector = DummyVecEnv([factory] * 4)
+    try:
+        result, infos = _run_saa_validation(vector, CountingRecurrentPolicy())
+        assert result[2] == 2
+        assert len(infos) == 2
+        assert len({info['validation_asset'] for info in infos}) == 2
+    finally:
+        vector.close()
+
+
+def test_validation_metrics_collect_every_worker():
+    from agents.RecurrPPO_target_position_agent.recurr_ppo_target_pos_agent import ValidationMetricsCallback
+
+    callback = ValidationMetricsCallback()
+    callback.locals = {'infos': [
+        {'episode_final': True, 'portfolio_final_value': 10.},
+        {'episode_final': False},
+        {'episode_final': True, 'portfolio_final_value': 20.},
+        {'episode_final': True, 'portfolio_final_value': 30.},
+    ]}
+    assert callback._on_step()
+    assert callback.eval_episode_count == 3
+    assert callback.pv_buffer == [10., 20., 30.]
+
+
+def test_training_keeps_one_random_asset_per_episode(configs, cache):
+    from agents.RecurrPPO_target_position_agent.recurr_ppo_target_pos_agent import build_env
+
+    _, saa = configs
+    adapter = build_env(_standalone_cache(cache, saa), saa, seed=42, for_eval=False)
+    assets = []
+    try:
+        for _ in range(12):
+            adapter.reset(options=_options())
+            asset = adapter._selected_asset
+            assets.append(asset)
+            for _ in range(7):
+                adapter.step(np.array([0.1], dtype=np.float32))
+                assert adapter._selected_asset == asset
+                other_assets = np.arange(cache.num_assets) != cache.asset_to_index[asset]
+                assert np.all(adapter.unwrapped.portfolio_state.positions[other_assets] == 0)
+        assert len(set(assets)) > 1
+    finally:
+        adapter.close()
+
+
+def test_eval_frequency_is_20000_aggregate_steps_with_16_workers(monkeypatch):
+    from agents.RecurrPPO_target_position_agent.recurr_ppo_target_pos_agent import EvalCallbackWithMetrics
+
+    space = gym.spaces.Box(-np.inf, np.inf, shape=(3,), dtype=np.float32)
+    factory = lambda: allocator._ObsNormDummyEnv(space)
+    training = VecNormalize(DummyVecEnv([factory] * 16))
+    evaluation = VecNormalize(DummyVecEnv([factory] * 4), training=False, norm_reward=False)
+    model = SimpleNamespace(
+        num_timesteps=0, get_env=lambda: training,
+        logger=SimpleNamespace(record=lambda *args, **kwargs: None),
+    )
+    callback = EvalCallbackWithMetrics(evaluation, None, None, 1250, 1, True, False)
+    callback.init_callback(model)
+    evaluated_at = []
+
+    def evaluate(step_cb):
+        evaluated_at.append(model.num_timesteps)
+        return [0.], [7], 1
+
+    monkeypatch.setattr(callback, '_run_deterministic_validation_grid', evaluate)
+    try:
+        for vector_step in range(2500):
+            model.num_timesteps += training.num_envs
+            callback.on_step()
+        assert evaluated_at == [20000, 40000]
+    finally:
+        training.close()
+        evaluation.close()
+
+
+def test_real_recurrent_saa_validation_is_repeatable_and_matches_serial(configs, cache):
+    from agents.RecurrPPO_target_position_agent.recurr_ppo_target_pos_agent import build_env, build_policy_kwargs
+
+    _, saa = configs
+    cache.validation_blocks = _validation_blocks()
+    factory = partial(build_env, _standalone_cache(cache, saa), saa, seed=42, for_eval=True)
+    serial = DummyVecEnv([factory])
+    parallel = DummyVecEnv([factory] * 4)
+    small_config = copy.deepcopy(saa)
+    small_config['agent']['policy_kwargs'].update(
+        mlp_hidden_sizes=[16], mlp_dropouts=[0.], features_dim=16,
+        lstm_hidden_size=8, n_lstm_layers=1, net_arch={'pi': [8], 'vf': [8]},
+    )
+    torch.set_num_threads(1)
+    model = RecurrentPPO(
+        'MlpLstmPolicy', serial, n_steps=8, batch_size=8, seed=42, device='cpu',
+        policy_kwargs=build_policy_kwargs(small_config),
+    )
+    with torch.no_grad():
+        model.policy.action_net.bias.fill_(0.5)
+    try:
+        serial_result, serial_infos = _run_saa_validation(serial, model)
+        parallel_result, parallel_infos = _run_saa_validation(parallel, model)
+        repeated_result, repeated_infos = _run_saa_validation(parallel, model)
+        assert parallel_result == repeated_result
+        assert serial_result[1:] == parallel_result[1:]
+        serial_values = {(info['validation_asset'], info['block_id']): info['portfolio_final_value'] for info in serial_infos}
+        for info in parallel_infos:
+            assert info['portfolio_final_value'] == pytest.approx(
+                serial_values[info['validation_asset'], info['block_id']], rel=1e-6, abs=0.01
+            )
+        assert [info['portfolio_final_value'] for info in parallel_infos] == [
+            info['portfolio_final_value'] for info in repeated_infos
+        ]
+    finally:
+        serial.close()
+        parallel.close()
+
+
+@pytest.mark.parametrize('config_id,seed', [('01060', 42), ('01061', 8), ('01062', 12), ('01063', 14)])
+def test_saa_training_configs_preserve_rollout_and_validation_intervals(config_id, seed):
+    path = REPO_ROOT / f'src/agents/RecurrPPO_target_position_agent/config_{config_id}.json'
+    config = json.loads(path.read_text())
+    assert config['training']['n_envs'] == 16
+    assert config['agent']['n_steps'] == 504
+    assert config['agent']['batch_size'] == 252
+    assert config['training']['eval_freq'] == 1250
+    assert config['training']['n_envs'] * config['training']['eval_freq'] == 20000
+    assert config['training']['n_envs'] * config['agent']['n_steps'] == 8064
+    assert config['training']['seed'] == seed
