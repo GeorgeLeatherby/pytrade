@@ -33,7 +33,7 @@ RESULTS_DIR = (
     / "agents"
     / "RecurrPPO_target_position_agent"
     / "saved_models"
-    / "00233_config_01056_26_08_04"
+    / "00314_config_01070_26_10_14"
     / "saa_inference_test_results"
 )
 
