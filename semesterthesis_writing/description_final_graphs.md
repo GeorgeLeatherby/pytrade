@@ -1156,6 +1156,104 @@ temporary increases and noisy raw observations. The green and red runs end
 with the lowest losses, orange has the lowest loss through much of the
 middle, and blue decreases more gradually and finishes slightly higher.
 
+## `validation_excess_return_over_spy_abs_mean.png`
+
+This graph is a **PAA validation graph**, not an additional SAA graph. It
+contains the hierarchical PAA runs 00315, 00316, 00317, and 00318, with
+configuration identifiers 10027, 10028, 10029, and 10030 respectively. The
+legend colours are blue for `config_10027`, orange for `config_10028`, green
+for `config_10029`, and red for `config_10030`. This is consistent with the
+PAA runs described later in this document and should not be confused with
+the SAA runs 00312, 00306, 00308, and 00314 described in the preceding
+TensorBoard section.
+
+The horizontal axis is the training step, extending from zero to about
+18 million steps. The vertical axis is the logged
+`validation/excess_return_over_spy_abs_mean` value. It ranges from
+approximately -13,000 at the bottom to about +9,000 at the top. Positive
+values indicate a positive validation excess-return metric relative to the
+SPY reference on the logged scale; negative values indicate an adverse
+relative result. The scale is a scalar diagnostic rather than a percentage
+axis, so values such as +5,000 should not be read directly as a 5,000%
+return. The validation traces are plotted directly, without the faint raw
+trace and 25-step rolling mean used for the training metrics.
+
+The blue `config_10027` curve is visible from the beginning to approximately
+9.3 million steps. It starts near -1,200, rises gradually toward zero by
+roughly 2 million steps, and crosses into positive territory around
+2.5--3 million steps. It then climbs strongly, reaching about +2,000 near
+3.5 million and a first major high of approximately +3,000--3,500 around
+4 million steps. Between roughly 4 and 6 million steps it remains positive
+but volatile, repeatedly falling and recovering. A particularly sharp
+positive spike appears near 5.3 million steps at around +4,000, followed
+by a decline toward approximately +1,000 around 6.2 million. The curve
+then oscillates between roughly zero and +3,000 through 8 million steps.
+After a final rise near 8.5--9 million, it finishes near +4,000 to +4,300.
+Thus, this run develops a sustained positive validation metric after an
+initial negative phase, although its path contains substantial reversals.
+
+The orange `config_10028` curve starts close to -1,200 and remains near
+-1,000 during the first 2.5--3 million steps. It briefly approaches zero
+and becomes slightly positive around 3.2--3.8 million steps, but this
+improvement is not maintained. The most important deterioration begins
+around 4.1 million steps: the curve falls to approximately -5,000 near
+4.6 million, briefly rebounds to a positive spike near +700 around
+5.4 million, and then drops sharply again. Around 5.8--6.2 million steps
+it reaches approximately -10,000 to -11,000. The trough is near -12,000
+around 7.0--7.5 million steps. It recovers partially afterward, fluctuating
+mostly between about -7,000 and -10,000, but remains strongly negative
+through its final point near 9.3 million steps. This is the weakest curve
+in the graph and shows no sustained transition to positive validation
+performance.
+
+The green `config_10029` curve is the longest-running trace, continuing to
+approximately 18 million steps. It begins near -1,200 and initially
+declines slightly, reaching around -1,500 by 2 million steps. It then
+falls further, with values around -2,500 to -3,500 between approximately
+3.5 and 5.5 million steps. The curve remains highly unstable through the
+middle of training: it repeatedly moves between roughly zero and -3,000,
+with a deeper trough near -4,500 around 9 million steps. The major
+turning point occurs after about 9.5 million steps. The curve rises rapidly,
+crosses zero near 10 million, and accelerates to approximately +4,000 by
+10.8 million and +6,000--7,000 around 11.3--12 million steps.
+
+After this breakthrough, the green curve remains strongly positive but
+continues to fluctuate. It reaches a local high near +7,500 around
+11.5--12 million, falls back toward roughly +5,000 near 12.8 million,
+and then oscillates between about +5,000 and +7,000 through 14 million.
+It rises again to approximately +8,000 around 14.5--15 million steps,
+which is its highest sustained region. From there it gradually declines
+but stays positive, ending near +7,500 at 18 million steps. The important
+interpretive event is the delayed transition from a long negative and
+unstable phase to a sustained high positive phase. This late improvement
+distinguishes config 10029 from the other three curves and is consistent
+with its later training extent.
+
+The red `config_10030` curve begins around -1,200 and rises more quickly
+than the orange curve during the first 3 million steps. It reaches a small
+positive peak of roughly +300 near 2.5--3 million steps, then falls back
+through zero around 3.5 million. From approximately 4 to 5.5 million it
+declines toward -2,000, with several short-lived reversals. It reaches
+values near -2,500 around 5.5--6 million and fluctuates around -1,500 to
+-2,500 through roughly 7 million. A further deterioration occurs between
+7 and 8.5 million steps, where it reaches approximately -4,000. It then
+recovers somewhat but remains negative, ending around -3,000 at about
+9.3 million steps. The red run therefore shows an early positive attempt
+followed by a persistent negative validation result.
+
+The graph’s main comparison is between the eventual positive outcomes of
+the blue and green curves and the negative outcomes of the orange and red
+curves. Config 10027 reaches positive values earlier and ends around
++4,000, whereas config 10029 remains negative for much longer but later
+reaches the highest and most sustained positive level, around +7,500 to
++8,000. Configs 10028 and 10030 experience substantial negative phases and
+finish below zero. The different horizontal extents also matter: the blue,
+orange, and red traces end near 9.3 million steps, while the green trace
+continues to 18 million. Consequently, the graph compares both validation
+behaviour and different observed training durations; the late green
+advantage should be described as a late-training result rather than as a
+directly time-matched advantage at every step.
+
 # Validation and test graphs for the best hierarchical PAA run
 
 The following section describes the PNG figures in
