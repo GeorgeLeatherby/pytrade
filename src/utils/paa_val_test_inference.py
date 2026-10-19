@@ -81,26 +81,22 @@ from agents.PAA_cross_sectional_only.PAA_cross_sectional_only import ZeroSignalW
 # USER SETTINGS - checkpoint lists (paths relative to the repo root)
 # =====================================================================================
 HIERARCHICAL_PAA_CHECKPOINTS: List[str] = [
-    r"src\agents\PPO_portfolio_allocator_weights\saved_models\00283_config_10019_26_10_02\best_model_excess_over_spy_abs.zip",
-    r"src\agents\PPO_portfolio_allocator_weights\saved_models\00284_config_10020_26_10_03\best_model_excess_over_spy_abs.zip",
-    r"src\agents\PPO_portfolio_allocator_weights\saved_models\00285_config_10021_26_10_03\best_model_excess_over_spy_abs.zip",
-    r"src\agents\PPO_portfolio_allocator_weights\saved_models\00286_config_10022_26_10_03\best_model_excess_over_spy_abs.zip",
-    r"src\agents\PPO_portfolio_allocator_weights\saved_models\00287_config_10023_26_10_04\best_model_excess_over_spy_abs.zip",
-    r"src\agents\PPO_portfolio_allocator_weights\saved_models\00288_config_10024_26_10_05\best_model_excess_over_spy_abs.zip",
-    r"src\agents\PPO_portfolio_allocator_weights\saved_models\00289_config_10025_26_10_05\best_model_excess_over_spy_abs.zip",
-    r"src\agents\PPO_portfolio_allocator_weights\saved_models\00290_config_10026_26_10_05\best_model_excess_over_spy_abs.zip",
+    r"src\agents\PPO_portfolio_allocator_weights\saved_models\00315_config_10027_26_10_14\best_model_excess_over_spy_abs.zip",
+    r"src\agents\PPO_portfolio_allocator_weights\saved_models\00316_config_10028_26_10_15\best_model_excess_over_spy_abs.zip",
+    r"src\agents\PPO_portfolio_allocator_weights\saved_models\00317_config_10029_26_10_15\best_model_excess_over_spy_abs.zip",
+    r"src\agents\PPO_portfolio_allocator_weights\saved_models\00318_config_10030_26_10_17\best_model_excess_over_spy_abs.zip",
 ]
 CONTROL_ABLATION_AR1_CHECKPOINTS: List[str] = [
-    r"src\agents\PAA_with_autoregressive_rnd_walk_SAA\saved_models\00291_config_20001_26_10_05\best_model_excess_over_spy_abs.zip",
-    r"src\agents\PAA_with_autoregressive_rnd_walk_SAA\saved_models\00292_config_20002_26_10_06\best_model_excess_over_spy_abs.zip",
-    r"src\agents\PAA_with_autoregressive_rnd_walk_SAA\saved_models\00293_config_20003_26_10_06\best_model_excess_over_spy_abs.zip",
-    r"src\agents\PAA_with_autoregressive_rnd_walk_SAA\saved_models\00294_config_20004_26_10_06\best_model_excess_over_spy_abs.zip",
+    # r"src\agents\PAA_with_autoregressive_rnd_walk_SAA\saved_models\00291_config_20001_26_10_05\best_model_excess_over_spy_abs.zip",
+    # r"src\agents\PAA_with_autoregressive_rnd_walk_SAA\saved_models\00292_config_20002_26_10_06\best_model_excess_over_spy_abs.zip",
+    # r"src\agents\PAA_with_autoregressive_rnd_walk_SAA\saved_models\00293_config_20003_26_10_06\best_model_excess_over_spy_abs.zip",
+    # r"src\agents\PAA_with_autoregressive_rnd_walk_SAA\saved_models\00294_config_20004_26_10_06\best_model_excess_over_spy_abs.zip",
 ]
 CROSS_SECTIONAL_ABLATION_CHECKPOINTS: List[str] = [
-    r"src\agents\PAA_cross_sectional_only\saved_models\00295_config_30001_26_10_07\best_model_excess_over_spy_abs.zip",
-    r"src\agents\PAA_cross_sectional_only\saved_models\00296_config_30002_26_10_07\best_model_excess_over_spy_abs.zip",
-    r"src\agents\PAA_cross_sectional_only\saved_models\00297_config_30003_26_10_07\best_model_excess_over_spy_abs.zip",
-    r"src\agents\PAA_cross_sectional_only\saved_models\00298_config_30004_26_10_07\best_model_excess_over_spy_abs.zip",
+    # r"src\agents\PAA_cross_sectional_only\saved_models\00295_config_30001_26_10_07\best_model_excess_over_spy_abs.zip",
+    # r"src\agents\PAA_cross_sectional_only\saved_models\00296_config_30002_26_10_07\best_model_excess_over_spy_abs.zip",
+    # r"src\agents\PAA_cross_sectional_only\saved_models\00297_config_30003_26_10_07\best_model_excess_over_spy_abs.zip",
+    # r"src\agents\PAA_cross_sectional_only\saved_models\00298_config_30004_26_10_07\best_model_excess_over_spy_abs.zip",
 ]
 
 # Ablation configs carry no saa_config/saa_features; the reference SAA is taken from here.
@@ -165,7 +161,7 @@ def _rel(p: Path) -> str:
 
 
 def _load_json(path: Path) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8-sig") as f:
         return json.load(f)
 
 
@@ -312,17 +308,20 @@ class DailyRecorder(gym.Wrapper):
         te = self.te
         rec = self
         orig_tc = te._calculate_transaction_costs
+        orig_book = te._book_cost_components
         orig_exec = te.execute_portfolio_change
         orig_apply = te.apply_saa_sub_actions
 
         def tc_patched(shares_traded, prices, abs_step, asset_mask=None):
             cost = orig_tc(shares_traded, prices, abs_step, asset_mask)
-            if cost > 0.0:
-                if rec._in_paa_exec:
-                    rec._tc_parts += np.asarray(te._last_cost_breakdown, dtype=np.float64)
-                elif rec._in_saa_apply and asset_mask is not None:
-                    rec._saa_tc[np.flatnonzero(asset_mask)[0]] += cost
+            if cost > 0.0 and rec._in_saa_apply and asset_mask is not None:
+                rec._saa_tc[np.flatnonzero(asset_mask)[0]] += cost
             return cost
+
+        def book_patched(cost):
+            orig_book(cost)
+            if rec._in_paa_exec and cost > 0.0:
+                rec._tc_parts += np.asarray(te._last_cost_breakdown, dtype=np.float64)
 
         def exec_patched(target_weights, portfolio_state):
             rec._tc_parts = np.zeros(4, dtype=np.float64)
@@ -375,6 +374,7 @@ class DailyRecorder(gym.Wrapper):
             ep["sub_committed"][t] = True
 
         te._calculate_transaction_costs = tc_patched
+        te._book_cost_components = book_patched
         te.execute_portfolio_change = exec_patched
         te.apply_saa_sub_actions = apply_patched
 
