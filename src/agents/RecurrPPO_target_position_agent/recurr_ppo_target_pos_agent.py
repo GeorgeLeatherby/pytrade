@@ -383,6 +383,7 @@ class ValidationMetricsCallback(BaseCallback):
         self.last_return_diff_target_mean = None
         self.last_alpha_return_mean = None
         self.last_pv_minus_selected_asset_bh_abs_mean = None
+        self.latest_metrics: Dict[str, float] = {}
 
     def _on_step(self) -> bool:
         """Called during evaluation episodes (by EvalCallback)."""
@@ -481,13 +482,15 @@ class ValidationMetricsCallback(BaseCallback):
         early return left partial data in place, which would then bleed into
         the next eval cycle and bias every subsequent mean.
         """
+        self.latest_metrics = {}
+
         # Only log if we have accumulated the expected number of episodes.
         # Either way, buffers are reset before returning to keep eval cycles
         # independent.
         if self.eval_episode_count < n_eval_episodes:
             self._reset_buffers()
             return
-        
+
         # Compute and log means
         if self.pv_buffer:
             mean_pv = float(np.mean(self.pv_buffer))
@@ -509,6 +512,7 @@ class ValidationMetricsCallback(BaseCallback):
             mean_return_diff_target = float(np.mean(self.saa_return_after_rdn_portf_init_buffer))
             self.model.logger.record(f"{self.tag_prefix}/return_diff_vs_init_target_mean", mean_return_diff_target, exclude=("stdout",))
             self.last_return_diff_target_mean = mean_return_diff_target
+            self.latest_metrics["return_diff_vs_init_target_mean"] = mean_return_diff_target
         
         if self.bench_buffer:
             mean_bench = float(np.mean(self.bench_buffer))
@@ -525,6 +529,7 @@ class ValidationMetricsCallback(BaseCallback):
             self.model.logger.record(f"{self.tag_prefix}/episode_sharpe_mean", mean_sharpe, exclude=("stdout",))
             std_sharpe = float(np.std(self.sharpe_buffer))
             self.model.logger.record(f"{self.tag_prefix}/episode_sharpe_std", std_sharpe, exclude=("stdout",))
+            self.latest_metrics["episode_sharpe_mean"] = mean_sharpe
         
         if self.dd_buffer:
             mean_dd = float(np.mean(self.dd_buffer))
@@ -538,6 +543,7 @@ class ValidationMetricsCallback(BaseCallback):
         if self.cum_reward_buffer:
             mean_cum_reward = float(np.mean(self.cum_reward_buffer))
             self.model.logger.record(f"{self.tag_prefix}/cumulative_reward_mean", mean_cum_reward, exclude=("stdout",))
+            self.latest_metrics["cumulative_reward_mean"] = mean_cum_reward
 
         if self.selected_asset_bh_final_value_buffer:
             mean_selected_asset_bh = float(np.mean(self.selected_asset_bh_final_value_buffer))
@@ -555,6 +561,7 @@ class ValidationMetricsCallback(BaseCallback):
                 exclude=("stdout",),
             )
             self.last_pv_minus_selected_asset_bh_abs_mean = mean_pv_minus_bh_abs
+            self.latest_metrics["pv_minus_selected_asset_bh_abs_mean"] = mean_pv_minus_bh_abs
 
         if self.pv_minus_selected_asset_bh_pct_base_buffer:
             mean_pv_minus_bh_pct = float(np.mean(self.pv_minus_selected_asset_bh_pct_base_buffer))
@@ -652,6 +659,13 @@ class EvalCallbackWithMetrics(BaseCallback):
     Saves best model based on last_return_diff_total_mean (value creation metric)
     rather than raw cumulative reward.
     """
+    _EARLY_STOP_METRICS = (
+        "pv_minus_selected_asset_bh_abs_mean",
+        "cumulative_reward_mean",
+        "episode_sharpe_mean",
+        "return_diff_vs_init_target_mean",
+    )
+
     def __init__(
         self,
         eval_env,
@@ -664,6 +678,9 @@ class EvalCallbackWithMetrics(BaseCallback):
         callback_on_new_best=None,
         callback_after_eval=None,
         eval_step_callback: Optional[BaseCallback] = None,
+        early_stop_patience_steps: int = 0,
+        early_stop_min_delta: float = 0.0,
+        early_stop_min_evals: int = 0,
         warn: bool = True,
         verbose: int = 0,
     ):
@@ -684,6 +701,11 @@ class EvalCallbackWithMetrics(BaseCallback):
         self.best_alpha_return_mean = -np.inf # Track best alpha_return_mean
         self.best_pv_minus_selected_asset_bh_abs_mean = -np.inf
         self.n_eval_calls = 0
+        self.early_stop_patience_steps = max(int(early_stop_patience_steps), 0)
+        self.early_stop_min_delta = max(float(early_stop_min_delta), 0.0)
+        self.early_stop_min_evals = max(int(early_stop_min_evals), 0)
+        self.early_stop_best = {name: -np.inf for name in self._EARLY_STOP_METRICS}
+        self.early_stop_last_improvement = {name: None for name in self._EARLY_STOP_METRICS}
 
     def _init_callback(self) -> None:
         if self.best_model_save_path is not None:
@@ -765,6 +787,9 @@ class EvalCallbackWithMetrics(BaseCallback):
             if self.eval_step_callback is not None:
                 total_eval_episodes = int(n_det_episodes)
                 self.eval_step_callback.flush_metrics(total_eval_episodes)
+
+            if self._should_stop_for_validation_plateau():
+                return False
                 
             # Log standard SB3 eval metrics
             mean_reward, std_reward = np.mean(episode_rewards), np.std(episode_rewards)
@@ -834,6 +859,52 @@ class EvalCallbackWithMetrics(BaseCallback):
 
             if self.callback_after_eval is not None:
                 self.callback_after_eval.on_step()
+        return True
+
+    def _should_stop_for_validation_plateau(self) -> bool:
+        """Stop only when every configured validation metric is stale."""
+        if self.early_stop_patience_steps <= 0:
+            return False
+        if not isinstance(self.eval_step_callback, ValidationMetricsCallback):
+            return False
+        if self.n_eval_calls < self.early_stop_min_evals:
+            return False
+
+        metrics = self.eval_step_callback.latest_metrics
+        if any(name not in metrics or not np.isfinite(metrics[name]) for name in self._EARLY_STOP_METRICS):
+            return False
+
+        current_step = int(self.num_timesteps)
+        for name in self._EARLY_STOP_METRICS:
+            value = float(metrics[name])
+            best = self.early_stop_best[name]
+            if value > best + self.early_stop_min_delta:
+                self.early_stop_best[name] = value
+                self.early_stop_last_improvement[name] = current_step
+
+        if any(step is None for step in self.early_stop_last_improvement.values()):
+            return False
+
+        stale_steps = min(
+            current_step - int(step)
+            for step in self.early_stop_last_improvement.values()
+        )
+        self.model.logger.record("training/early_stop_stale_steps", float(stale_steps))
+        for name, step in self.early_stop_last_improvement.items():
+            self.model.logger.record(
+                f"training/early_stop_last_improvement_{name}",
+                float(step),
+            )
+
+        if stale_steps < self.early_stop_patience_steps:
+            return False
+
+        self.model.logger.record("training/early_stopped", 1.0)
+        self.model.logger.record("training/early_stop_timestep", float(current_step))
+        print(
+            "Early stopping after validation plateau: "
+            f"no monitored metric improved for {stale_steps} timesteps."
+        )
         return True
 
 
@@ -1169,6 +1240,9 @@ def build_eval_callback(eval_env: gym.Env, config: Dict[str, Any], log_dir: str)
     eval_freq = int(train_cfg.get("eval_freq", 10_000))
     n_eval_episodes = int(train_cfg.get("n_eval_episodes", 10))
     deterministic = bool(train_cfg.get("eval_deterministic", False))
+    early_stop_patience_steps = int(train_cfg.get("early_stop_patience_steps", 0))
+    early_stop_min_delta = float(train_cfg.get("early_stop_min_delta", 0.0))
+    early_stop_min_evals = int(train_cfg.get("early_stop_min_evals", 0))
 
     val_metrics_cb = ValidationMetricsCallback(tag_prefix='validation')
 
@@ -1182,7 +1256,10 @@ def build_eval_callback(eval_env: gym.Env, config: Dict[str, Any], log_dir: str)
         render=False,
         callback_on_new_best=None,
         callback_after_eval=None,
-        eval_step_callback=val_metrics_cb
+        eval_step_callback=val_metrics_cb,
+        early_stop_patience_steps=early_stop_patience_steps,
+        early_stop_min_delta=early_stop_min_delta,
+        early_stop_min_evals=early_stop_min_evals,
     )
     return callback
 

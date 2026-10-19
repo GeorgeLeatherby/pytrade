@@ -821,6 +821,45 @@ def test_validation_metrics_collect_every_worker():
     assert callback.pv_buffer == [10., 20., 30.]
 
 
+def test_validation_plateau_stops_only_after_all_metrics_are_stale():
+    from agents.RecurrPPO_target_position_agent.recurr_ppo_target_pos_agent import (
+        EvalCallbackWithMetrics,
+        ValidationMetricsCallback,
+    )
+
+    metrics = ValidationMetricsCallback()
+    callback = EvalCallbackWithMetrics(
+        eval_env=None,
+        best_model_save_path=None,
+        log_path=None,
+        eval_freq=1,
+        n_eval_episodes=1,
+        deterministic=True,
+        render=False,
+        eval_step_callback=metrics,
+        early_stop_patience_steps=2_000_000,
+        early_stop_min_delta=0.0001,
+        early_stop_min_evals=2,
+    )
+    model = SimpleNamespace(
+        num_timesteps=100,
+        logger=SimpleNamespace(record=lambda *args, **kwargs: None),
+    )
+    callback.init_callback(model)
+    callback.n_eval_calls = 2
+    callback.num_timesteps = 100
+    metrics.latest_metrics = {
+        "pv_minus_selected_asset_bh_abs_mean": 1.0,
+        "cumulative_reward_mean": 2.0,
+        "episode_sharpe_mean": 3.0,
+        "return_diff_vs_init_target_mean": 4.0,
+    }
+    assert not callback._should_stop_for_validation_plateau()
+
+    callback.num_timesteps = 2_000_100
+    assert callback._should_stop_for_validation_plateau()
+
+
 def test_training_keeps_one_random_asset_per_episode(configs, cache):
     from agents.RecurrPPO_target_position_agent.recurr_ppo_target_pos_agent import build_env
 
@@ -918,7 +957,7 @@ def test_saa_training_configs_preserve_rollout_and_validation_intervals(config_i
     assert config['training']['n_envs'] == 16
     assert config['agent']['n_steps'] == 504
     assert config['agent']['batch_size'] == 252
-    assert config['training']['eval_freq'] == 1250
-    assert config['training']['n_envs'] * config['training']['eval_freq'] == 20000
+    assert config['training']['eval_freq'] == 2500
+    assert config['training']['n_envs'] * config['training']['eval_freq'] == 40000
     assert config['training']['n_envs'] * config['agent']['n_steps'] == 8064
     assert config['training']['seed'] == seed
