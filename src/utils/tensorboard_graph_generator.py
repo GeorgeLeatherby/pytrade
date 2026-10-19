@@ -20,15 +20,21 @@ from tbparse import SummaryReader
 # ----------------------------------------------------------------------------
 # Configuration - edit these before running the script
 # ----------------------------------------------------------------------------
-AGENT_NAME = "PPO_portfolio_allocator_weights"
+AGENT_NAME = "RecurrPPO_target_position_agent"
 CONFIG_IDENTS = [
-    "00283_config_10019_26_10_02_1",
-    "00284_config_10020_26_10_03_1",
-    "00285_config_10021_26_10_03_1",
-    "00286_config_10022_26_10_03_1"
+    "00312_config_01068_26_10_14_1",
+    "00306_config_01062_26_10_13_1",
+    "00308_config_01064_26_10_13_1",
+    "00314_config_01070_26_10_14_1"
 ]
 METRIC_NAMES = [
-    "validation/excess_return_over_spy_abs_mean"
+    "validation/pv_minus_selected_asset_bh_abs_mean",
+    "train/pv_minus_selected_asset_bh_abs_mean",
+    "train/approx_kl",
+    "train/explained_variance",
+    "train/policy_gradient_loss",
+    "train/value_loss"
+
 ]
 TRAIN_SMOOTHING_WINDOW = 25
 # ----------------------------------------------------------------------------
