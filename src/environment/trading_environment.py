@@ -40,7 +40,8 @@ Function classes:
 """
 
 # Imports
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from copy import deepcopy
 import importlib
 import numpy as np
 import pandas as pd
@@ -307,10 +308,26 @@ class EpisodeBuffer:
         self.saa_sub_cash         = np.zeros((self.episode_buffer_length_days, self.num_assets), dtype=dtype)  # $ cash per asset
         self.saa_sub_shares       = np.zeros((self.episode_buffer_length_days, self.num_assets), dtype=dtype)  # shares held per asset
         self.saa_sub_last_action  = np.zeros((self.episode_buffer_length_days, self.num_assets), dtype=dtype)  # previous SAA scalar action per asset
-        self.saa_sub_daily_return = np.zeros((self.episode_buffer_length_days, self.num_assets), dtype=dtype)  # $-delta matching env.saa_returns formula
+        self.saa_sub_daily_return = np.zeros((self.episode_buffer_length_days, self.num_assets), dtype=dtype)  # percentage net NAV return
         # Per-asset shadow sub-portfolio diagnostics fed to the PAA asset tokens (PORTFOLIO_WEIGHTS mode).
         self.shadow_sortino  = np.zeros((self.episode_buffer_length_days, self.num_assets), dtype=dtype)  # clipped per-asset Sortino ratio
         self.shadow_drawdown = np.zeros((self.episode_buffer_length_days, self.num_assets), dtype=dtype)  # per-asset rolling max drawdown
+        self.shadow_nav = np.zeros((self.episode_buffer_length_days, self.num_assets), dtype=dtype)
+
+    def record_portfolio_snapshot(self, external_step: int, portfolio_value: float, weights: np.ndarray,
+                                  portfolio_positions: np.ndarray, daily_return: float, prices: np.ndarray) -> None:
+        internal_step = external_step + (self.lookback_window if self.maybe_provide_sequence else 0)
+        assert 0 <= internal_step < self.episode_buffer_length_days, "Step out of bounds of EpisodeBuffer"
+        self.portfolio_values[internal_step] = portfolio_value
+        self.portfolio_weights[internal_step] = weights
+        self.portfolio_positions[internal_step] = portfolio_positions
+        self.returns[internal_step] = daily_return
+        self.asset_prices[internal_step] = prices
+        self.current_step = external_step
+
+    def record_shadow_nav(self, external_step: int, values: np.ndarray) -> None:
+        internal_step = external_step + (self.lookback_window if self.maybe_provide_sequence else 0)
+        self.shadow_nav[internal_step] = values
 
     def record_step(self, external_step: int, portfolio_value: float, weights: np.ndarray, portfolio_positions: np.ndarray,
                    daily_return: float, saa_return: float, reward_to_record: float,action: np.ndarray,
@@ -339,10 +356,7 @@ class EpisodeBuffer:
 
         assert 0 <= internal_offset_step < self.episode_buffer_length_days, "Step out of bounds of EpisodeBuffer"
 
-        self.portfolio_values[internal_offset_step] = portfolio_value
-        self.portfolio_weights[internal_offset_step] = weights
-        self.portfolio_positions[internal_offset_step] = portfolio_positions
-        self.returns[internal_offset_step] = daily_return
+        self.record_portfolio_snapshot(external_step, portfolio_value, weights, portfolio_positions, daily_return, prices)
         self.saa_returns[internal_offset_step] = saa_return
         self.rewards[internal_offset_step] = reward_to_record
         self.actions[internal_offset_step] = action
@@ -419,23 +433,14 @@ class EpisodeBuffer:
 
     def shadow_calculate_max_drawdown(self, external_step: int, window: int, current_step_prices: np.ndarray) -> np.ndarray:
         """
-        Per-asset max drawdown of each shadow sub-portfolio (cash + that asset's notional) over
-        the last `window` steps, ending at `external_step` (inclusive). saa_sub_cash/shares for
-        `external_step` must already be written (via set_saa_sub_state_mtm) before calling this;
-        `current_step_prices` substitutes for asset_prices[external_step], which record_step()
-        for this step hasn't run yet at the point this is normally called.
+        Per-asset drawdown over immutable, pre-action NAV snapshots, including the current step.
         """
         internal_end = external_step + self.lookback_window if self.maybe_provide_sequence else external_step
         if internal_end <= 0:
             return np.zeros(self.num_assets, dtype=np.float32)
-        internal_start = max(0, internal_end - window)
-
-        cash_slice = self.saa_sub_cash[internal_start:internal_end + 1]        # [T, N]
-        shares_slice = self.saa_sub_shares[internal_start:internal_end + 1]    # [T, N]
-        prices_slice = self.asset_prices[internal_start:internal_end + 1].copy()  # [T, N]
-        prices_slice[-1] = current_step_prices
-
-        values = cash_slice + shares_slice * prices_slice
+        first_step = self.lookback_window if self.maybe_provide_sequence else 0
+        internal_start = max(first_step, internal_end - window)
+        values = self.shadow_nav[internal_start:internal_end + 1]
         if values.shape[0] < 2:
             return np.zeros(self.num_assets, dtype=np.float32)
 
@@ -448,8 +453,9 @@ class EpisodeBuffer:
     
     def get_returns_window(self, window: int) -> np.ndarray:
         """Get last N returns for risk calculations (no wrap-around, no ring buffer)"""
-        end_idx = self.current_step
-        start_idx = max(0, end_idx - window)
+        first_step = self.lookback_window if self.maybe_provide_sequence else 0
+        end_idx = first_step + self.current_step + 1
+        start_idx = max(first_step + 1, end_idx - window)
         return self.returns[start_idx:end_idx]
     
     def calculate_sharpe_ratio(self, window: int) -> float:
@@ -476,10 +482,11 @@ class EpisodeBuffer:
         Returns 0.0 until a positive portfolio value is observed.
         Completely avoids NaNs/Infs from 0/0 situations in warm-up.
         """
-        end_idx = self.current_step
-        if end_idx <= 0:
+        if self.current_step <= 0:
             return 0.0
-        start_idx = max(0, end_idx - window)
+        first_step = self.lookback_window if self.maybe_provide_sequence else 0
+        end_idx = first_step + self.current_step + 1
+        start_idx = max(first_step, end_idx - window - 1)
         values_window = self.portfolio_values[start_idx:end_idx]
 
         if values_window.size == 0:
@@ -530,11 +537,11 @@ class EpisodeBuffer:
         Returns:
             Maximum drawdown as float in [0, 1]
         """
-        end_idx = self.current_step
-        if end_idx <= 0:
+        if self.current_step <= 0:
             return 0.0
-        
-        start_idx = max(0, end_idx - window)
+        first_step = self.lookback_window if self.maybe_provide_sequence else 0
+        end_idx = first_step + self.current_step + 1
+        start_idx = max(first_step, end_idx - window - 1)
         
         # Reconstruct subportfolio values: cash + selected asset notional
         # portfolio_weights[t, 0] = cash_weight = cash[t] / total_portfolio_value[t]
@@ -1167,9 +1174,11 @@ class MarketDataCache:
         min_cycle_days = int(min_super_block_days + purge_days)
 
         # End-of-range OOS test size: default equals base validation size unless overridden.
-        default_test_days = int(min_viable_val_block)
+        default_test_days = 252
         test_days_cfg = default_test_days
-        test_days = int(max(min_viable_val_block, test_days_cfg))
+        test_days = int(test_days_cfg)
+        if self.episode_length_days > test_days:
+            raise ValueError("Episodes cannot exceed the reserved 252-day test block.")
         holdout_tail_days = int(purge_days + test_days)
 
 
@@ -1648,6 +1657,19 @@ class MarketDataCache:
             return np.zeros((self.num_assets, self.num_features), dtype=np.float32)
         
         return self.features[step_idx]
+
+    def get_spy_log_close_return_at_step(self, step_idx: int) -> float:
+        """Return SPY's one-day log close return without adding a repeated asset feature."""
+        spy_index = self.asset_to_index.get("SPY")
+        if spy_index is None:
+            raise ValueError("SPY is required for the SPY market-context observation feature.")
+        if step_idx <= 0 or step_idx >= self.num_days:
+            return 0.0
+        previous_close = float(self.close_prices[step_idx - 1, spy_index])
+        current_close = float(self.close_prices[step_idx, spy_index])
+        if previous_close <= 0.0 or current_close <= 0.0:
+            raise ValueError(f"Invalid SPY close prices at step {step_idx}: {previous_close}, {current_close}")
+        return float(np.log(current_close / previous_close))
     
     # NEW: Utility functions
     def get_selected_feature_names(self) -> List[str]:
@@ -1875,6 +1897,7 @@ class TradingEnv(gym.Env):
         super(TradingEnv, self).__init__()
         
         # Configuration parameters
+        self._saa_shadow_envs = []
         self.episode_length_days = config["environment"]["episode_length_days"]
         self.max_reward_risk_window = int(min(self.episode_length_days // 2, 63))
         self.lookback_window = config["environment"]["lookback_window"]
@@ -1955,6 +1978,10 @@ class TradingEnv(gym.Env):
         self.include_risk_free_zscore_feature = bool(config["environment"].get("z_score_60_effr", True))
         # Raw EFFR level is opt-in so older checkpoints retain their observation shape.
         self.effr_level_active = bool(config["environment"].get("effr_level_active", False))
+        # Optional scalar market-context input for standalone SAA observations.
+        self.include_spy_log_close_return_feature = bool(
+            config["environment"].get("include_spy_log_close_return_1d", False)
+        )
 
         self.quantity_type = config["environment"].get("quantity_type", "shares")
         self.price_source = config["environment"].get("price_source", "next_open")  # "next_open" | "current_close"
@@ -2078,8 +2105,9 @@ class TradingEnv(gym.Env):
             )
         elif self.execution_mode == EXECUTION_PORTFOLIO_WEIGHTS:
             # ------ Action space: Continuous weights for each asset + cash (sum to 1) ------
+            logit_bound = float(self.config['environment'].get('allocator_action_logit_bound', 5.0))
             self.action_space = spaces.Box(
-                low=-2.0, high=2.0, shape=(num_assets,), dtype=np.float32
+                low=-logit_bound, high=logit_bound, shape=(num_assets,), dtype=np.float32
             )
         else:
             # Simple/Tranche modes: action is a list of instructions; Gym does not have a list space.
@@ -2096,6 +2124,7 @@ class TradingEnv(gym.Env):
                 5
                 + (1 if self.include_risk_free_zscore_feature else 0)
                 + (1 if self.effr_level_active else 0)
+                + (1 if self.include_spy_log_close_return_feature else 0)
             )
 
         else:
@@ -2690,6 +2719,22 @@ class TradingEnv(gym.Env):
             )
             # Snapshot previous sub-portfolio values for next-step return computation
             self._saa_sub_prev_value = np.full(num_assets, self.initial_portfolio_value, dtype=np.float32)
+            self.episode_buffer.record_shadow_nav(0, self._saa_sub_prev_value)
+            if self._saa_shadow_envs:
+                self._saa_shadow_observations = [
+                    shadow.reset(
+                        seed=seed,
+                        option={
+                            "block_id": self.current_block_id,
+                            "episode_start_step": self.current_episode_start_step,
+                            "episode_length_override": self.current_episode_length,
+                            "force_cash_only_start": True,
+                        },
+                        asset=asset,
+                    )[0]
+                    for shadow, asset in zip(self._saa_shadow_envs, self.market_data_cache.asset_names)
+                ]
+                self._saa_shadow_transaction_costs = np.zeros(num_assets, dtype=np.float64)
 
         # Initialize previous portfolio value for return calculation
         self._previous_portfolio_value = actual_initial_value
@@ -2737,6 +2782,37 @@ class TradingEnv(gym.Env):
         
         return self.market_data_cache.close_prices[current_absolute_step].copy()
 
+    def configure_saa_shadow_portfolios(self, saa_training_config: Dict[str, Any], policy_observations: bool = True) -> Tuple[int, ...]:
+        if self.execution_mode != EXECUTION_PORTFOLIO_WEIGHTS:
+            raise ValueError("Standalone SAA shadow accounts require portfolio_weights mode.")
+        if saa_training_config["environment"]["maybe_provide_sequence"]:
+            raise ValueError("SAASignalWrapper requires single-step SAA observations.")
+        cache = self.market_data_cache
+        feature_names = (
+            cache._select_features_from_config(cache.available_feature_names, saa_training_config)
+            if policy_observations else cache.selected_feature_names
+        )
+        feature_indices = [cache.feature_to_index[name] for name in feature_names]
+        saa_cache = replace(
+            cache,
+            features=cache.features[:, :, feature_indices],
+            selected_feature_names=feature_names,
+            feature_to_index={name: index for index, name in enumerate(feature_names)},
+            num_features=len(feature_names),
+            lookback_window=saa_training_config["environment"]["lookback_window"],
+            maybe_provide_sequence=False,
+        )
+        for shadow in self._saa_shadow_envs:
+            shadow.close()
+        self._saa_shadow_envs = [
+            TradingEnv(deepcopy(saa_training_config), saa_cache, mode=self.mode)
+            for _ in cache.asset_names
+        ]
+        self._saa_shadow_reporting_scale = (
+            self.initial_portfolio_value / saa_training_config["environment"]["initial_portfolio_value"]
+        )
+        return self._saa_shadow_envs[0].observation_space.shape
+
     def apply_saa_sub_actions(self, actions_per_asset: np.ndarray) -> None:
         """
         Apply one SAA target_position_change per asset to its hypothetical sub-portfolio.
@@ -2749,6 +2825,35 @@ class TradingEnv(gym.Env):
         if self.execution_mode != EXECUTION_PORTFOLIO_WEIGHTS:
             return
         ebuf = self.episode_buffer
+        if self._saa_shadow_envs:
+            scale = self._saa_shadow_reporting_scale
+            post_cash = np.empty(len(self._saa_shadow_envs), dtype=np.float32)
+            post_shares = np.empty_like(post_cash)
+            for asset_index, (shadow, asset) in enumerate(
+                zip(self._saa_shadow_envs, self.market_data_cache.asset_names)
+            ):
+                if shadow.current_absolute_step != self.current_absolute_step:
+                    raise RuntimeError("SAA shadow and allocator dates are not aligned.")
+                observation, _, terminated, _, _ = shadow.step(
+                    actions_per_asset[asset_index:asset_index + 1], asset=asset
+                )
+                if terminated and self.current_step < self.current_episode_length - 2:
+                    raise RuntimeError(
+                        f"Standalone SAA for {asset} terminated before the allocator episode; "
+                        "continuing its recurrent state would not match standalone evaluation."
+                    )
+                self._saa_shadow_observations[asset_index] = observation
+                cash_after_execution, shares_after_execution, transaction_cost = shadow._saa_post_execution_state
+                post_cash[asset_index] = cash_after_execution * scale
+                post_shares[asset_index] = shares_after_execution * scale
+                self._saa_shadow_transaction_costs[asset_index] = transaction_cost * scale
+            ebuf.set_saa_sub_state_after_action(
+                external_step=self.current_step,
+                cash=post_cash,
+                shares=post_shares,
+                last_action=np.asarray(actions_per_asset, dtype=np.float32),
+            )
+            return
         cash, shares, _, _ = ebuf.get_saa_sub_state(self.current_step)  # current MTM state
         cash   = cash.copy()
         shares = shares.copy()
@@ -2785,6 +2890,26 @@ class TradingEnv(gym.Env):
                 shares_traded=shares_vec, prices=prices,
                 abs_step=self.current_absolute_step, asset_mask=mask,
             )
+            if delta_shares > 0 and delta_shares * px + tc > cash[a]:
+                lower_shares = 0.0
+                upper_shares = delta_shares
+                for iteration in range(40):
+                    candidate_shares = (lower_shares + upper_shares) / 2.0
+                    shares_vec[a] = candidate_shares
+                    candidate_cost = self._calculate_transaction_costs(
+                        shares_traded=shares_vec, prices=prices,
+                        abs_step=self.current_absolute_step, asset_mask=mask,
+                    )
+                    if candidate_shares * px + candidate_cost <= cash[a]:
+                        lower_shares = candidate_shares
+                    else:
+                        upper_shares = candidate_shares
+                delta_shares = lower_shares
+                shares_vec[a] = delta_shares
+                tc = self._calculate_transaction_costs(
+                    shares_traded=shares_vec, prices=prices,
+                    abs_step=self.current_absolute_step, asset_mask=mask,
+                )
 
             shares[a] += delta_shares
             cash[a]   -= (delta_shares * px + tc)
@@ -2795,14 +2920,35 @@ class TradingEnv(gym.Env):
             shares=shares.astype(np.float32),
             last_action=actions_per_asset.astype(np.float32),
         )
-        # Refresh the cached "previous sub-portfolio value" so next step's MTM uses post-trade state
-        self._saa_sub_prev_value = (cash + shares * prices).astype(np.float32)
 
-    def get_saa_signal_inputs(self) -> Dict[str, np.ndarray]:
+    def get_saa_signal_inputs(self, compact: bool = False) -> Dict[str, np.ndarray]:
         """
-        Per-asset state the allocator's SAASignalWrapper needs to rebuild SAA training
-        observations. Returned as a bundle so it survives one SubprocVecEnv round trip.
+        Per-asset state used by the allocator's SAA signal wrapper.
+
+        ``compact=True`` returns only the standalone observations and current shadow
+        holding weights required by the wrapper. The full bundle remains available for
+        diagnostics and compatibility.
         """
+        if self._saa_shadow_envs:
+            if any(shadow.current_absolute_step != self.current_absolute_step for shadow in self._saa_shadow_envs):
+                raise RuntimeError("SAA shadow observations requested before allocator time advancement.")
+            observations = np.stack(self._saa_shadow_observations).copy()
+            if compact:
+                weights = np.asarray([
+                    shadow.portfolio_state.positions[asset_index] * self.portfolio_state.prices[asset_index]
+                    / max(shadow.portfolio_state.get_total_value(), 1e-12)
+                    for asset_index, shadow in enumerate(self._saa_shadow_envs)
+                ], dtype=np.float32)
+                return {"observation": observations, "shadow_weights": weights}
+            return {
+                "observation": observations,
+                "cash": np.array([shadow.portfolio_state.cash for shadow in self._saa_shadow_envs]),
+                "shares": np.array([
+                    shadow.portfolio_state.positions[asset_index]
+                    for asset_index, shadow in enumerate(self._saa_shadow_envs)
+                ]),
+                "prices": self.portfolio_state.prices.copy(),
+            }
         cash, shares, last_action, daily_return = self.episode_buffer.get_saa_sub_state(self.current_step)
         return {
             "cash": np.asarray(cash, dtype=np.float32).copy(),
@@ -2942,6 +3088,11 @@ class TradingEnv(gym.Env):
                 asset_index=selected_asset_index,
                 target_position_change=target_position_change,
                 portfolio_state=self.portfolio_state
+            )
+            self._saa_post_execution_state = (
+                float(self.portfolio_state.cash),
+                float(self.portfolio_state.positions[selected_asset_index]),
+                float(execution_result.transaction_cost),
             )
 
         # ----- Portfolio mode: action is target weights vector -----
@@ -3118,16 +3269,10 @@ class TradingEnv(gym.Env):
         self.selected_asset_bh_portfolio_state.cash *= cash_multiplier
         
         # --- SAA sub-portfolio MTM update (PORTFOLIO_WEIGHTS mode only) ---
-        # Mirrors live-portfolio treatment: apply cash drag, then price-revalue. Records per-asset
-        # saa_sub_daily_return using the same $-delta formula the SAA saw during training:
-        #     delta_notional + (cash_before - cash_after_drag)   (see env.py L2290-2292 for single-asset path)
         if self.execution_mode == EXECUTION_PORTFOLIO_WEIGHTS:
             ebuf = self.episode_buffer
             # Previous-slot state (from end of previous step, i.e. post-SAA-action)
             prev_cash, prev_shares, prev_last_action, _ = ebuf.get_saa_sub_state(self.current_step - 1)  # note: current_step already advanced
-
-            # Cash before drag (snapshotted at start of this step, stored on env at reset/after last action)
-            cash_before_drag = prev_cash.copy()
 
             # Apply the same dynamic risk-free cash carry used by the live portfolio.
             cash_after_drag = prev_cash * (1.0 + daily_cash_return)
@@ -3135,11 +3280,26 @@ class TradingEnv(gym.Env):
             # Revalue at new prices
             notional_after   = prev_shares * new_prices                                      # [N]
             sub_value_after  = cash_after_drag + notional_after                              # [N]
-            # delta_cash = cash_before - cash_after; delta_notional = after - before_at_NEW_prices
-            # But env's formula compares: after(new_price) vs before(old_price) for notional, and before vs after_drag for cash.
-            delta_cash        = cash_before_drag - cash_after_drag                           # [N] (only drag, no trade yet)
-            delta_notional    = notional_after - (prev_shares * self._saa_sub_prev_prices)  # [N] (price change effect on old shares, ignores trades)
-            saa_sub_ret       = delta_notional + delta_cash                                  # [N]
+            saa_sub_ret = sub_value_after / np.maximum(self._saa_sub_prev_value, 1e-8) - 1.0
+
+            if self._saa_shadow_envs:
+                scale = self._saa_shadow_reporting_scale
+                cash_after_drag = np.array([
+                    shadow.portfolio_state.cash * scale for shadow in self._saa_shadow_envs
+                ], dtype=np.float32)
+                prev_shares = np.array([
+                    shadow.portfolio_state.positions[asset_index] * scale
+                    for asset_index, shadow in enumerate(self._saa_shadow_envs)
+                ], dtype=np.float32)
+                sub_value_after = np.array([
+                    shadow.portfolio_state.get_total_value() * scale for shadow in self._saa_shadow_envs
+                ])
+                saa_sub_ret = np.array([
+                    shadow.episode_buffer.saa_returns[shadow.current_step + (
+                        shadow.lookback_window if shadow.maybe_provide_sequence else 0
+                    )]
+                    for shadow in self._saa_shadow_envs
+                ], dtype=np.float32)
 
             ebuf.set_saa_sub_state_mtm(
                 external_step = self.current_step,
@@ -3148,14 +3308,12 @@ class TradingEnv(gym.Env):
                 last_action   = prev_last_action.astype(np.float32),
                 daily_return  = saa_sub_ret.astype(np.float32),
             )
-            # Cache for the NEXT step's "before_notional" read (avoids indexing into buffer again)
-            self._saa_sub_prev_value = (cash_after_drag + notional_after).astype(np.float32)
 
             # --- Per-asset shadow-portfolio Sortino + drawdown (feeds PAA asset tokens) ---
-            # Same EMA/floor/clip setup as the SAA reward's own Sortino (calculate_saa_step_reward),
-            # just vectorized across assets and applied to each shadow sub-portfolio's own return.
-            prev_sub_value = cash_before_drag + prev_shares * self._saa_sub_prev_prices  # [N] value before this step
-            shadow_step_return = saa_sub_ret / np.maximum(prev_sub_value, 1e-8)          # [N] pct return, not $-delta
+            prev_sub_value = self._saa_sub_prev_value
+            shadow_step_return = sub_value_after / np.maximum(prev_sub_value, 1e-8) - 1.0
+            self._saa_sub_prev_value = sub_value_after.astype(np.float32)
+            ebuf.record_shadow_nav(self.current_step, sub_value_after)
 
             shadow_delta = shadow_step_return - self.shadow_running_mean_ema
             self.shadow_running_mean_ema = self.shadow_running_mean_ema + self.sortino_eta * shadow_delta
@@ -3187,8 +3345,13 @@ class TradingEnv(gym.Env):
         benchmark_portfolio_value_after = self.benchmark_portfolio_state.get_total_value()
         comparison_portfolio_value_after = self.comparison_portfolio_state.get_total_value()
         spy_bh_value_after = self.selected_asset_bh_portfolio_state.get_total_value()
+        daily_return = portfolio_value_after / portfolio_value_before - 1.0
+        self.episode_buffer.record_portfolio_snapshot(
+            self.current_step, portfolio_value_after, self.portfolio_state.get_weights(),
+            self.portfolio_state.positions, daily_return, new_prices,
+        )
 
-        # SAA return: change in cash + target asset return 
+        # SAA feedback uses the account's net percentage NAV return.
         "NOTE: only meaningful in single-asset mode"
         selected_asset_notional_after = 0.0
         delta_selected_asset_notional = 0.0
@@ -3201,8 +3364,8 @@ class TradingEnv(gym.Env):
                 * self.portfolio_state.prices[selected_asset_index]
             )
             delta_selected_asset_notional = selected_asset_notional_after - selected_asset_notional_before
-            delta_cash = live_portfolio_cash_before - self.portfolio_state.cash
-            saa_return = delta_selected_asset_notional + delta_cash
+            delta_cash = self.portfolio_state.cash - live_portfolio_cash_before
+            saa_return = daily_return
 
 
         # Allocate rewards based on mode. Init all with None to check proper implementation
@@ -3305,7 +3468,7 @@ class TradingEnv(gym.Env):
             transaction_cost=float(execution_result.transaction_cost),
             prices=new_prices.copy(),
             sharpe_ratio=reward_parts.get("sharpe_ratio", 0.0),
-            drawdown=reward_parts.get("max_drawdown_delta", 0.0),
+            drawdown=reward_parts.get("max_drawdown", saa_reward_parts.get("max_drawdown", 0.0)),
             volatility=step_volatility,
             turnover=reward_parts.get("turnover", 0.0),
             alpha=reward_parts.get("raw_alpha", 0.0),
@@ -3371,7 +3534,16 @@ class TradingEnv(gym.Env):
 
         # ------------------ Prepare next observation if not terminated ------------------------
         if terminated or truncated:
-            next_observation = np.zeros(self.observation_space.shape, dtype=np.float32)
+            next_observation = self.get_observation_sequence() if self.maybe_provide_sequence else self.get_observation_single_step()
+            if self.execution_mode == EXECUTION_PORTFOLIO_WEIGHTS:
+                if self._saa_shadow_envs:
+                    terminal_inputs = self.get_saa_signal_inputs(compact=True)
+                    info['terminal_saa_observations'] = terminal_inputs['observation']
+                    info['terminal_shadow_weights'] = terminal_inputs['shadow_weights']
+                else:
+                    terminal_cash, terminal_shares, _, _ = self.episode_buffer.get_saa_sub_state(self.current_step)
+                    terminal_notional = terminal_shares * self.portfolio_state.prices
+                    info['terminal_shadow_weights'] = terminal_notional / (terminal_cash + terminal_notional)
             # Internal index range for actual episode steps (exclude warmup)
             if self.maybe_provide_sequence:
                 internal_start = self.lookback_window
@@ -3388,11 +3560,10 @@ class TradingEnv(gym.Env):
             else:
                 cumulative_reward = 0.0
 
-            # Episode max drawdown (already stored per step)
             if internal_end >= internal_start:
-                episode_max_dd = float(
-                    np.max(self.episode_buffer.drawdown[internal_start:internal_end + 1])
-                )
+                episode_values = self.episode_buffer.portfolio_values[internal_start:internal_end + 1]
+                episode_peaks = np.maximum.accumulate(np.concatenate([[self.initial_portfolio_value], episode_values]))[1:]
+                episode_max_dd = float(np.max(1.0 - episode_values / episode_peaks))
             else:
                 episode_max_dd = 0.0
 
@@ -3726,8 +3897,8 @@ class TradingEnv(gym.Env):
 
         downside_sq = (min(portfolio_return_absolut, 0.0))**2
         self.running_downside_variance_ema += self.sortino_eta * (downside_sq - self.running_downside_variance_ema)
-        downside_var_floor = 0.005
-        downside_var = max(self.running_downside_variance_ema, downside_var_floor)
+        downside_std_floor = 0.005
+        downside_var = max(self.running_downside_variance_ema, downside_std_floor ** 2)
         current_sortino = self.running_mean_ema / np.sqrt(downside_var)
 
         # Delay the differential-Sortino reward contribution until the EMAs have warmed up,
@@ -3870,6 +4041,7 @@ class TradingEnv(gym.Env):
             "sharpe_ratio": sharpe_ratio,
             "volatility": volatility,
             "turnover": turnover,
+            "max_drawdown": max_drawdown,
             "max_drawdown_delta": max_drawdown_delta,
             "previous_sortino": self.previous_sortino,
             "current_sortino": current_sortino,
@@ -4052,15 +4224,16 @@ class TradingEnv(gym.Env):
         # Execution gap penalty: asymmetric with a dynamic deadband so we do not
         # penalize gaps caused by non-executed tiny trades (<~$50 + buffer).
         total_value_before = float(selected_asset_notional_before + saa_cash_before)
-        action_executed = float(delta_selected_asset_notional / max(total_value_before, eps))
+        executed_notional = float(
+            execution_result.trades_executed[selected_asset_index]
+            * execution_result.executed_prices[selected_asset_index]
+        )
+        action_executed = executed_notional / max(total_value_before, eps)
 
         min_trade_usd = float(self.config['environment'].get('execution_min_trade_value_threshold', 50.0))
         min_trade_usd = max(min_trade_usd, float(self.saa_min_trade_value_floor))
         small_trade_buffer_usd = float(self.config['environment'].get('saa_execution_gap_buffer_usd', 10.0))
-        action_limiter = float(self.action_limiting_factor_start) if self.action_limiting_factor_start is not None else 1.0
-        action_limiter = float(np.clip(action_limiter, 1e-6, 1.0))
-
-        no_penalty_gap = ((min_trade_usd + small_trade_buffer_usd) / max(total_value_before, eps)) / action_limiter
+        no_penalty_gap = (min_trade_usd + small_trade_buffer_usd) / max(total_value_before, eps)
         signed_gap = float(action - action_executed)
         excess_gap = max(0.0, abs(signed_gap) - no_penalty_gap)
 
@@ -5053,8 +5226,8 @@ class TradingEnv(gym.Env):
             asset_notional = asset_weight * self.episode_buffer.portfolio_values[internal_step]
             initial_portfolio_value = self.initial_portfolio_value
 
-            cash_log_value = np.log(cash_notional / initial_portfolio_value) if cash_notional > 0 else 0.0
-            asset_log_value = np.log(asset_notional / initial_portfolio_value) if asset_notional > 0 else 0.0
+            cash_log_value = np.log1p(cash_notional / initial_portfolio_value)
+            asset_log_value = np.log1p(asset_notional / initial_portfolio_value)
 
 
             # Daily return of the full portfolio for this step
@@ -5090,6 +5263,10 @@ class TradingEnv(gym.Env):
                     self.market_data_cache.get_risk_free_rate_pa_at_step(self.current_absolute_step)
                 ) / 0.1
                 portfolio_feature_list.append(effr_level_scaled)
+            if self.include_spy_log_close_return_feature:
+                portfolio_feature_list.append(
+                    self.market_data_cache.get_spy_log_close_return_at_step(self.current_absolute_step)
+                )
 
             portfolio_features = np.array(portfolio_feature_list, dtype=np.float32)
 

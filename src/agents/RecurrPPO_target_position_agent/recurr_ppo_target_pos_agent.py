@@ -44,6 +44,7 @@ Envs differential Sortino reward is stepwise and benefits from longer n_steps to
 import os
 import time
 import numpy as np
+from collections import deque
 from typing import Callable, Dict, Any, Optional, List, Tuple
 from datetime import datetime
 
@@ -55,8 +56,7 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from sb3_contrib import RecurrentPPO
 from sb3_contrib.ppo_recurrent import MlpLstmPolicy
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.evaluation import evaluate_policy
-from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv, SubprocVecEnv
+from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv, SubprocVecEnv, sync_envs_normalization
 #from stable_baselines3.common.utils import configure_logger
 
 import gymnasium as gym
@@ -383,10 +383,15 @@ class ValidationMetricsCallback(BaseCallback):
         self.last_return_diff_target_mean = None
         self.last_alpha_return_mean = None
         self.last_pv_minus_selected_asset_bh_abs_mean = None
+        self.latest_metrics: Dict[str, float] = {}
 
     def _on_step(self) -> bool:
         """Called during evaluation episodes (by EvalCallback)."""
-        info = self.locals.get("infos", [{}])[0]
+        for info in self.locals.get("infos", []):
+            self.collect_info(info)
+        return True
+
+    def collect_info(self, info: Dict[str, Any]) -> None:
         if info.get("episode_final", False):
             self.eval_episode_count += 1
             
@@ -465,8 +470,6 @@ class ValidationMetricsCallback(BaseCallback):
                 if metric_value is not None and (np.isnan(metric_value) or np.isinf(metric_value)):
                     raise ValueError(f"Invalid metric value detected in evaluation episode {self.eval_episode_count}: {metric_name}={metric_value}")
                 
-        return True
-    
     def flush_metrics(self, n_eval_episodes: int) -> None:
         """
         Called after all eval episodes complete to log aggregated metrics.
@@ -479,13 +482,15 @@ class ValidationMetricsCallback(BaseCallback):
         early return left partial data in place, which would then bleed into
         the next eval cycle and bias every subsequent mean.
         """
+        self.latest_metrics = {}
+
         # Only log if we have accumulated the expected number of episodes.
         # Either way, buffers are reset before returning to keep eval cycles
         # independent.
         if self.eval_episode_count < n_eval_episodes:
             self._reset_buffers()
             return
-        
+
         # Compute and log means
         if self.pv_buffer:
             mean_pv = float(np.mean(self.pv_buffer))
@@ -507,6 +512,7 @@ class ValidationMetricsCallback(BaseCallback):
             mean_return_diff_target = float(np.mean(self.saa_return_after_rdn_portf_init_buffer))
             self.model.logger.record(f"{self.tag_prefix}/return_diff_vs_init_target_mean", mean_return_diff_target, exclude=("stdout",))
             self.last_return_diff_target_mean = mean_return_diff_target
+            self.latest_metrics["return_diff_vs_init_target_mean"] = mean_return_diff_target
         
         if self.bench_buffer:
             mean_bench = float(np.mean(self.bench_buffer))
@@ -523,6 +529,7 @@ class ValidationMetricsCallback(BaseCallback):
             self.model.logger.record(f"{self.tag_prefix}/episode_sharpe_mean", mean_sharpe, exclude=("stdout",))
             std_sharpe = float(np.std(self.sharpe_buffer))
             self.model.logger.record(f"{self.tag_prefix}/episode_sharpe_std", std_sharpe, exclude=("stdout",))
+            self.latest_metrics["episode_sharpe_mean"] = mean_sharpe
         
         if self.dd_buffer:
             mean_dd = float(np.mean(self.dd_buffer))
@@ -536,6 +543,7 @@ class ValidationMetricsCallback(BaseCallback):
         if self.cum_reward_buffer:
             mean_cum_reward = float(np.mean(self.cum_reward_buffer))
             self.model.logger.record(f"{self.tag_prefix}/cumulative_reward_mean", mean_cum_reward, exclude=("stdout",))
+            self.latest_metrics["cumulative_reward_mean"] = mean_cum_reward
 
         if self.selected_asset_bh_final_value_buffer:
             mean_selected_asset_bh = float(np.mean(self.selected_asset_bh_final_value_buffer))
@@ -553,6 +561,7 @@ class ValidationMetricsCallback(BaseCallback):
                 exclude=("stdout",),
             )
             self.last_pv_minus_selected_asset_bh_abs_mean = mean_pv_minus_bh_abs
+            self.latest_metrics["pv_minus_selected_asset_bh_abs_mean"] = mean_pv_minus_bh_abs
 
         if self.pv_minus_selected_asset_bh_pct_base_buffer:
             mean_pv_minus_bh_pct = float(np.mean(self.pv_minus_selected_asset_bh_pct_base_buffer))
@@ -650,6 +659,13 @@ class EvalCallbackWithMetrics(BaseCallback):
     Saves best model based on last_return_diff_total_mean (value creation metric)
     rather than raw cumulative reward.
     """
+    _EARLY_STOP_METRICS = (
+        "pv_minus_selected_asset_bh_abs_mean",
+        "cumulative_reward_mean",
+        "episode_sharpe_mean",
+        "return_diff_vs_init_target_mean",
+    )
+
     def __init__(
         self,
         eval_env,
@@ -662,6 +678,9 @@ class EvalCallbackWithMetrics(BaseCallback):
         callback_on_new_best=None,
         callback_after_eval=None,
         eval_step_callback: Optional[BaseCallback] = None,
+        early_stop_patience_steps: int = 0,
+        early_stop_min_delta: float = 0.0,
+        early_stop_min_evals: int = 0,
         warn: bool = True,
         verbose: int = 0,
     ):
@@ -682,6 +701,11 @@ class EvalCallbackWithMetrics(BaseCallback):
         self.best_alpha_return_mean = -np.inf # Track best alpha_return_mean
         self.best_pv_minus_selected_asset_bh_abs_mean = -np.inf
         self.n_eval_calls = 0
+        self.early_stop_patience_steps = max(int(early_stop_patience_steps), 0)
+        self.early_stop_min_delta = max(float(early_stop_min_delta), 0.0)
+        self.early_stop_min_evals = max(int(early_stop_min_evals), 0)
+        self.early_stop_best = {name: -np.inf for name in self._EARLY_STOP_METRICS}
+        self.early_stop_last_improvement = {name: None for name in self._EARLY_STOP_METRICS}
 
     def _init_callback(self) -> None:
         if self.best_model_save_path is not None:
@@ -691,51 +715,58 @@ class EvalCallbackWithMetrics(BaseCallback):
 
     def _run_deterministic_validation_grid(self, step_cb) -> Tuple[List[float], List[int], int]:
         """
-        Run one deterministic validation episode for every (asset, validation block)
-        pair, always starting from cash-only state. Returns rewards, lengths, count.
+        Run one full-block, cash-only episode per asset/block pair across evaluation workers.
+        Results are returned in plan order; recurrent state resets independently per worker.
         """
-        if not hasattr(self.eval_env, "env_method"):
-            return [], [], 0
-
-        plans_list = self.eval_env.env_method("get_validation_sweep_plan")
-        if not plans_list:
-            return [], [], 0
-
-        plans = plans_list[0] or []
-        if len(plans) == 0:
-            return [], [], 0
-
-        all_rewards: List[float] = []
-        all_lengths: List[int] = []
-
-        for plan in plans:
-            asset = str(plan["asset"])
-            block_id = str(plan["block_id"])
-            episode_start_step = int(plan["episode_start_step"])
-            forced_options = {
-                "block_id": block_id,
-                "episode_start_step": episode_start_step,
-                "force_cash_only_start": True,
-            }
-            self.eval_env.env_method("set_forced_episode_once", asset, forced_options)
-
-            ep_rewards, ep_lengths = evaluate_policy(
-                self.model,
-                self.eval_env,
-                n_eval_episodes=1,
-                deterministic=self.deterministic,
-                render=self.render,
-                return_episode_rewards=True,
-                warn=self.warn,
-                callback=step_cb,
+        plans = self.eval_env.env_method('get_validation_sweep_plan', indices=0)[0]
+        if not plans:
+            raise ValueError('SAA validation requires at least one asset/block pair.')
+        n_envs = self.eval_env.num_envs
+        shards = [list(range(worker, len(plans), n_envs)) for worker in range(n_envs)]
+        for worker, shard in enumerate(shards):
+            self.eval_env.env_method(
+                'set_validation_plan_queue', [plans[index] for index in shard], plans[0], indices=worker,
             )
-            all_rewards.extend([float(r) for r in ep_rewards])
-            all_lengths.extend([int(l) for l in ep_lengths])
-
-        return all_rewards, all_lengths, len(plans)
+        active = np.array([bool(shard) for shard in shards])
+        completed = np.zeros(n_envs, dtype=int)
+        current_rewards = np.zeros(n_envs, dtype=np.float64)
+        current_lengths = np.zeros(n_envs, dtype=int)
+        all_rewards = np.empty(len(plans), dtype=np.float64)
+        all_lengths = np.empty(len(plans), dtype=int)
+        observations = self.eval_env.reset()
+        states = None
+        episode_starts = np.ones(n_envs, dtype=bool)
+        while active.any():
+            actions, states = self.model.predict(
+                observations, state=states, episode_start=episode_starts, deterministic=True,
+            )
+            observations, rewards, dones, infos = self.eval_env.step(actions)
+            current_rewards += np.asarray(rewards, dtype=np.float64) * active
+            current_lengths += active
+            for worker in range(n_envs):
+                if not active[worker] or not dones[worker]:
+                    continue
+                plan_index = shards[worker][completed[worker]]
+                plan = plans[plan_index]
+                info = infos[worker]
+                if not info.get('episode_final', False):
+                    raise RuntimeError('Validation episode ended without final metrics.')
+                if info['validation_asset'] != plan['asset'] or info['block_id'] != plan['block_id']:
+                    raise RuntimeError('Validation worker completed a different asset/block pair.')
+                if step_cb is not None:
+                    step_cb({'infos': [info]}, {})
+                all_rewards[plan_index] = current_rewards[worker]
+                all_lengths[plan_index] = current_lengths[worker]
+                completed[worker] += 1
+                active[worker] = completed[worker] < len(shards[worker])
+                current_rewards[worker] = 0.0
+                current_lengths[worker] = 0
+            episode_starts = np.asarray(dones, dtype=bool)
+        return all_rewards.tolist(), all_lengths.tolist(), len(plans)
 
     def _on_step(self) -> bool:
         if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
+            sync_envs_normalization(self.model.get_env(), self.eval_env)
             def _step_cb(locals_, globals_):
                 if self.eval_step_callback is None:
                     return True
@@ -756,6 +787,9 @@ class EvalCallbackWithMetrics(BaseCallback):
             if self.eval_step_callback is not None:
                 total_eval_episodes = int(n_det_episodes)
                 self.eval_step_callback.flush_metrics(total_eval_episodes)
+
+            if self._should_stop_for_validation_plateau():
+                return False
                 
             # Log standard SB3 eval metrics
             mean_reward, std_reward = np.mean(episode_rewards), np.std(episode_rewards)
@@ -827,6 +861,52 @@ class EvalCallbackWithMetrics(BaseCallback):
                 self.callback_after_eval.on_step()
         return True
 
+    def _should_stop_for_validation_plateau(self) -> bool:
+        """Stop only when every configured validation metric is stale."""
+        if self.early_stop_patience_steps <= 0:
+            return False
+        if not isinstance(self.eval_step_callback, ValidationMetricsCallback):
+            return False
+        if self.n_eval_calls < self.early_stop_min_evals:
+            return False
+
+        metrics = self.eval_step_callback.latest_metrics
+        if any(name not in metrics or not np.isfinite(metrics[name]) for name in self._EARLY_STOP_METRICS):
+            return False
+
+        current_step = int(self.num_timesteps)
+        for name in self._EARLY_STOP_METRICS:
+            value = float(metrics[name])
+            best = self.early_stop_best[name]
+            if value > best + self.early_stop_min_delta:
+                self.early_stop_best[name] = value
+                self.early_stop_last_improvement[name] = current_step
+
+        if any(step is None for step in self.early_stop_last_improvement.values()):
+            return False
+
+        stale_steps = min(
+            current_step - int(step)
+            for step in self.early_stop_last_improvement.values()
+        )
+        self.model.logger.record("training/early_stop_stale_steps", float(stale_steps))
+        for name, step in self.early_stop_last_improvement.items():
+            self.model.logger.record(
+                f"training/early_stop_last_improvement_{name}",
+                float(step),
+            )
+
+        if stale_steps < self.early_stop_patience_steps:
+            return False
+
+        self.model.logger.record("training/early_stopped", 1.0)
+        self.model.logger.record("training/early_stop_timestep", float(current_step))
+        print(
+            "Early stopping after validation plateau: "
+            f"no monitored metric improved for {stale_steps} timesteps."
+        )
+        return True
+
 
 class ProgressSyncCallback(BaseCallback):
     def __init__(self, verbose: int = 0):
@@ -874,6 +954,12 @@ class SingleAssetEpisodeAdapter(gym.Wrapper):
         self._progress_remaining: float = 1.0  # start-of-training default
         self._forced_asset_once: Optional[str] = None
         self._forced_options_once: Optional[Dict[str, Any]] = None
+        self._validation_plans = None
+        self._validation_idle_plan = None
+
+    def set_validation_plan_queue(self, plans: List[Dict[str, Any]], idle_plan: Dict[str, Any]) -> None:
+        self._validation_plans = deque(dict(plan) for plan in plans)
+        self._validation_idle_plan = dict(idle_plan)
 
     def set_forced_episode_once(self, asset: str, options: Optional[Dict[str, Any]] = None) -> None:
         """Force the next reset() to use a specific asset and reset options once."""
@@ -881,7 +967,7 @@ class SingleAssetEpisodeAdapter(gym.Wrapper):
         self._forced_options_once = dict(options) if options is not None else None
 
     def get_validation_sweep_plan(self) -> List[Dict[str, Any]]:
-        """Return one deterministic validation run plan per (asset, validation block)."""
+        """Return one full-block deterministic validation plan per asset/block pair."""
         cache = self.env.market_data_cache
         assets = [str(a) for a in cache.asset_names]
         blocks = sorted(cache.validation_blocks, key=lambda b: b.start_date_idx)
@@ -894,12 +980,22 @@ class SingleAssetEpisodeAdapter(gym.Wrapper):
                         "asset": asset,
                         "block_id": str(block.block_id),
                         "episode_start_step": start_step,
+                        "episode_length_override": int(block.end_date_idx - start_step),
                     }
                 )
         return plans
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
         reset_options = dict(options) if options is not None else {}
+
+        if self._validation_plans is not None:
+            plan = self._validation_plans.popleft() if self._validation_plans else self._validation_idle_plan
+            self.set_forced_episode_once(plan['asset'], {
+                'block_id': plan['block_id'],
+                'episode_start_step': plan['episode_start_step'],
+                'episode_length_override': plan['episode_length_override'],
+                'force_cash_only_start': True,
+            })
 
         # If forced by validation callback, consume that override once.
         if self._forced_asset_once is not None:
@@ -936,6 +1032,8 @@ class SingleAssetEpisodeAdapter(gym.Wrapper):
         
         # Forward call with selected asset
         obs, reward, terminated, truncated, info = self.env.step(scaled_action, asset=self._selected_asset)
+        if self._validation_plans is not None:
+            info['validation_asset'] = self._selected_asset
         return obs, reward, terminated, truncated, info
 
 
@@ -1006,8 +1104,19 @@ def build_env(cache, config: Dict[str, Any], seed: Optional[int] = None, for_eva
 
     # Wrap env in the episode adapter to choose asset and apply action scaling
     wrapped = SingleAssetEpisodeAdapter(env=env, action_factor_fn=alf_fn, seed=seed)
+    if for_eval:
+        wrapped.set_progress_remaining(0.0)
 
     return wrapped
+
+
+def _build_validation_vec_env(cache, config: Dict[str, Any], seed: int, start_method: str):
+    def make_eval(worker: int):
+        def initialize():
+            return build_env(cache, config, seed=seed + worker, for_eval=True)
+        return initialize
+
+    return SubprocVecEnv([make_eval(worker) for worker in range(4)], start_method=start_method)
 
 
 def build_policy_kwargs(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -1131,6 +1240,9 @@ def build_eval_callback(eval_env: gym.Env, config: Dict[str, Any], log_dir: str)
     eval_freq = int(train_cfg.get("eval_freq", 10_000))
     n_eval_episodes = int(train_cfg.get("n_eval_episodes", 10))
     deterministic = bool(train_cfg.get("eval_deterministic", False))
+    early_stop_patience_steps = int(train_cfg.get("early_stop_patience_steps", 0))
+    early_stop_min_delta = float(train_cfg.get("early_stop_min_delta", 0.0))
+    early_stop_min_evals = int(train_cfg.get("early_stop_min_evals", 0))
 
     val_metrics_cb = ValidationMetricsCallback(tag_prefix='validation')
 
@@ -1144,7 +1256,10 @@ def build_eval_callback(eval_env: gym.Env, config: Dict[str, Any], log_dir: str)
         render=False,
         callback_on_new_best=None,
         callback_after_eval=None,
-        eval_step_callback=val_metrics_cb
+        eval_step_callback=val_metrics_cb,
+        early_stop_patience_steps=early_stop_patience_steps,
+        early_stop_min_delta=early_stop_min_delta,
+        early_stop_min_evals=early_stop_min_evals,
     )
     return callback
 
@@ -1247,9 +1362,6 @@ def run(cache, config: Dict[str, Any]) -> Dict[str, Any]:
             return build_env(cache, config, seed=seed + rank, for_eval=False)
         return _init
 
-    def make_eval():
-        return build_env(cache, config, seed=seed + 1, for_eval=True)
-
     train_env_fns = [make_train(i) for i in range(n_envs)]
 
     # Strict behavior: choose vec env implementation explicitly
@@ -1268,9 +1380,8 @@ def run(cache, config: Dict[str, Any]) -> Dict[str, Any]:
         gamma=gamma_cfg,
     )
 
-    # Eval: normalized obs, raw rewards; keep single-env eval
     vec_eval = VecNormalize(
-        DummyVecEnv([make_eval]),
+        _build_validation_vec_env(cache, config, seed + n_envs, vec_env_start_method),
         training=False,
         norm_obs=True,
         norm_reward=False,
@@ -1460,9 +1571,6 @@ def continue_run(cache, config: Dict[str, Any], model_path: str, saved_models_di
             return build_env(cache, config, seed=seed + rank, for_eval=False)
         return _init
 
-    def make_eval():
-        return build_env(cache, config, seed=seed + 1, for_eval=True)
-
     train_env_fns = [make_train(i) for i in range(n_envs)]
 
     # Strict behavior: choose vec env implementation explicitly
@@ -1471,7 +1579,7 @@ def continue_run(cache, config: Dict[str, Any], model_path: str, saved_models_di
     else:
         base_train_vec = SubprocVecEnv(train_env_fns, start_method=vec_env_start_method)
 
-    base_eval_vec = DummyVecEnv([make_eval])
+    base_eval_vec = _build_validation_vec_env(cache, config, seed + n_envs, vec_env_start_method)
 
     # Create VecNormalize wrappers
     vec_train = VecNormalize(
@@ -1505,6 +1613,7 @@ def continue_run(cache, config: Dict[str, Any], model_path: str, saved_models_di
     # Load evaluation VecNormalize stats (same file, but for eval env)
     vec_eval = VecNormalize.load(vecnorm_path, venv=base_eval_vec)
     vec_eval.training = False  # Ensure eval mode
+    vec_eval.norm_reward = False
 
     # Load the pre-trained model
     if not os.path.isfile(model_path):

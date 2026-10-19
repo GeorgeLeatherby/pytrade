@@ -14,6 +14,7 @@ Inputs:
 import pandas as pd
 import numpy as np
 import os
+import json
 from statsmodels.tsa.stattools import adfuller
 from rich.console import Console
 from rich.table import Table
@@ -49,6 +50,7 @@ class DataEnricher:
 
         # Convert 'Date' columns to datetime objects immediately after loading
         self.raw_indices_data['Date'] = pd.to_datetime(self.raw_indices_data['Date'])
+        self.correct_ohlc_bounds()
 
         # Asset configuration
         self.assets = sorted(self.raw_indices_data['Symbol'].dropna().unique().tolist())  # list all symbols to use here
@@ -67,6 +69,24 @@ class DataEnricher:
 
         # start enrichment process
         self.enrich_data()
+
+    def correct_ohlc_bounds(self):
+        """Ensure Open and Close prices are contained by each day's Low/High."""
+        required_columns = {'Open', 'High', 'Low', 'Close'}
+        missing_columns = required_columns.difference(self.raw_indices_data.columns)
+        if missing_columns:
+            raise ValueError(f"Raw data is missing OHLC columns: {sorted(missing_columns)}")
+
+        lower_bound = self.raw_indices_data[['Open', 'Close']].min(axis=1)
+        upper_bound = self.raw_indices_data[['Open', 'Close']].max(axis=1)
+        invalid_low = self.raw_indices_data['Low'] > lower_bound
+        invalid_high = self.raw_indices_data['High'] < upper_bound
+
+        corrections = int(invalid_low.sum() + invalid_high.sum())
+        self.raw_indices_data.loc[invalid_low, 'Low'] = lower_bound[invalid_low]
+        self.raw_indices_data.loc[invalid_high, 'High'] = upper_bound[invalid_high]
+        if corrections:
+            print(f"Corrected {corrections} implausible OHLC bounds before feature calculation.")
 
     def init_data_NaN_inf_check(self, df):
         # Initial NaN and Inf check on raw data
@@ -298,7 +318,13 @@ class DataEnricher:
         self.enriched_data = self.enriched_data.sort_values(by=['Date', 'Symbol'])
 
         output_filepath = os.path.join(self.output_dir, 'enriched_financial_data.csv')
+        final_dates = pd.DatetimeIndex(sorted(self.enriched_data['Date'].unique()))
+        if not final_dates[-252:].equals(self.ffd_test_dates):
+            raise ValueError("Cleaning changed the reserved final 252 trading dates.")
         self.enriched_data.to_csv(output_filepath, index=False)
+        metadata = dict(self.ffd_metadata, feature_columns=list(self.enriched_data.columns))
+        with open(os.path.join(self.output_dir, 'enriched_financial_data_metadata.json'), 'w', encoding='utf-8') as metadata_file:
+            json.dump(metadata, metadata_file, indent=2)
         print(f"\nEnriched data saved to {output_filepath}")
 
 
@@ -464,8 +490,20 @@ class DataEnricher:
         df['market_dispersion'] = df['Date'].map(np.log(dispersion + 1e-8))
         
         # Z-score the dispersion to make it stationary
-        df['z_market_dispersion'] = (df['market_dispersion'] - df['market_dispersion'].rolling(window=self.max_norm_horizon, min_periods=5).mean()) / \
-                                    (df['market_dispersion'].rolling(window=self.max_norm_horizon, min_periods=5).std() + 1e-8)
+        dispersion_dates = df[['Date', 'market_dispersion']].drop_duplicates('Date').sort_values('Date')
+        dispersion_mean = dispersion_dates['market_dispersion'].rolling(
+            window=self.max_norm_horizon, min_periods=5
+        ).mean()
+        dispersion_std = dispersion_dates['market_dispersion'].rolling(
+            window=self.max_norm_horizon, min_periods=5
+        ).std()
+        dispersion_dates['z_market_dispersion'] = (
+            (dispersion_dates['market_dispersion'] - dispersion_mean)
+            / (dispersion_std + 1e-8)
+        )
+        df['z_market_dispersion'] = df['Date'].map(
+            dispersion_dates.set_index('Date')['z_market_dispersion']
+        )
 
         # --- 4. Rolling Beta (FIXED) ---
         def calc_beta(group):
@@ -489,7 +527,7 @@ class DataEnricher:
         # Final Z-score for Beta to normalize across assets
         df['z_beta_spy'] = df.groupby('Symbol')['beta_spy'].transform(
             lambda x: (x - x.rolling(window=self.max_norm_horizon, min_periods=5).mean()) / (x.rolling(window=self.max_norm_horizon, min_periods=5).std() + 1e-8)
-        )
+        ).clip(-3, 3)
 
         # Add the new features to enriched_data at correct symbol and time alignment
         for feature in ['z_fisher_corr_spy', 'z_market_dispersion','z_beta_spy']:
@@ -579,7 +617,11 @@ class DataEnricher:
             df[f'z_vol_of_vol_{period}d'] = df[f'z_vol_of_vol_{period}d'].clip(-4, 4)
 
             # Volatility breakout based on short-term volatility compared to long-term volatility
-            df[f'z_vol_breakout_{period}d'] = (df[f'log_vol_short_{period}d'] - max_horizon_rolling_mean) / (max_horizon_rolling_std + 1e-8)
+            log_vol_ratio = np.log((short_term_rolling_std + 1e-8) / (max_horizon_rolling_std + 1e-8))
+            ratio_group = log_vol_ratio.groupby(df['Symbol'])
+            ratio_mean = ratio_group.transform(lambda values: values.rolling(window=self.max_norm_horizon, min_periods=5).mean())
+            ratio_std = ratio_group.transform(lambda values: values.rolling(window=self.max_norm_horizon, min_periods=5).std())
+            df[f'z_vol_breakout_{period}d'] = (log_vol_ratio - ratio_mean) / (ratio_std + 1e-8)
             # Clip to avoid overwhelming network during Black Swans
             df[f'z_vol_breakout_{period}d'] = df[f'z_vol_breakout_{period}d'].clip(-4, 4)
 
@@ -597,14 +639,15 @@ class DataEnricher:
         # We use a log-ratio of SPY volume to its own moving average
         spy_vol = df[df['Symbol'] == 'SPY'].set_index('Date')['Volume']
         spy_vol_ma = spy_vol.rolling(window=self.max_norm_horizon).mean()
-        spy_vol_intensity = np.log(spy_vol.clip(lower=1e-8) / (spy_vol_ma + 1e-8)).clip(lower=1e-8)
-
         for period in volume_periods:
 
             # A. Log Volume Intensity (Today vs Moving Average)
             # This is much more stable than pct_change for volume
             v_ma = df.groupby('Symbol')['Volume'].transform(lambda x: x.rolling(window=self.max_norm_horizon).mean())
-            df[f'log_volume_intensity_{period}d'] = np.log(df['Volume'].clip(lower=1e-8) / (v_ma + 1e-8))
+            recent_volume = df.groupby('Symbol')['Volume'].transform(lambda values: values.rolling(window=period).mean())
+            df[f'log_volume_intensity_{period}d'] = np.log(recent_volume.clip(lower=1e-8) / (v_ma + 1e-8))
+            spy_recent_volume = spy_vol.rolling(window=period).mean()
+            spy_vol_intensity = np.log(spy_recent_volume.clip(lower=1e-8) / (spy_vol_ma + 1e-8))
 
             # B. Market-Relative Volume Intensity
             # Subtracting the SPY volume intensity from the Asset volume intensity
@@ -625,16 +668,26 @@ class DataEnricher:
         # Features for compact intraday information (Open, High, Low)
         log_intra_vol = np.log(df['High']/(df['Low']))
         closing_strength = (df['Close'] - df['Low']) / (df['High'] - df['Low'])
-        log_overnight_gap = np.log(df['Open'] / df['Close'].shift(1))
+        log_overnight_gap = np.log(
+            df['Open'] / df.groupby('Symbol')['Close'].shift(1)
+        )
         shadow_ratio = (df['High'] - np.max(df[['Open', 'Close']], axis=1)) / (df['High'] - df['Low'])
 
         # Make stationary (z-scoring or MinMax scaling)
-        rolling_mean = log_intra_vol.rolling(window=self.max_norm_horizon).mean()
-        rolling_std = log_intra_vol.rolling(window=self.max_norm_horizon).std()
+        rolling_mean = log_intra_vol.groupby(df['Symbol']).transform(
+            lambda x: x.rolling(window=self.max_norm_horizon).mean()
+        )
+        rolling_std = log_intra_vol.groupby(df['Symbol']).transform(
+            lambda x: x.rolling(window=self.max_norm_horizon).std()
+        )
         z_log_intra_vol = np.tanh((log_intra_vol - rolling_mean) / (rolling_std + 1e-8))
 
-        rolling_mean_og = log_overnight_gap.rolling(window=self.max_norm_horizon).mean()
-        rolling_std_og = log_overnight_gap.rolling(window=self.max_norm_horizon).std()
+        rolling_mean_og = log_overnight_gap.groupby(df['Symbol']).transform(
+            lambda x: x.rolling(window=self.max_norm_horizon).mean()
+        )
+        rolling_std_og = log_overnight_gap.groupby(df['Symbol']).transform(
+            lambda x: x.rolling(window=self.max_norm_horizon).std()
+        )
         z_log_overnight_gap = np.tanh((log_overnight_gap - rolling_mean_og) / (rolling_std_og + 1e-8))
 
         df['z_log_intra_vol'] = z_log_intra_vol
@@ -666,7 +719,6 @@ class DataEnricher:
             w.append(w_k)
             k += 1
                 
-        # Return flipped weights for convolution
         return np.array(w[::-1]).reshape(-1, 1)
 
     def _apply_ffd_to_series(self, series, global_weights):
@@ -679,7 +731,7 @@ class DataEnricher:
             return pd.Series(np.nan, index=series.index)
             
         padded_series = series.values
-        output = np.convolve(padded_series, global_weights.flatten(), mode='valid')
+        output = np.correlate(padded_series, global_weights.flatten(), mode='valid')
         
         # Return as series with aligned index (the first 'width-1' days are dropped)
         return pd.Series(output, index=series.index[width-1:])
@@ -739,13 +791,29 @@ class DataEnricher:
         """Main entry point to calculate and add FFD features to enriched_data."""
         print("Calculating stationary memory features (FFD)...")
         df = self.enriched_data
-            
-        golden_d = self.find_multi_asset_golden_d(df)
+        dates = pd.DatetimeIndex(sorted(df['Date'].unique()))
+        if len(dates) <= 252:
+            raise ValueError("FFD fitting requires history before the final 252 trading dates.")
+        self.ffd_test_dates = dates[-252:]
+        self.ffd_fit_end = dates[-253]
+        fit_data = df[df['Date'] <= self.ffd_fit_end]
+        golden_d = self.find_multi_asset_golden_d(fit_data)
         print(f"Applying Golden d={golden_d:.2f} to all assets.")
 
         # 1. Calculate the weights exactly ONCE globally
         global_weights = self._get_global_ffd_weights(golden_d, threshold=self.FFD_THRESHOLD)
         window_size = len(global_weights)
+        self.ffd_metadata = {
+            'feature_schema_version': 2,
+            'ffd_fit_end': self.ffd_fit_end.strftime('%Y-%m-%d'),
+            'test_start': self.ffd_test_dates[0].strftime('%Y-%m-%d'),
+            'test_end': self.ffd_test_dates[-1].strftime('%Y-%m-%d'),
+            'test_days': 252,
+            'ffd_order': float(golden_d),
+            'ffd_threshold': self.FFD_THRESHOLD,
+            'ffd_window_size': window_size,
+            'ffd_weights_oldest_to_newest': global_weights.flatten().tolist(),
+        }
         print(f"Global FFD window size established at {window_size} days.")
 
         # 2. Apply FFD to each symbol using the FIXED weights
@@ -793,7 +861,8 @@ class DataEnricher:
         passed_count = 0
 
         for symbol in symbols:
-            series = self.enriched_data[self.enriched_data['Symbol'] == symbol][feature_col].dropna()
+            fit_mask = (self.enriched_data['Symbol'] == symbol) & (self.enriched_data['Date'] <= self.ffd_fit_end)
+            series = self.enriched_data.loc[fit_mask, feature_col].dropna()
             
             # We need enough data points for a meaningful ADF test
             if len(series) < 30:
@@ -827,8 +896,8 @@ class DataEnricher:
 
         
 
-# Execution
-data_process_and_enrichment = DataEnricher(
-    input_raw_indices_filepath = r"src\data\processed_multi_index_data.csv",
-    input_raw_fx_filepath = None
-)
+if __name__ == '__main__':
+    data_process_and_enrichment = DataEnricher(
+        input_raw_indices_filepath=r"src\data\processed_multi_index_data.csv",
+        input_raw_fx_filepath=None,
+    )

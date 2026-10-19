@@ -21,8 +21,25 @@ def discover_agents():
     return sorted(agents)
 
 def load_config(path):
-    with open(path, "r") as f:
-        return json.load(f)
+    """Load a JSON object and report configuration-file errors with its path."""
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            config = json.load(f)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Invalid JSON in configuration file {path!r}: {exc.msg} "
+            f"(line {exc.lineno}, column {exc.colno}). "
+            "The file may be empty or still being written."
+        ) from exc
+    except OSError as exc:
+        raise OSError(f"Could not read configuration file {path!r}: {exc}") from exc
+
+    if not isinstance(config, dict):
+        raise ValueError(
+            f"Configuration file {path!r} must contain a JSON object, "
+            f"not {type(config).__name__}."
+        )
+    return config
 
 def load_market_data(csv_path):
     return pd.read_csv(csv_path)
@@ -350,7 +367,12 @@ def main():
         if not agent or not configs:
             print("No selection. Exiting."); return
         for cfg in configs:
-            run_agent(agent, cfg)
+            try:
+                run_agent(agent, cfg)
+            except (OSError, ValueError) as exc:
+                messagebox.showerror("Configuration error", str(exc))
+                print(f"Could not start run for {cfg}: {exc}")
+                continue
     
     def on_continue_training():
         root.destroy()

@@ -107,14 +107,9 @@ class _ObsNormDummyEnv(gym.Env):
 
 def _normalize_obs(obs: np.ndarray, vecnorm: Optional[VecNormalize]) -> np.ndarray:
     """Apply saved VecNormalize obs_rms to a (1, obs_dim) array. Returns float32."""
-    if vecnorm is None or getattr(vecnorm, "obs_rms", None) is None:
+    if vecnorm is None:
         return np.asarray(obs, dtype=np.float32)
-    obs = np.asarray(obs, dtype=np.float32)
-    mean = vecnorm.obs_rms.mean
-    var = vecnorm.obs_rms.var
-    epsilon = float(getattr(vecnorm, "epsilon", getattr(vecnorm, "eps", 1e-8)))
-    clip_obs = float(getattr(vecnorm, "clip_obs", 10.0))
-    return np.clip((obs - mean) / np.sqrt(var + epsilon), -clip_obs, clip_obs).astype(np.float32)
+    return vecnorm.normalize_obs(np.asarray(obs, dtype=np.float32))
 
 
 # ================================
@@ -249,7 +244,7 @@ def _run_asset_episode(
     # TradingEnv.reset() via _initialize_portfolio_with_costs() and updated each step.
 
     lstm_state = None
-    episode_start_flag = np.ones((1, 1), dtype=bool)
+    episode_start_flag = np.ones(1, dtype=bool)
     terminated = truncated = False
     step_info: Dict[str, Any] = {}
 
@@ -264,11 +259,12 @@ def _run_asset_episode(
             )
         episode_start_flag[:] = False
 
-        raw_action = float(np.clip(action_out[0, 0], -1.0, 1.0))
-        scaled_action = raw_action * action_limiting_factor
+        scaled_action = np.clip(
+            np.asarray(action_out[0], dtype=np.float32) * action_limiting_factor, -1.0, 1.0
+        ).astype(np.float32)
 
         obs, _reward, terminated, truncated, step_info = env.step(
-            np.array([scaled_action], dtype=np.float32),
+            scaled_action,
             asset=asset_name,
         )
     # step_info from the terminating step contains episode-level diagnostics (costs etc.).
