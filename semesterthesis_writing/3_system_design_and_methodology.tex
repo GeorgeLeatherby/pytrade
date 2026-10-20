@@ -121,7 +121,7 @@ The impact coefficient \(\lambda_{\text{impact}}\) controls the size-dependent c
 
 The Single-Asset Agent (SAA) learns position changes for one asset at a time, while the Portfolio Allocator Agent (PAA) allocates capital across all eleven plus cash. The SAA is trained first and frozen. The PAA using its signals is called the hierarchical PAA. The hierarchical PAA receives the SAA's per-asset actions alongside market and account information. It can use, discount, or override these signals. This separates temporal representation from cross-sectional allocation without assuming that transfer must improve performance.
 
-At each trading day, the observation \(o_t\) supplies market features and account information. The policy emits an action \(a_t\), interpreted as a position change or allocation request. The simulator executes it, advances to the next date, and returns reward \(R_{t+1}\). Proximal Policy Optimization (PPO) updates network parameters from batches of these trajectories \cite{JohnSchulmanFilipWolskiPrafullaDhariwalAlecRadfordOlegKlimov.2017}. Episodes differ in their historical intervals and initial accounts, but replayed prices do not respond to the SAA's or hierarchical PAA's trades.
+At each trading day, the observation \(o_t\) supplies market features and account information. The policy emits an action \(a_t\), interpreted as a position change or allocation request. The simulator executes it, advances to the next date, and returns reward \(\mathcal R_{t+1}\). Proximal Policy Optimization (PPO) updates network parameters from batches of these trajectories \cite{JohnSchulmanFilipWolskiPrafullaDhariwalAlecRadfordOlegKlimov.2017}. Episodes differ in their historical intervals and initial accounts, but replayed prices do not respond to the SAA's or hierarchical PAA's trades.
 
 Splitting temporal modeling from cross-sectional allocation responds to two structures in the decision problem. The SAA uses a Long Short-Term Memory (LSTM) network to retain information across dates \cite{Hochreiter1997}. Cross-sectional allocation instead compares assets at the same date. Self-attention learns content-dependent weights for these comparisons \cite{vaswani2017}. The hierarchical PAA remains identity-aware and uses ordered portfolio fields and asset-specific output positions (Section~\ref{sec:paa}). PyTrade trains the SAA first and the hierarchical PAA second, so the hierarchical PAA can learn how much to rely on the frozen SAA's information.
 
@@ -347,7 +347,16 @@ The fractional-price feature \(\phi_t\) retains a weighted contribution from his
 A calendar vector \(\mathbf g_t\in\mathbb R^6\) encodes weekday, relative calendar-day position within the month, and month of year. For cycle position \(k_t\) and cycle length \(K\), sine and cosine inputs \(x_t^{\sin}\) and \(x_t^{\cos}\) are
 
 \begin{equation}
-x^{\sin}_t = \sin\!\Big(\tfrac{2\pi\, k_t}{K}\Big), \qquad x^{\cos}_t = \cos\!\Big(\tfrac{2\pi\, k_t}{K}\Big),öseries \texttt{DFF} supplies annual percentage rate \(\mathrm{DFF}_t\), converted to annual decimal rate \(f_t\). The query includes 120 calendar days before the first required market date. Missing calendar dates are forward-filled. Any remaining leading gaps use the first available value. Daily cash return \(q_t\), standardized cash-rate input \(z_t^{\mathrm{rf}}\), and optional rate-level input \(\ell_t^{\mathrm{rf}}\) are
+x^{\sin}_t = \sin\!\Big(\tfrac{2\pi\, k_t}{K}\Big), \qquad x^{\cos}_t = \cos\!\Big(\tfrac{2\pi\, k_t}{K}\Big).
+\label{eq:feature-calendar}
+\end{equation}
+
+For weekdays, cycle position \(k_t\) is zero on Monday through four on Friday and cycle length \(K=5\). Within a month, cycle position \(k_t\) is calendar day minus one and cycle length \(K\) is the number of calendar days in that month minus one. The first and last calendar days therefore have the same encoding. For months, cycle position \(k_t\) is month number minus one and cycle length \(K=12\).
+
+\subsubsection{Cash-Rate Inputs Outside the Offline Feature Panel}
+\label{sec:cash-inputs}
+
+EFFR \(f_t\) is integrated separately from the OHLCV enrichment pipeline. At cache construction, FRED series \texttt{DFF} supplies annual percentage rate \(\mathrm{DFF}_t\), converted to annual decimal rate \(f_t\). The query includes 120 calendar days before the first required market date. Missing calendar dates are forward-filled. Any remaining leading gaps use the first available value. Daily cash return \(q_t\), standardized cash-rate input \(z_t^{\mathrm{rf}}\), and optional rate-level input \(\ell_t^{\mathrm{rf}}\) are
 \begin{equation}
 \begin{aligned}
 f_t&=\frac{\mathrm{DFF}_t}{100},&q_t&=\frac{f_t}{252},\\
@@ -363,31 +372,31 @@ The calendar-based rate input \(z_t^{\mathrm{rf}}\) uses 60 complete calendar ob
 \end{equation}
 The SAA context in Equation~\eqref{eq:saa-context} receives standardized cash rate \(z_t^{\mathrm{rf}}\) and asset excess return \(\alpha_t^{i,\mathrm{rf}}\). The hierarchical PAA's portfolio diagnostics in Equation~\eqref{eq:paa-diagnostics} receive standardized cash rate \(z_t^{\mathrm{rf}}\), daily cash return \(q_t\), and portfolio excess return over cash \(\alpha_t^{\mathrm{pf,rf}}\). These account-level paths are distinct from selecting columns for the market-feature vector.
 
-Feature selection is fixed separately for the SAA, hierarchical PAA asset tokens, and hierarchical PAA portfolio token in each experiment. This separates changes in available information from changes in neural architecture and supports the feature ablation reported in Chapter~4.
+Feature selection is fixed separately for the SAA, hierarchical PAA asset tokens, and hierarchical PAA portfolio token in each experiment. This separates the available information from the neural architecture.
 
 \subsection{A Shared Reward Design Methodology}
 \label{sec:reward}
 
-Both layers use the same reward methodology for two notions of ``portfolio'': the SAA's cash-plus-one-asset account (Section~\ref{sec:saa}) and the hierarchical PAA's live multi-asset account (Section~\ref{sec:paa}). The reward \(R_t\) scores the transition ending at date \(t\), following action \(a_{t-1}\). It is \emph{dense}, meaning that it is supplied at every daily transition rather than only at episode termination. This gives PPO intermediate targets for its value estimates \(v_t\) and advantage estimates \(\hat A_t\) \cite{SuttonBarto,JohnSchulmanFilipWolskiPrafullaDhariwalAlecRadfordOlegKlimov.2017}.
+Both layers use the same reward methodology for two notions of ``portfolio'': the SAA's cash-plus-one-asset account (Section~\ref{sec:saa}) and the hierarchical PAA's live multi-asset account (Section~\ref{sec:paa}). Learning reward \(\mathcal R_t\) is distinct from cumulative investment return \(R_t\) throughout the thesis. Reward \(\mathcal R_t\) scores the transition ending at date \(t\), following action \(a_{t-1}\). It is \emph{dense}, meaning that it is supplied at every daily transition rather than only at episode termination. This gives PPO intermediate targets for its value estimates \(v_t\) and advantage estimates \(\hat A_t\) \cite{SuttonBarto,JohnSchulmanFilipWolskiPrafullaDhariwalAlecRadfordOlegKlimov.2017}.
 
 \paragraph{Multi-Objective Reward Composition.}
 
-Raw reward \(R_t^{\mathrm{raw}}\) combines excess log return \(\Delta\ell_t\), differential Sortino \(\Delta S_t\), incremental drawdown \(\Delta\mathrm{DD}_t^+\), and persistent drawdown \(\mathrm{DD}_t^{\mathrm{level}}\). The SAA additionally includes execution gap \(G_{t-1}\) from the preceding action. These terms are defined below. For the described configurations, optional realized-profit exit bonuses have coefficient zero:
+Raw reward \(\mathcal R_t^{\mathrm{raw}}\) combines excess log return \(\Delta\ell_t\), differential Sortino \(\Delta S_t\), incremental drawdown \(\Delta\mathrm{DD}_t^+\), and persistent drawdown \(\mathrm{DD}_t^{\mathrm{level}}\). The SAA additionally includes execution gap \(G_{t-1}\) from the preceding action. These terms are defined below. For the described configurations, optional realized-profit exit bonuses have coefficient zero:
 
 \begin{equation}
-R_t^{\mathrm{raw}}=s_\alpha\Delta\ell_t+s_S\Delta S_t
+\mathcal R_t^{\mathrm{raw}}=s_\alpha\Delta\ell_t+s_S\Delta S_t
 -\lambda_{dd}\Delta\mathrm{DD}_t^+
 -\lambda_{dd}^{\mathrm{lvl}}\mathrm{DD}_t^{\mathrm{level}}
--\lambda_{\mathrm{exec}}G_{t-1}.
+-\lambda_{\mathrm{exec},t-1}^{\mathrm{eff}}G_{t-1}.
 \label{eq:reward-composition}
 \end{equation}
 
 \begin{equation}
-R_t = \tanh\!\Big(\frac{R_t^{\text{raw}}}{\tau}\Big) \cdot \sigma_R.
+\mathcal R_t = \tanh\!\Big(\frac{\mathcal R_t^{\mathrm{raw}}}{\tau}\Big) \cdot \sigma_{\mathcal R}.
 \label{eq:reward-squash}
 \end{equation}
 
-The return scale \(s_\alpha\), Sortino scale \(s_S\), drawdown coefficients \(\lambda_{dd}\) and \(\lambda_{dd}^{\mathrm{lvl}}\), and execution-gap coefficient \(\lambda_{\mathrm{exec}}\) control the contributions in Equation~\eqref{eq:reward-composition}. The saturation divisor \(\tau\) and output scale \(\sigma_R\) bound environment reward \(R_t\) to \((-\sigma_R,\sigma_R)\) in Equation~\eqref{eq:reward-squash}. Training subsequently applies running reward normalization, so this bound does not describe the normalized learning signal. Evaluation reports unnormalized rewards \(R_t\). The SAA and hierarchical PAA use different passive return counterfactuals. Persistent drawdown coefficient \(\lambda_{dd}^{\mathrm{lvl}}\) is zero in the described configurations. The hierarchical PAA records execution gap \(G_t^{\mathrm{paa}}\) but does not subtract it from reward, so its effective coefficient \(\lambda_{\mathrm{exec}}\) is zero.
+The return scale \(s_\alpha\), Sortino scale \(s_S\), drawdown coefficients \(\lambda_{dd}\) and \(\lambda_{dd}^{\mathrm{lvl}}\), and effective execution-gap coefficient \(\lambda_{\mathrm{exec},t-1}^{\mathrm{eff}}\) control the contributions in Equation~\eqref{eq:reward-composition}. The effective coefficient \(\lambda_{\mathrm{exec},t}^{\mathrm{eff}}\) includes the sign-dependent multiplier defined in Equation~\eqref{eq:execution-gap-coefficient}. The saturation divisor \(\tau\) and output scale \(\sigma_{\mathcal R}\) bound environment reward \(\mathcal R_t\) to \((-\sigma_{\mathcal R},\sigma_{\mathcal R})\) in Equation~\eqref{eq:reward-squash}. Training subsequently applies running reward normalization, so this bound does not describe the normalized learning signal. Evaluation reports unnormalized rewards \(\mathcal R_t\). The SAA and hierarchical PAA use different passive return counterfactuals. Persistent drawdown coefficient \(\lambda_{dd}^{\mathrm{lvl}}\) is zero in the described configurations. The hierarchical PAA records execution gap \(G_t^{\mathrm{paa}}\) but does not subtract it from reward, so its effective coefficient \(\lambda_{\mathrm{exec},t}^{\mathrm{eff}}\) is zero.
 
 \paragraph{Excess Return over a Passive Counterfactual.}
 \label{sec:excess-return}
@@ -455,14 +464,24 @@ G_t^{\text{paa}} = \sum_{j=1}^{N} \max\big(0,\, \lvert \Delta w_t^{(j)} - \Delta
 \label{eq:execution-gap-paa}
 \end{equation}
 
-Cash is excluded to avoid double counting. Soft weight change \(\Delta w_t^{\mathrm{soft},(j)}\) precedes weight renormalization and cash or inventory constraints, so gap diagnostic \(G_t^{\mathrm{paa}}\) is not a gap to final fills. It is not subtracted from the hierarchical PAA reward \(R_t\). For the SAA, executed action \(a_t^{\mathrm{exec}}=\Delta x_t^{\mathrm{filled}}p_t/V_t\) values signed filled shares \(\Delta x_t^{\mathrm{filled}}\) at execution price \(p_t\). The execution gap \(G_t^{\mathrm{saa}}\) is
+Cash is excluded to avoid double counting. Soft weight change \(\Delta w_t^{\mathrm{soft},(j)}\) precedes weight renormalization and cash or inventory constraints, so gap diagnostic \(G_t^{\mathrm{paa}}\) is not a gap to final fills. It is not subtracted from the hierarchical PAA reward \(\mathcal R_t\). For the SAA, executed action \(a_t^{\mathrm{exec}}=\Delta x_t^{\mathrm{filled}}p_t/V_t\) values signed filled shares \(\Delta x_t^{\mathrm{filled}}\) at execution price \(p_t\). The execution gap \(G_t^{\mathrm{saa}}\) is
 
 \begin{equation}
 G_t^{\text{saa}} = \max\big(0,\, \lvert a_t - a_t^{\text{exec}} \rvert - g_0\big),
 \label{eq:execution-gap-saa}
 \end{equation}
 
-Here \(g_0=(n_{\min}+b_{\text{usd}})/V_t\), where \(n_{\min}\) is the larger of the execution minimum and SAA trade-value floor, and \(b_{\text{usd}}\) is a monetary buffer. The denominator is pre-trade account value. Subsequent market-price movement is not an executed action. Configured multipliers distinguish positive from non-positive signed gaps \(a_t-a_t^{\text{exec}}\).
+Here \(g_0=(n_{\min}+b_{\text{usd}})/V_t\), where \(n_{\min}\) is the larger of the execution minimum and SAA trade-value floor, and \(b_{\text{usd}}\) is a monetary buffer. The denominator is pre-trade account value. Subsequent market-price movement is not an executed action. For configured base coefficient \(\lambda_{\mathrm{exec}}^{\mathrm{base}}\), the effective SAA execution-gap coefficient \(\lambda_{\mathrm{exec},t}^{\mathrm{eff}}\) is
+\begin{equation}
+\lambda_{\mathrm{exec},t}^{\mathrm{eff}}=
+\lambda_{\mathrm{exec}}^{\mathrm{base}}
+\begin{cases}
+m_+,&a_t-a_t^{\mathrm{exec}}>0,\\
+m_-,&a_t-a_t^{\mathrm{exec}}\leq0.
+\end{cases}
+\label{eq:execution-gap-coefficient}
+\end{equation}
+The described SAA configurations use positive-gap multiplier \(m_+=0.8\) and non-positive-gap multiplier \(m_-=1.0\). Equation~\eqref{eq:reward-composition} therefore displays the effective coefficient, not the unadjusted configuration value.
 
 
 \subsection{Layer 1: The Single-Asset Agent}
@@ -507,7 +526,7 @@ a_t=\operatorname{clip}(\kappa_t\hat a_t,-1,1),\qquad
 n_t^{\mathrm{req}}=a_tV_t,\qquad V_t=c_t+x_tp_t.
 \label{eq:saa-action}
 \end{equation}
-Current pre-trade account value \(V_t\), not initial capital \(c_0\), determines trade size. Thus policy action \(\hat a_t=1\) requests a buy of \(\kappa_tV_t\) dollars, while \(\hat a_t=-0.5\) requests a sale of \(0.5\kappa_tV_t\). Available cash, inventory, costs, and trade thresholds constrain fills. The three-phase schedule permits a warm-up, linear ramp, and terminal action scale \(\kappa_t\). Equal endpoints keep action scale \(\kappa_t\) constant, as in the described configuration. Reward \(R_t\) uses the selected asset's price log return as counterfactual in Equation~\eqref{eq:reward-excess}.
+Current pre-trade account value \(V_t\), not initial capital \(c_0\), determines trade size. Thus policy action \(\hat a_t=1\) requests a buy of \(\kappa_tV_t\) dollars, while \(\hat a_t=-0.5\) requests a sale of \(0.5\kappa_tV_t\). Available cash, inventory, costs, and trade thresholds constrain fills. The three-phase schedule permits a warm-up, linear ramp, and terminal action scale \(\kappa_t\). Equal endpoints keep action scale \(\kappa_t\) constant, as in the described configuration. Reward \(\mathcal R_t\) uses the selected asset's price log return as counterfactual in Equation~\eqref{eq:reward-excess}.
 
 \subsubsection{Network Architecture}
 
@@ -570,15 +589,15 @@ Critic value estimate \(v_t\) provides a baseline for judging whether an action 
 
 \subsubsection{Recurrent Memory and Advantage Estimation}
 
-Advantage estimate \(\hat A_t=\hat R_t-v_t\) compares empirical return-to-go target \(\hat R_t\), the estimated sum of future discounted rewards, with critic value estimate \(v_t\). A positive advantage estimate \(\hat A_t\) means the action performed better than predicted. PPO increases its likelihood subject to a clipped update objective \cite{JohnSchulmanFilipWolskiPrafullaDhariwalAlecRadfordOlegKlimov.2017}. GAE builds advantage estimate \(\hat A_t\) from temporal-difference residuals \(\delta_t^{\mathrm{TD}}\), which compare a one-step reward and next value with the current value:
+Advantage estimate \(\hat A_t=\hat G_t-v_t\) compares empirical discounted reward-to-go target \(\hat G_t\), the estimated sum of future discounted rewards, with critic value estimate \(v_t\). This learning target is distinct from cumulative investment return \(R_t\). A positive advantage estimate \(\hat A_t\) means the action performed better than predicted. PPO increases its likelihood subject to a clipped update objective \cite{JohnSchulmanFilipWolskiPrafullaDhariwalAlecRadfordOlegKlimov.2017}. GAE builds advantage estimate \(\hat A_t\) from temporal-difference residuals \(\delta_t^{\mathrm{TD}}\), which compare a one-step reward and next value with the current value:
 \begin{equation}
-\delta_t^{\mathrm{TD}}=R_{t+1}+\gamma v_{t+1}-v_t,\qquad
+\delta_t^{\mathrm{TD}}=\mathcal R_{t+1}+\gamma v_{t+1}-v_t,\qquad
 \hat A_t=\delta_t^{\mathrm{TD}}+\gamma\lambda\hat A_{t+1}.
 \label{eq:gae}
 \end{equation}
 GAE decay \(\lambda\) trades reliance on short value-based predictions against longer realized trajectories. Backpropagation through time (BPTT) is different. It unfolds recurrent state \(h_t\) across a sequence and propagates gradients through the repeated network operations \cite[Chapter~10]{Goodfellow-et-al-2016}. Longer unrolls require more computation and can cause vanishing or exploding gradients, meaning gradients become too small or too large for stable learning.
 
-Recurrent state \(h_t\) carries observation history during trajectory collection. GAE then computes advantage targets \(\hat A_t\) backward through collected rewards \(R_t\) and value estimates \(v_t\), stopping its recursion at episode boundaries. Ordinary time limits use value bootstrapping, meaning that estimated future value is retained at truncation. It uses the actual final observation \(o_t\), not the automatically reset episode's observation.
+Recurrent state \(h_t\) carries observation history during trajectory collection. GAE then computes advantage targets \(\hat A_t\) backward through collected rewards \(\mathcal R_t\) and value estimates \(v_t\), stopping its recursion at episode boundaries. Ordinary time limits use value bootstrapping, meaning that estimated future value is retained at truncation. It uses the actual final observation \(o_t\), not the automatically reset episode's observation.
 
 Optimization replays bounded trajectory segments with their recurrent starting states \(h_t\). BPTT is limited by the available segment, whereas advantage targets \(\hat A_t\) have already been calculated over the rollout. This separates recurrent gradient propagation from reward attribution. Truncation controls computational cost but can still affect which temporal relationships are learned.
 
@@ -788,7 +807,7 @@ Target weights \(\mathbf w_t\) are not applied instantaneously. Soft execution m
 \label{eq:paa-soft-execution}
 \end{equation}
 
-Execution step size \(\eta_{\mathrm{exec}}\in(0,1]\) sets the partial move. Deadband \(\delta\) suppresses changes below a threshold. Elementwise product \(\odot\) and the indicator apply to every weight, including cash. Negative provisional weights are clipped to zero and renormalized before share orders are formed. Sales are inventory-limited and precede purchases. Purchases can be scaled down to cover costs from available cash. Minimum-share thresholds can suppress individual orders. Soft weight change \(\Delta\mathbf w_t^{\mathrm{soft}}\) is therefore an intermediate request, not the final filled change. Reward \(R_t\) uses SPY buy-and-hold value \(B_t\) in Equation~\eqref{eq:reward-excess}. Vector gap \(G_t^{\mathrm{paa}}\) in Equation~\eqref{eq:execution-gap-paa} remains diagnostic only.
+Execution step size \(\eta_{\mathrm{exec}}\in(0,1]\) sets the partial move. Deadband \(\delta\) suppresses changes below a threshold. Elementwise product \(\odot\) and the indicator apply to every weight, including cash. Negative provisional weights are clipped to zero and renormalized before share orders are formed. Sales are inventory-limited and precede purchases. Purchases can be scaled down to cover costs from available cash. Minimum-share thresholds can suppress individual orders. Soft weight change \(\Delta\mathbf w_t^{\mathrm{soft}}\) is therefore an intermediate request, not the final filled change. Reward \(\mathcal R_t\) uses SPY buy-and-hold value \(B_t\) in Equation~\eqref{eq:reward-excess}. Vector gap \(G_t^{\mathrm{paa}}\) in Equation~\eqref{eq:execution-gap-paa} remains diagnostic only.
 
 Three reference accounts must be distinguished. Reward counterfactual value \(B_t\) comes from fully invested SPY buy-and-hold, paying initial transaction cost and then retaining the position. Comparison value \(B_t^{\mathrm{start}}\) retains the live account's initial allocation without further trading. Custom benchmark value \(B_t^{\mathrm{bench}}\) starts at \(45\%\) SPY, \(20\%\) Gold, \(10\%\) EWJ, \(10\%\) EWG, and \(5\%\) each in Crude, EWQ, and EWT. Its simple return \(r_t^{\mathrm{bench}}=B_t^{\mathrm{bench}}/B_{t-1}^{\mathrm{bench}}-1\) supplies diagnostic excess return \(\alpha_t^{\mathrm{diag}}\) in Equation~\eqref{eq:paa-return-diagnostics}. Only SPY reference value \(B_t\) enters excess-return reward \(\Delta\ell_t\).
 
