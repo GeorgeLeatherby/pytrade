@@ -712,7 +712,7 @@ def _plot_aggregate_page(
     timestamp: str,
     cache: MarketDataCache,
 ) -> str:
-    """Produce one aggregate PNG comparing agent, SPY B&H, and cash carry."""
+    """Produce one aggregate PNG comparing agent, equal-weight B&H, SPY B&H, and cash carry."""
     _apply_paper_style()
 
     # Combined portfolio = equal-weight average of all shadow sub-portfolios.
@@ -721,6 +721,10 @@ def _plot_aggregate_page(
     )
     combined_pv = asset_pvs.mean(axis=1)
 
+    asset_bhs = np.stack(
+        [episode_record["assets"][a]["bh_values"] for a in asset_names], axis=1
+    )
+
     spy_rec = episode_record["assets"].get("SPY")
     spy_bh = np.asarray(spy_rec["bh_values"], dtype=np.float64) if spy_rec is not None else None
 
@@ -728,6 +732,7 @@ def _plot_aggregate_page(
     x = np.arange(T)
 
     combined_idx = _index_to_100(combined_pv)
+    uniform_bh_idx = _index_to_100(asset_bhs.mean(axis=1))
 
     # Cash benchmark compounds the same date-aligned EFFR carry applied by TradingEnv.
     cash_values = np.empty(T, dtype=np.float64)
@@ -743,6 +748,7 @@ def _plot_aggregate_page(
 
     fig, ax = plt.subplots(figsize=(8.27, 4.5))
     ax.plot(x, combined_idx, color="#1f77b4", linewidth=1.6, label="Combined agent portfolio (equal-weight)")
+    ax.plot(x, uniform_bh_idx, color="#9467bd", linewidth=1.3, label="Equal-weight B&H")
 
     spy_idx_vals = None
     if spy_bh is not None and len(spy_bh) == T:
@@ -756,6 +762,8 @@ def _plot_aggregate_page(
     final_spy = float(spy_idx_vals[-1] - 100.0) if spy_idx_vals is not None else None
 
     summary_lines = [f"Agent: {final_agent:+.1f}%"]
+    if T > 0:
+        summary_lines.append(f"Equal-weight B&H: {uniform_bh_idx[-1] - 100.0:+.1f}%")
     if final_spy is not None:
         summary_lines.append(f"SPY B&H: {final_spy:+.1f}%")
     if T > 0:
